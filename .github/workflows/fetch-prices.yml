@@ -4,17 +4,18 @@ name: Nightly price fetch
 # Secrets come from GitHub → Settings → Secrets and variables → Actions.
 
 on:
+  # Run takes ~3h (125 destinations, 9402 requests at >=1100ms).
+  # Scheduled so data is fresh by 10:00 and 18:00 Berlin time.
+  # Runs do not overlap: 07:00+3h = 10:00, next start 15:00 (5h gap).
   schedule:
-    # Two daily runs (06:00 & 17:00 Berlin) cover morning and evening search peaks.
-    # 11h apart vs a ~2-3h run → the two never overlap.
-    - cron: '0 4 * * *'    # 06:00 Berlin (CEST)
-    - cron: '0 15 * * *'   # 17:00 Berlin (CEST)
+    - cron: '0 5 * * *'    # 07:00 Berlin — run finishes ~10:00, data fresh for the day
+    - cron: '0 13 * * *'   # 15:00 Berlin — run finishes ~18:00, data fresh for the evening search peak
   workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
 
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
-    # ~132 min typical run at ≥1100ms/request; generous headroom for growth/retries.
+    # ~172 min typical run (125 destinations, 9402 requests at ≥1100ms); headroom for retries.
     timeout-minutes: 350
     env:
       # Public project URL (not a secret) — the script also defaults to this.
