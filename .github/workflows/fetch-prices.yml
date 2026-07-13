@@ -1,25 +1,47 @@
 name: Nightly price fetch
 
-# Collects Travelpayouts prices and writes them to Supabase (tables prices/hotels).
+# Collects Travelpayouts prices and writes them to Supabase (table `prices`).
 # Secrets come from GitHub → Settings → Secrets and variables → Actions.
+#
+# 12-month horizon, split across two SEQUENTIAL jobs so neither exceeds the 6-hour
+# GitHub Actions job limit (1567 routes × 12 months ≈ 345 min would be too close):
+#   near — months 1–6  (MONTH_START=1)
+#   far  — months 7–12 (MONTH_START=7), needs: near → NEVER runs in parallel with it
+#          (parallel runs would double the request rate and break the 60/min TP limit).
+#
+# Tiered schedule: Far months (7–12) change slowly — refreshed once daily. Near months
+# (1–6) change fast and are refreshed twice daily for the evening search peak.
 
 on:
-  # Run takes ~3h (125 destinations, 9402 requests at >=1100ms).
-  # Scheduled so data is fresh by 10:00 and 18:00 Berlin time.
-  # Runs do not overlap: 07:00+3h = 10:00, next start 15:00 (5h gap).
   schedule:
-    - cron: '0 5 * * *'    # 07:00 Berlin — run finishes ~10:00, data fresh for the day
-    - cron: '0 13 * * *'   # 15:00 Berlin — run finishes ~18:00, data fresh for the evening search peak
-  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
+    - cron: '0 5 * * *'    # 07:00 Berlin — full 12-month sweep (near → far), ready ~13:00
+    - cron: '0 13 * * *'   # 15:00 Berlin — near 6 months only, ready ~18:00
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Which months to collect'
+        type: choice
+        options: [both, near, far]
+        default: both
+
+env:
+  # Public project URL (not a secret) — the script also defaults to this.
+  SUPABASE_URL: https://xpalogebawoljlafsafs.supabase.co
 
 jobs:
-  fetch-prices:
+  near:
+    # Runs on BOTH cron schedules (near is refreshed twice daily) and on a manual
+    # near/both run. Skipped only for a manual far-only run.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.inputs.scope == 'near' ||
+      github.event.inputs.scope == 'both'
     runs-on: ubuntu-latest
-    # ~172 min typical run (125 destinations, 9402 requests at ≥1100ms); headroom for retries.
-    timeout-minutes: 350
+    # ~172 min typical for 6 months; 340 leaves headroom for retries, well under the 6h cap.
+    timeout-minutes: 340
     env:
-      # Public project URL (not a secret) — the script also defaults to this.
-      SUPABASE_URL: https://xpalogebawoljlafsafs.supabase.co
+      MONTH_START: '1'
+      MONTH_COUNT: '6'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -35,7 +57,43 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Fetch prices → Supabase
+      - name: Fetch near months (1–6) → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/fetch-prices.mjs
+
+  far:
+    # Far months only on the 07:00 full sweep, or a manual far/both run — never at 15:00.
+    # `needs: near` keeps it strictly after near (no concurrent API load); `always()`
+    # lets it still run when near was SKIPPED (a manual far-only dispatch).
+    needs: near
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+        github.event.inputs.scope == 'far' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      MONTH_START: '7'
+      MONTH_COUNT: '6'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch far months (7–12) → Supabase
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

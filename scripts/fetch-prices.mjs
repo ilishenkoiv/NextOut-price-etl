@@ -92,11 +92,21 @@ const BATCH = 500; // rows per Supabase upsert — batched, not row-by-row
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
 
-// 6 months of horizon, starting from the current month → ['YYYY-MM', ...].
+// Month window, parameterized so a long horizon can be split across sequential CI jobs
+// without either exceeding the 6-hour job limit or the 60 req/min API limit.
+//   MONTH_START — 1-based offset from the current month (default 1). START=1 → the NEXT
+//                 full month; the current, partially-elapsed month is never collected
+//                 (matches the app's horizon — lib/prices.ts horizonMonths).
+//   MONTH_COUNT — how many consecutive months to collect (default 6).
+// Examples:  MONTH_START=1 MONTH_COUNT=6 → the near 6 months (default).
+//            MONTH_START=7 MONTH_COUNT=6 → the far months 7–12.
+const MONTH_START = Number(process.env.MONTH_START) || 1;
+const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
 const now = new Date();
 const MONTHS = [];
-for (let i = 0; i < 6; i += 1) {
-  const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+for (let i = 0; i < MONTH_COUNT; i += 1) {
+  // +MONTH_START skips the current partially-elapsed month; +i walks the window.
+  const d = new Date(now.getFullYear(), now.getMonth() + MONTH_START + i, 1);
   MONTHS.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`);
 }
 
@@ -145,7 +155,7 @@ async function main() {
   console.log(`Origins (${ORIGINS_ALL.length}): ${ORIGINS_ALL.join(', ')}`);
   console.log(`  hubs (${HUB_AIRPORTS.length}, all dests): ${HUB_AIRPORTS.join(', ')}`);
   console.log(`  low-cost (${LOWCOST_AIRPORTS.length}, narrow map): ${LOWCOST_AIRPORTS.join(', ')}`);
-  console.log(`Flight months (${MONTHS.length}): ${MONTHS.join(', ')}`);
+  console.log(`Flight months (${MONTHS.length}): ${MONTHS[0]} … ${MONTHS[MONTHS.length - 1]}  (MONTH_START=${MONTH_START}, MONTH_COUNT=${MONTH_COUNT})`);
   console.log(`Route-pairs: ${routeTotal}  ·  Flight requests: ${totalRequests} (1 per route-month)`);
   console.log(`At ≥${PAUSE_MS}ms/request ≈ ${Math.round(totalRequests * PAUSE_MS / 60000)} min\n`);
 
