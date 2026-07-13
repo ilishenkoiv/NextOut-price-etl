@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# secrets — never commit tokens/keys (they come from env / GitHub Secrets)
+.env
+.env.local
+.env.*.local
+
+# logs / os
+*.log
+.DS_Store
+
+# local tooling
+.claude/

@@ -1,0 +1,41 @@
+name: Nightly price fetch
+
+# Collects Travelpayouts prices and writes them to Supabase (tables prices/hotels).
+# Secrets come from GitHub → Settings → Secrets and variables → Actions.
+
+on:
+  schedule:
+    # Two daily runs (06:00 & 17:00 Berlin) cover morning and evening search peaks.
+    # 11h apart vs a ~2-3h run → the two never overlap.
+    - cron: '0 4 * * *'    # 06:00 Berlin (CEST)
+    - cron: '0 15 * * *'   # 17:00 Berlin (CEST)
+  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
+
+jobs:
+  fetch-prices:
+    runs-on: ubuntu-latest
+    # ~132 min typical run at ≥1100ms/request; generous headroom for growth/retries.
+    timeout-minutes: 350
+    env:
+      # Public project URL (not a secret) — the script also defaults to this.
+      SUPABASE_URL: https://xpalogebawoljlafsafs.supabase.co
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          # Node 22 has native WebSocket + fetch. The script also passes a `ws` transport
+          # as a belt-and-suspenders fallback, so it works on older Node too.
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch prices → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/fetch-prices.mjs

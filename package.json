@@ -1,0 +1,17 @@
+{
+  "name": "nextout-price-etl",
+  "version": "1.0.0",
+  "description": "Nightly price-collection pipeline: Travelpayouts API → Supabase, automated via GitHub Actions.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "fetch-prices": "node scripts/fetch-prices.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.1",
+    "ws": "^8.21.0"
+  },
+  "license": "MIT"
+}
