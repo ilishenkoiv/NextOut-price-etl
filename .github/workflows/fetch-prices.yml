@@ -11,11 +11,20 @@ name: Nightly price fetch
 #
 # Tiered schedule: Far months (7–12) change slowly — refreshed once daily. Near months
 # (1–6) change fast and are refreshed twice daily for the evening search peak.
+#
+# Scheduled so data is fresh by 10:00 and 17:00 Berlin time.
+# 04:00 start + ~6h full sweep (12 months) = ready by 10:00.
+# 14:00 start + ~3h near sweep (6 months) = ready by 17:00.
+# Runs never overlap: first ends 10:00, second starts 14:00 (4h gap).
+#
+# WINTER TIME: GitHub Actions cron is UTC and does NOT follow the CET switch. The times
+# below assume CEST (summer, UTC+2). In winter (CET, UTC+1) the runs shift one hour earlier
+# in Berlin — start 03:00 / 13:00, ready by 09:00 / 16:00. Adjust in late October if wanted.
 
 on:
   schedule:
-    - cron: '0 5 * * *'    # 07:00 Berlin — full 12-month sweep (near → far), ready ~13:00
-    - cron: '0 13 * * *'   # 15:00 Berlin — near 6 months only, ready ~18:00
+    - cron: '0 2 * * *'    # 04:00 Berlin (CEST) — full 12-month sweep (near → far, ~6h), ready by 10:00
+    - cron: '0 12 * * *'   # 14:00 Berlin (CEST) — near 6 months only (~3h), ready by 17:00
   workflow_dispatch:
     inputs:
       scope:
@@ -64,14 +73,14 @@ jobs:
         run: node scripts/fetch-prices.mjs
 
   far:
-    # Far months only on the 07:00 full sweep, or a manual far/both run — never at 15:00.
+    # Far months only on the 04:00 full sweep, or a manual far/both run — never at 14:00.
     # `needs: near` keeps it strictly after near (no concurrent API load); `always()`
     # lets it still run when near was SKIPPED (a manual far-only dispatch).
     needs: near
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '0 5 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
