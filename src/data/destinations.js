@@ -98,4 +98,54 @@ export const DESTINATIONS = [
   { iata: 'LIM', stops: 1, bestMonths: [1, 2, 3, 4, 12] },
   { iata: 'CTG', stops: 1, bestMonths: [1, 2, 3, 4, 12] },
   { iata: 'SCL', stops: 1, bestMonths: [1, 2, 3, 10, 11, 12] },
+
+  // ── Tunisia (7th most-booked by Germans)
+  { iata: 'DJE', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+  { iata: 'NBE', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+
+  // ── Bulgaria (9th most-booked)
+  { iata: 'BOJ', stops: 0, bestMonths: [6, 7, 8, 9] },
+  { iata: 'VAR', stops: 0, bestMonths: [6, 7, 8, 9] },
+
+  // ── Canary Islands (German winter-sun staple)
+  { iata: 'LPA', stops: 0, bestMonths: [1, 2, 3, 4, 10, 11, 12] },
+  { iata: 'ACE', stops: 0, bestMonths: [1, 2, 3, 4, 10, 11, 12] },
+  { iata: 'FUE', stops: 0, bestMonths: [1, 2, 3, 4, 10, 11, 12] },
+
+  // ── Turkey (#1 destination for Germans)
+  { iata: 'ADB', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+  { iata: 'BJV', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+  { iata: 'DLM', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+
+  // ── Balkans
+  { iata: 'BEG', stops: 0, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'SJJ', stops: 0, bestMonths: [5, 6, 7, 8, 9] },
+  { iata: 'SKP', stops: 0, bestMonths: [5, 6, 7, 8, 9] },
+  { iata: 'SOF', stops: 0, bestMonths: [1, 2, 5, 6, 9, 10, 12] },
+  { iata: 'OTP', stops: 0, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'ZAG', stops: 0, bestMonths: [4, 5, 6, 9, 10, 12] },
+
+  // ── Mediterranean fill-ins
+  { iata: 'CTA', stops: 0, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'ALC', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10] },
+  { iata: 'KGS', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+  { iata: 'SKG', stops: 0, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'CHQ', stops: 0, bestMonths: [5, 6, 7, 8, 9, 10] },
+
+  // ── North Africa & Middle East
+  { iata: 'CMN', stops: 0, bestMonths: [3, 4, 5, 9, 10, 11] },
+  { iata: 'TNG', stops: 1, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'RMF', stops: 0, bestMonths: [1, 2, 3, 4, 10, 11, 12] },
+  { iata: 'MCT', stops: 1, bestMonths: [1, 2, 3, 11, 12] },
+  { iata: 'AQJ', stops: 1, bestMonths: [3, 4, 5, 10, 11] },
+
+  // ── Asia
+  { iata: 'DAD', stops: 1, bestMonths: [2, 3, 4, 5, 6, 7, 8] },
+  { iata: 'CNX', stops: 1, bestMonths: [11, 12, 1, 2] },
+  { iata: 'LGK', stops: 1, bestMonths: [1, 2, 3, 11, 12] },
+  { iata: 'DEL', stops: 0, bestMonths: [10, 11, 12, 1, 2, 3] },
+
+  // ── Central Asia
+  { iata: 'TAS', stops: 1, bestMonths: [4, 5, 6, 9, 10] },
+  { iata: 'ALA', stops: 1, bestMonths: [5, 6, 7, 8, 9] },
 ];
