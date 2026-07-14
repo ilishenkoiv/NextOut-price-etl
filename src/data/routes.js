@@ -1,8 +1,10 @@
 // src/data/routes.js — hand-curated origin→destination route map (IATA codes).
 //
-// Hubs query every destination (see destinations.js); low-cost bases query only the
-// narrow lists below. A rough approximation of real Ryanair/Wizz/Eurowings networks —
-// Mediterranean-heavy (ES/IT/GR/HR/PT) plus Morocco and the Canaries, no long-haul.
+// ⚠️ REFERENCE ONLY — no longer read by the collector. As of the low-cost coverage
+// expansion, fetch-prices.mjs queries EVERY destination from every origin (see
+// origins.js / targetsFor). This map is kept because it documents the real, approximate
+// Ryanair/Wizz/Eurowings low-cost networks (Mediterranean-heavy: ES/IT/GR/HR/PT plus
+// Morocco and the Canaries, no long-haul) and may be useful for future ranking hints.
 export const AVAILABLE_ROUTES = {
   // Major hubs: wide network covering most/all destinations.
   'MUC': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD'],

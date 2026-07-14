@@ -38,7 +38,6 @@
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
-import { AVAILABLE_ROUTES } from '../src/data/routes.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 
 // ── Config / secrets (env only) ──────────────────────────────────────────────
@@ -90,11 +89,12 @@ for (const d of DESTINATIONS) {
   if (STOPS[d.iata] === undefined) { STOPS[d.iata] = d.stops; DEST_IATAS.push(d.iata); }
 }
 
-// Targets per origin: hubs → all destinations; low-cost → their curated map
-// (intersected with the dataset so we never query a non-destination airport).
+// Targets per origin: EVERY destination, for EVERY origin (hubs and low-cost bases alike).
+// The former narrow per-origin map for low-cost bases under-collected the cheapest fares;
+// we now query the whole network and let the API return null where there's no route.
+// Self-excluded (d !== origin) so an airport is never queried against itself.
 function targetsFor(origin) {
-  const base = LOWCOST_AIRPORTS.includes(origin) ? (AVAILABLE_ROUTES[origin] ?? []) : DEST_IATAS;
-  return base.filter((d) => d !== origin && STOPS[d] !== undefined);
+  return DEST_IATAS.filter((d) => d !== origin && STOPS[d] !== undefined);
 }
 
 // ≥1100ms between ALL TP calls keeps us under the 60/min limit with margin. Overridable
@@ -252,9 +252,9 @@ async function main() {
 
   console.log(`Supabase: ${SUPABASE_URL}`);
   console.log(`Supabase key role: ${SERVICE_KEY_ROLE}`);
-  console.log(`Origins (${ORIGINS_ALL.length}): ${ORIGINS_ALL.join(', ')}`);
-  console.log(`  hubs (${HUB_AIRPORTS.length}, all dests): ${HUB_AIRPORTS.join(', ')}`);
-  console.log(`  low-cost (${LOWCOST_AIRPORTS.length}, narrow map): ${LOWCOST_AIRPORTS.join(', ')}`);
+  console.log(`Origins (${ORIGINS_ALL.length}, all query the full ${DEST_IATAS.length}-destination network): ${ORIGINS_ALL.join(', ')}`);
+  console.log(`  hubs (${HUB_AIRPORTS.length}): ${HUB_AIRPORTS.join(', ')}`);
+  console.log(`  low-cost bases (${LOWCOST_AIRPORTS.length}): ${LOWCOST_AIRPORTS.join(', ')}`);
   console.log(`Flight months (${MONTHS.length}): ${MONTHS[0]} … ${MONTHS[MONTHS.length - 1]}  (MONTH_START=${MONTH_START}, MONTH_COUNT=${MONTH_COUNT})`);
   console.log(`Route-pairs: ${routeTotal}  ·  Flight requests: ${totalRequests} (1 per route-month)`);
   console.log(`At ≥${PAUSE_MS}ms/request ≈ ${Math.round(totalRequests * PAUSE_MS / 60000)} min\n`);

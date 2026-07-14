@@ -4,7 +4,7 @@ name: Nightly price fetch
 # Secrets come from GitHub → Settings → Secrets and variables → Actions.
 #
 # 12-month horizon, split across two SEQUENTIAL jobs so neither exceeds the 6-hour
-# GitHub Actions job limit (1567 routes × 12 months ≈ 345 min would be too close):
+# GitHub Actions job limit (2247 routes × 6 months ≈ 247 min/job, well under 360):
 #   near — months 1–6  (MONTH_START=1)
 #   far  — months 7–12 (MONTH_START=7), needs: near → NEVER runs in parallel with it
 #          (parallel runs would double the request rate and break the 60/min TP limit).
@@ -12,19 +12,22 @@ name: Nightly price fetch
 # Tiered schedule: Far months (7–12) change slowly — refreshed once daily. Near months
 # (1–6) change fast and are refreshed twice daily for the evening search peak.
 #
-# Scheduled so data is fresh by 10:00 and 17:00 Berlin time.
-# 04:00 start + ~6h full sweep (12 months) = ready by 10:00.
-# 14:00 start + ~3h near sweep (6 months) = ready by 17:00.
-# Runs never overlap: first ends 10:00, second starts 14:00 (4h gap).
+# Since low-cost bases now query the FULL 125-destination network (2247 route-pairs, up from
+# 1567), a job takes ~247 min (was ~172) and the full sweep ~8h14 (was ~6h). Starts moved
+# EARLIER so data is still fresh by 10:00 and 17:00 Berlin time.
+# 01:00 start + ~8h14 full sweep (12 months) = ready by ~09:15.
+# 12:00 start + ~4h07 near sweep (6 months)  = ready by ~16:10.
+# Runs never overlap: full sweep ends 07:14 UTC, near starts 10:00 UTC (2h46 gap).
 #
 # WINTER TIME: GitHub Actions cron is UTC and does NOT follow the CET switch. The times
 # below assume CEST (summer, UTC+2). In winter (CET, UTC+1) the runs shift one hour earlier
-# in Berlin — start 03:00 / 13:00, ready by 09:00 / 16:00. Adjust in late October if wanted.
+# in Berlin — start 00:00 / 11:00, ready by ~08:15 / ~15:10. The UTC non-overlap gap (2h46)
+# is season-independent. Adjust in late October if wanted.
 
 on:
   schedule:
-    - cron: '0 2 * * *'    # 04:00 Berlin (CEST) — full 12-month sweep (near → far, ~6h), ready by 10:00
-    - cron: '0 12 * * *'   # 14:00 Berlin (CEST) — near 6 months only (~3h), ready by 17:00
+    - cron: '0 23 * * *'   # 01:00 Berlin (CEST) — full 12-month sweep (near → far, ~8h14), ready by ~09:15
+    - cron: '0 10 * * *'   # 12:00 Berlin (CEST) — near 6 months only (~4h07), ready by ~16:10
   workflow_dispatch:
     inputs:
       scope:
@@ -46,7 +49,7 @@ jobs:
       github.event.inputs.scope == 'near' ||
       github.event.inputs.scope == 'both'
     runs-on: ubuntu-latest
-    # ~172 min typical for 6 months; 340 leaves headroom for retries, well under the 6h cap.
+    # ~247 min typical for 6 months (2247 routes); 340 leaves headroom for retries, under the 6h cap.
     timeout-minutes: 340
     env:
       MONTH_START: '1'
