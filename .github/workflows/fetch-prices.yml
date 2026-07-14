@@ -40,6 +40,17 @@ env:
   # Public project URL (not a secret) — the script also defaults to this.
   SUPABASE_URL: https://xpalogebawoljlafsafs.supabase.co
 
+# Hard guarantee that two runs never collect at once. The scheduled starts already leave a
+# 2h46 UTC gap, but if the full sweep ever overruns past that, the noon near run would start
+# while it's still going and double the request rate past the 60/min TP limit. With a single
+# workflow-level concurrency group, a new run stays PENDING until the in-progress one finishes.
+# cancel-in-progress: false — never abort a run mid-collection (it's writing to Supabase); make
+# the newcomer wait instead. (Applies across whole workflow runs; the in-run near→far order is
+# still enforced separately by `needs: near`.)
+concurrency:
+  group: price-fetch
+  cancel-in-progress: false
+
 jobs:
   near:
     # Runs on BOTH cron schedules (near is refreshed twice daily) and on a manual
