@@ -4,13 +4,19 @@
 // GitHub Actions; can be run locally too. This is the ETL half of NextOut — it contains NO
 // product logic (no ranking, no scoring, no UI), only the collection pipeline.
 //
-// TWO tables are filled from the SAME API responses:
+// THREE tables are filled from the SAME API responses:
 //   • prices — one row per route-month = the cheapest price (the app reads this today).
 //   • offers — every individual offer WHOLE (departure_at/return_at/nights/price/transfers/
 //     airline). The v3 endpoint returns up to 30 dated offers per route-month; the old code
 //     kept only Math.min and threw the rest away — losing which DAYS are cheap and mixing a
 //     2-night fare into a 7-night Total. offers is a per-run SNAPSHOT: upsert on PK, then
 //     stale rows (older than the run) are pruned, so it reflects current state, not a log.
+//   • price_history — an APPEND-ONLY log of price CHANGES (never overwritten). prices upserts
+//     on (origin,dest,month) so each run clobbers the previous value; without a log we lose
+//     the time series needed for "cheaper than this month's average" and analytics. We insert
+//     a row ONLY when direct/any_stops differ from what prices currently holds (or a route is
+//     new) — a full snapshot each run would hit Supabase's storage cap in ~4 months; recording
+//     only the ~10-20% that change per run lasts ~2 years.
 //
 //   PowerShell:  $env:TP_TOKEN="..."; $env:SUPABASE_SERVICE_KEY="..."; node scripts/fetch-prices.mjs
 //   bash:        TP_TOKEN=... SUPABASE_SERVICE_KEY=... node scripts/fetch-prices.mjs
@@ -209,6 +215,35 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
   return { ok: true, min, offers };
 }
 
+// Load the CURRENT price for every route-month from `prices` in ONE paginated scan, keyed by
+// `origin|dest|month`. This is the baseline the run compares against so price_history only logs
+// CHANGES. PostgREST silently caps a .select() at 1000 rows (we have ~7000+) — we page with
+// .range() and a STABLE .order(), because unordered pages can repeat or skip rows across the cap.
+async function loadExistingPrices() {
+  const map = new Map();
+  const PAGE = 1000;
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase
+      .from('prices')
+      .select('origin,dest,month,direct,any_stops')
+      .order('origin', { ascending: true })
+      .order('dest', { ascending: true })
+      .order('month', { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      // A read failure here would make EVERY route look "changed" and flood price_history.
+      // Abort loudly instead of silently logging a spurious full snapshot.
+      throw new Error(`could not load existing prices (baseline): ${error.message}`);
+    }
+    if (!data || data.length === 0) break;
+    for (const r of data) map.set(`${r.origin}|${r.dest}|${r.month}`, { direct: r.direct, any_stops: r.any_stops });
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return map;
+}
+
 async function main() {
   // Plan the run so we can print totals and a live ETA.
   const plan = ORIGINS_ALL.map((o) => ({ origin: o, targets: targetsFor(o) }));
@@ -228,6 +263,11 @@ async function main() {
   // pruning deletes only rows OLDER than it, so a fresh row is never removed.
   const RUN_START_ISO = new Date().toISOString();
 
+  // Baseline: the current price of every route-month, loaded ONCE (paginated) before the run.
+  // price_history rows are written only where this run's price differs from this snapshot.
+  const existingPrices = await loadExistingPrices();
+  console.log(`Loaded ${existingPrices.size} existing price rows (baseline for change detection)\n`);
+
   // Supabase write buffer + counters. We flush in BATCH-sized upserts, and flush
   // periodically during the (multi-hour) run so partial progress is persisted.
   const priceBuf = [];
@@ -244,6 +284,29 @@ async function main() {
       } catch (e) {
         console.warn(`    ⚠ prices upsert threw (${rows.length} rows): ${e.message}`);
         priceWriteErrors += rows.length;
+      }
+    }
+  }
+
+  // ── price_history table: append-only log of price CHANGES (batched, insert only) ──
+  // A row is pushed only when a route-month's price differs from the baseline (see the loop).
+  // insert (not upsert): every row is a new observation; observed_at defaults to now() in the DB.
+  const historyBuf = [];
+  let historyWritten = 0;
+  let historyWriteErrors = 0;
+  let pricesChanged = 0;   // route-months whose price changed or are new-with-a-price (→ logged)
+  let pricesUnchanged = 0; // route-months whose price matched the baseline (→ NOT logged)
+
+  async function flushHistory(force = false) {
+    while (historyBuf.length >= BATCH || (force && historyBuf.length > 0)) {
+      const rows = historyBuf.splice(0, BATCH);
+      try {
+        const { error } = await supabase.from('price_history').insert(rows);
+        if (error) { console.warn(`    ⚠ price_history insert error (${rows.length} rows): ${error.message}`); historyWriteErrors += rows.length; }
+        else historyWritten += rows.length;
+      } catch (e) {
+        console.warn(`    ⚠ price_history insert threw (${rows.length} rows): ${e.message}`);
+        historyWriteErrors += rows.length;
       }
     }
   }
@@ -321,6 +384,23 @@ async function main() {
         byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month). Unchanged.
         priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+
+        // price_history: log ONLY when this price differs from the baseline (or the route is new).
+        // Compare each column against the loaded snapshot (null-normalized so null===null matches).
+        // We DON'T log a change that has no price at all (both null) — a route that returned no
+        // data, or a transient API failure clobbering prices to null, is noise, not a real
+        // observation. Genuine prices (including a price appearing where there was none) are logged.
+        const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
+        const hasPrice = pair.direct != null || pair.any != null;
+        const changed = !prev
+          || (prev.direct ?? null) !== (pair.direct ?? null)
+          || (prev.any_stops ?? null) !== (pair.any ?? null);
+        if (changed && hasPrice) {
+          historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
+          pricesChanged += 1;
+        } else if (!changed) {
+          pricesUnchanged += 1;
+        }
         // Every individual offer → the offers buffer (only when the API actually answered).
         if (ok) {
           okRouteMonths += 1;
@@ -331,6 +411,7 @@ async function main() {
         await sleep(PAUSE_MS);
       }
       await flushPrices(false);
+      await flushHistory(false);
 
       // Force-flush THIS route's offers so they are persisted BEFORE we prune stale ones.
       // Only prune when the write raised no error (else we'd delete old data without a
@@ -349,6 +430,7 @@ async function main() {
     }
   }
   await flushPrices(true);
+  await flushHistory(true);
   await flushOffers(true); // safety net; per-route force-flushes normally drain it already
 
   const elapsedMin = ((Date.now() - t0) / 60000).toFixed(1);
@@ -359,6 +441,8 @@ async function main() {
   console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
+  console.log(`Price changes: ${pricesChanged} changed/new  ·  ${pricesUnchanged} unchanged (baseline ${existingPrices.size})`);
+  console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
   console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
