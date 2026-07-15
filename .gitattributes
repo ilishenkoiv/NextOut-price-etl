@@ -1,0 +1,2 @@
+# Price snapshots are gzip binaries — never diff/merge as text.
+snapshots/**/*.csv.gz binary

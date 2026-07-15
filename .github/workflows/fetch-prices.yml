@@ -51,6 +51,11 @@ concurrency:
   group: price-fetch
   cancel-in-progress: false
 
+# The snapshot commit steps push the generated snapshots/ files back to the repo using the
+# built-in GITHUB_TOKEN — that needs write access to contents.
+permissions:
+  contents: write
+
 jobs:
   near:
     # Runs on BOTH cron schedules (near is refreshed twice daily) and on a manual
@@ -86,15 +91,34 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
 
+      - name: Commit price snapshot (near)
+        if: always()          # snapshot a partial run too; never gate on the fetch step's status
+        env:
+          SCOPE: near
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshots/
+          if git diff --staged --quiet; then
+            echo "No snapshot to commit."
+          else
+            git commit -m "snapshot: $(TZ=Europe/Berlin date '+%Y-%m-%d %H%M') ${SCOPE}"
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main && git push && break
+              echo "push retry $i"; sleep 5
+            done
+          fi
+
   far:
-    # Far months only on the 04:00 full sweep, or a manual far/both run — never at 14:00.
-    # `needs: near` keeps it strictly after near (no concurrent API load); `always()`
-    # lets it still run when near was SKIPPED (a manual far-only dispatch).
+    # Far months only on the nightly full sweep (cron '0 23'), or a manual far/both run —
+    # never on the noon near-only run ('0 10'). `needs: near` keeps it strictly after near
+    # (no concurrent API load); `always()` lets it still run when near was SKIPPED (a manual
+    # far-only dispatch).
     needs: near
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -121,3 +145,21 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
+
+      - name: Commit price snapshot (far)
+        if: always()          # snapshot a partial run too; never gate on the fetch step's status
+        env:
+          SCOPE: far
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snapshots/
+          if git diff --staged --quiet; then
+            echo "No snapshot to commit."
+          else
+            git commit -m "snapshot: $(TZ=Europe/Berlin date '+%Y-%m-%d %H%M') ${SCOPE}"
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main && git push && break
+              echo "push retry $i"; sleep 5
+            done
+          fi

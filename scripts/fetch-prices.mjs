@@ -37,8 +37,12 @@
 
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
+import { gzipSync } from 'node:zlib';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
+import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
 
 // ── Config / secrets (env only) ──────────────────────────────────────────────
 const TP_TOKEN = process.env.TP_TOKEN;
@@ -97,6 +101,53 @@ function targetsFor(origin) {
   return DEST_IATAS.filter((d) => d !== origin && STOPS[d] !== undefined);
 }
 
+// ── COMBO selection: cheap pool + min-nights-by-distance targets ─────────────────
+// From the FULL month response (limit=500) we keep, per route-month+flight_type:
+//   (a) the N cheapest offers of ANY length  → in_cheap_pool = true
+//   (b) the cheapest offer within ±1 night of each TARGET duration → target_nights = target
+// Targets depend on distance (haversine origin→dest, from coords.js) AND stops (curated):
+//   near <1500km:            3/5/7/10/14
+//   mid  1500–4000km:        5/7/10/14
+//   far  >4000km & stops=0:  5/7/10/14   (direct long-haul, e.g. Dubai)
+//   far  >4000km & stops=1:  7/10/14     (island/Asia/Americas via a stop)
+// One offer may carry BOTH tags (never duplicated). Where a target has no offer in ±1, no row
+// is created — the app honestly shows a seed "estimate" there (selectFlightOffer needs nights±2).
+const CHEAP_N = 10;
+function haversineKm(a, b) {
+  const R = 6371, t = (x) => x * Math.PI / 180;
+  const dLat = t(b[0] - a[0]), dLon = t(b[1] - a[1]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(t(a[0])) * Math.cos(t(b[0])) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(h)));
+}
+function targetSet(origin, dest) {
+  const oc = ORIGIN_COORDS[origin], dc = DEST_COORDS[dest];
+  if (!oc || !dc) return [5, 7, 10, 14]; // safe default if a coord is ever missing
+  const km = haversineKm(oc, dc);
+  const stops = STOPS[dest] ?? 1;
+  if (km < 1500) return [3, 5, 7, 10, 14];
+  if (km <= 4000) return [5, 7, 10, 14];
+  return stops === 0 ? [5, 7, 10, 14] : [7, 10, 14];
+}
+function selectCombo(offers, origin, dest) {
+  const usable = offers.filter((o) => o.price > 0 && o.nights != null && o.nights >= 1);
+  if (!usable.length) return [];
+  const byPrice = [...usable].sort((a, b) => a.price - b.price); // ascending → first match = cheapest
+  const chosen = new Map(); // `${departure_at}|${return_at}` → tagged offer
+  const take = (o, patch) => {
+    const k = `${o.departure_at}|${o.return_at}`;
+    const cur = chosen.get(k) || { ...o, in_cheap_pool: false, target_nights: null };
+    if (patch.cheap) cur.in_cheap_pool = true;
+    if (patch.target != null && cur.target_nights == null) cur.target_nights = patch.target;
+    chosen.set(k, cur);
+  };
+  for (const o of byPrice.slice(0, CHEAP_N)) take(o, { cheap: true });            // (a) cheap pool
+  for (const t of targetSet(origin, dest)) {                                      // (b) per target
+    const best = byPrice.find((o) => Math.abs(o.nights - t) <= 1);
+    if (best) take(best, { target: t });
+  }
+  return [...chosen.values()];
+}
+
 // ≥1100ms between ALL TP calls keeps us under the 60/min limit with margin. Overridable
 // via TP_PAUSE_MS for CI/re-runs; do NOT drop below ~1100 against the live API.
 const PAUSE_MS = Number(process.env.TP_PAUSE_MS) || 1100;
@@ -115,6 +166,10 @@ const pad = (n) => String(n).padStart(2, '0');
 //            MONTH_START=7 MONTH_COUNT=6 → the far months 7–12.
 const MONTH_START = Number(process.env.MONTH_START) || 1;
 const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
+// Snapshot scope label = which month-slice THIS job collected (near=1–6, far=7–12).
+const SCOPE = MONTH_START <= 1 ? 'near'
+  : MONTH_START === 7 ? 'far'
+  : `m${MONTH_START}-${MONTH_START + MONTH_COUNT - 1}`;
 const now = new Date();
 const MONTHS = [];
 for (let i = 0; i < MONTH_COUNT; i += 1) {
@@ -177,7 +232,10 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
   const url =
     `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=${origin}` +
     `&destination=${dest}&departure_at=${ym}&return_at=${ym}&direct=${direct}` +
-    `&currency=eur&limit=30&token=${TP_TOKEN}`;
+    // limit RAISED 30→500: the cheapest 30 were all short trips (1–4n) → the long durations
+    // (10/14n) drowned. 500 returns EVERY duration for combo selection. Still ONE request
+    // (TP rate-limits per REQUEST, not per row) — no extra API calls.
+    `&currency=eur&limit=500&token=${TP_TOKEN}`;
   const r = await getJson(url);
   if (!r || !r.success || !Array.isArray(r.data)) {
     return { ok: false, min: null, offers: [] };
@@ -244,6 +302,38 @@ async function loadExistingPrices() {
   return map;
 }
 
+// ── Price snapshot: append-only gzip-CSV history for future analysis ──────────
+// PURELY ADDITIVE. Runs AFTER all Supabase writes; never changes what/how we collect
+// or what we write to Supabase. Any failure is logged and swallowed so a snapshot
+// problem can NEVER fail the ETL. Path: snapshots/YYYY/MM/YYYY-MM-DD_HHMM_<scope>.csv.gz
+// (HHMM = Europe/Berlin, matching the ETL schedule). Columns are explicit + stable.
+function berlinStampParts(d = new Date()) {
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const g = (t) => p.find((x) => x.type === t).value;
+  return { y: g('year'), mo: g('month'), da: g('day'), hh: g('hour'), mi: g('minute') };
+}
+function writeSnapshot(rows, scope) {
+  try {
+    const { y, mo, da, hh, mi } = berlinStampParts(new Date());
+    const dir = join('snapshots', y, mo);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${y}-${mo}-${da}_${hh}${mi}_${scope}.csv.gz`);
+    const esc = (v) => (v == null ? '' : String(v));
+    let csv = 'origin,dest,depart_month,price_direct,price_any,currency,fetched_at,scope\n';
+    for (const r of rows) {
+      csv += [r.origin, r.dest, r.month, esc(r.direct), esc(r.any), 'EUR', r.fetched_at, scope].join(',') + '\n';
+    }
+    const gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
+    writeFileSync(file, gz);
+    console.log(`Snapshot: ${file}  (${rows.length} rows, ${(gz.length / 1024).toFixed(1)} KB gz)`);
+  } catch (e) {
+    console.warn(`⚠ snapshot write failed (non-fatal, ETL unaffected): ${e.message}`);
+  }
+}
+
 async function main() {
   // Plan the run so we can print totals and a live ETA.
   const plan = ORIGINS_ALL.map((o) => ({ origin: o, targets: targetsFor(o) }));
@@ -271,6 +361,7 @@ async function main() {
   // Supabase write buffer + counters. We flush in BATCH-sized upserts, and flush
   // periodically during the (multi-hour) run so partial progress is persisted.
   const priceBuf = [];
+  const snapshotRows = []; // TEE of this run's collected price rows → gzip-CSV history file
   let pricesWritten = 0;
   let priceWriteErrors = 0;
 
@@ -384,6 +475,8 @@ async function main() {
         byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month). Unchanged.
         priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+        // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
+        snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
         // price_history: log ONLY when this price differs from the baseline (or the route is new).
         // Compare each column against the loaded snapshot (null-normalized so null===null matches).
@@ -401,12 +494,15 @@ async function main() {
         } else if (!changed) {
           pricesUnchanged += 1;
         }
-        // Every individual offer → the offers buffer (only when the API actually answered).
+        // COMBO selection → the offers buffer (only when the API actually answered). From the
+        // full ≤500 response we keep the cheap pool + one offer per distance-matrix target,
+        // tagged (in_cheap_pool / target_nights). offersCollected counts what we STORE.
         if (ok) {
           okRouteMonths += 1;
           okMonths.push(ym);
-          for (const o of offers) offerBuf.push(o);
-          offersCollected += offers.length;
+          const combo = selectCombo(offers, origin, dest);
+          for (const o of combo) offerBuf.push(o);
+          offersCollected += combo.length;
         }
         await sleep(PAUSE_MS);
       }
@@ -447,6 +543,9 @@ async function main() {
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
   console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
   console.log(`Elapsed: ${elapsedMin} min`);
+
+  // Additive history step — AFTER every Supabase write. Non-blocking (see writeSnapshot).
+  writeSnapshot(snapshotRows, SCOPE);
 }
 
 main().catch((e) => {
