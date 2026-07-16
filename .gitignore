@@ -10,5 +10,9 @@ node_modules/
 *.log
 .DS_Store
 
+# curated destination photos — downloaded/generated locally, NOT committed (public repo).
+# Includes candidates, optimized WebP, manifest.json, selected.json, review.html.
+photos/
+
 # local tooling
 .claude/

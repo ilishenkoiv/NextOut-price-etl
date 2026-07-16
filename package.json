@@ -7,11 +7,18 @@
     "node": ">=22"
   },
   "scripts": {
-    "fetch-prices": "node scripts/fetch-prices.mjs"
+    "fetch-prices": "node scripts/fetch-prices.mjs",
+    "fetch-photos": "node scripts/fetch-photos.mjs",
+    "review-photos": "node scripts/review.mjs",
+    "optimize-photos": "node scripts/optimize-photos.mjs",
+    "upload-photos": "node scripts/upload-photos.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.1",
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "sharp": "^0.34.1"
   },
   "license": "MIT"
 }
