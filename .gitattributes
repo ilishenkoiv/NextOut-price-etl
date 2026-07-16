@@ -1,2 +1,14 @@
 # Price snapshots are gzip binaries — never diff/merge as text.
 snapshots/**/*.csv.gz binary
+
+# Line endings: normalize to LF in the repo AND keep LF on checkout. Silences the
+# "LF will be replaced by CRLF" warnings from Git-for-Windows' system-level
+# core.autocrlf=true, without touching that machine setting.
+* text=auto eol=lf
+
+# Binary assets — never normalize line endings or diff as text.
+*.gz   binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.webp binary
