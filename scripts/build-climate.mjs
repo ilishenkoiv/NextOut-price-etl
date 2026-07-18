@@ -62,9 +62,21 @@ async function fetchChunk(lat, lng, y1, y2) {
     `?latitude=${lat}&longitude=${lng}` +
     `&start_date=${y1}-01-01&end_date=${y2}-12-31` +
     '&daily=temperature_2m_max,precipitation_sum,sunshine_duration&timezone=UTC';
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${lat},${lng} ${y1}-${y2}`);
-  return res.json();
+  // The free tier rate-limits in short bursts — retry 429/5xx with backoff (a transient
+  // 429 killed the very first run). Give up only after all retries are exhausted.
+  const waits = [5000, 15000, 30000, 60000, 120000];
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url);
+    if (res.ok) return res.json();
+    if ((res.status === 429 || res.status >= 500) && attempt < waits.length) {
+      const retryAfter = Number(res.headers.get('retry-after')) * 1000;
+      const wait = Math.max(waits[attempt], retryAfter || 0);
+      console.warn(`  HTTP ${res.status} for ${lat},${lng} ${y1}-${y2} — retry in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${waits.length})`);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(`HTTP ${res.status} for ${lat},${lng} ${y1}-${y2}`);
+  }
 }
 
 // Aggregate one coordinate → 12 monthly rows.
