@@ -179,7 +179,7 @@ export const CITIES = {
   PVG: {
     city: 'Shanghai', country: 'China',
     photoQuery: 'Shanghai Pudong skyline',
-    photoQueryFallbacks: ['The Bund Shanghai', 'Yu Garden Shanghai'],
+    photoQueryFallbacks: ['Shanghai Yuyuan garden', 'Shanghai French Concession street', 'Shanghai night cityscape'],
   },
   CAN: {
     city: 'Guangzhou', country: 'China',
@@ -188,8 +188,8 @@ export const CITIES = {
   },
   TFU: {
     city: 'Chengdu', country: 'China',
-    photoQuery: 'Giant panda Chengdu',
-    photoQueryFallbacks: ['Jinli Street Chengdu', 'Chengdu skyline China'],
+    photoQuery: 'Chengdu skyline',
+    photoQueryFallbacks: ['Chengdu Anshun bridge', 'Chengdu Jinli ancient street', 'Chengdu teahouse people', 'Giant panda Chengdu'],
   },
   NRT: {
     city: 'Tokyo', country: 'Japan',
@@ -203,8 +203,8 @@ export const CITIES = {
   },
   FUK: {
     city: 'Fukuoka', country: 'Japan',
-    photoQuery: 'Fukuoka yatai food stalls',
-    photoQueryFallbacks: ['Ohori Park Fukuoka', 'Fukuoka skyline Japan'],
+    photoQuery: 'Fukuoka skyline',
+    photoQueryFallbacks: ['Fukuoka Ohori park', 'Fukuoka Canal City', 'Fukuoka temple', 'Fukuoka yatai food stalls'],
   },
   PUS: {
     city: 'Busan', country: 'South Korea',
