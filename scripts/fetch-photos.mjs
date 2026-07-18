@@ -115,9 +115,13 @@ async function main() {
       continue;
     }
 
-    // Try the primary query; if the city comes up short (< MIN_RESULTS), try the next
-    // fallback query, MERGING unique photos (dedup by Pexels id) until we have enough or run
-    // out of queries. Each query is one API request, so pause after every one.
+    // Pool candidates ACROSS the queries for thematic diversity (dedup by Pexels id).
+    // Before, a primary that returned ≥ MIN_RESULTS starved every fallback — TFU got only
+    // pandas, PVG only the Pudong waterfront, FUK only food stalls. Now each query
+    // contributes at most PER_QUERY_CAP unique photos until we have PER_PAGE or run out of
+    // queries. Cities with ONE query behave exactly as before. One API request per query,
+    // so pause after every one.
+    const PER_QUERY_CAP = 2;
     const photosById = new Map();
     const queriesTried = [];
     const searchErrors = [];
@@ -131,9 +135,14 @@ async function main() {
         continue;
       }
       queriesTried.push(q);
-      for (const p of batch) if (!photosById.has(p.id)) photosById.set(p.id, p);
+      let added = 0;
+      for (const p of batch) {
+        if (photosById.has(p.id) || added >= PER_QUERY_CAP) continue;
+        photosById.set(p.id, p);
+        added++;
+      }
       await sleep(PAUSE_MS);
-      if (photosById.size >= MIN_RESULTS) break; // enough — don't spend fallback requests
+      if (photosById.size >= PER_PAGE) break; // full pool — don't spend more requests
     }
     const photos = [...photosById.values()].slice(0, PER_PAGE);
 
