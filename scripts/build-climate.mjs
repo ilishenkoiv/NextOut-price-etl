@@ -18,7 +18,7 @@
 // Free-tier limits (600 req/min, 10k/day): 6 chunks/dest × ~133 dests ≈ 800 requests — one day
 // suffices with the 300 ms pause. Identical coordinates are fetched ONCE (NRT shares HND/Tokyo).
 
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEST_COORDS } from '../src/data/coords.js';
@@ -28,8 +28,11 @@ const ROOT = path.join(__dirname, '..');
 const DRY_RUN = process.argv.includes('--dry-run');
 
 const YEARS_START = 1995, YEARS_END = 2024;   // 30 years
-const CHUNK_YEARS = 5;                        // 6 requests per destination
-const PAUSE_MS = 300;
+const CHUNK_YEARS = 10;                       // 3 bigger requests per destination (fewer 429s)
+// The archive endpoint's real minutely limit is FAR below the advertised 600/min — at
+// 300ms pauses (~37 req/min) every request bounced with "Minutely API request limit
+// exceeded". 5s spacing (~12/min) stays under it; retries handle the residual bursts.
+const PAUSE_MS = 5000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Dedupe identical coordinates (NRT == HND/Tokyo): fetch once, copy the rows.
@@ -62,9 +65,9 @@ async function fetchChunk(lat, lng, y1, y2) {
     `?latitude=${lat}&longitude=${lng}` +
     `&start_date=${y1}-01-01&end_date=${y2}-12-31` +
     '&daily=temperature_2m_max,precipitation_sum,sunshine_duration&timezone=UTC';
-  // The free tier rate-limits in short bursts — retry 429/5xx with backoff (a transient
-  // 429 killed the very first run). Give up only after all retries are exhausted.
-  const waits = [5000, 15000, 30000, 60000, 120000];
+  // The free tier rate-limits in bursts and penalizes with longer windows — back off
+  // patiently (up to ~28 min of retries per chunk), then skip: the next run refills.
+  const waits = [30000, 60000, 120000, 300000, 600000];
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url);
     if (res.ok) return res.json();
@@ -117,30 +120,63 @@ function iconOf(r) {
   return '☁️';
 }
 
-const allRows = []; // { iata, month, avg_tmax, rain_days, avg_sun_h, precip_mm }
+// ── Main loop (RESUMABLE) ─────────────────────────────────────────────────────
+// Progress is persisted after EVERY destination into data/weather-climate.json, so a
+// rate-limited / interrupted run resumes where it stopped — just run the script again.
+// A chunk that exhausts its retries is SKIPPED (logged) and the run continues; the next
+// run refills it. Partial artifacts are always written — coverage is reported honestly.
+
+const PROGRESS_PATH = path.join(ROOT, 'data', 'weather-climate.json');
+let allRows = [];
+try {
+  allRows = JSON.parse(await readFile(PROGRESS_PATH, 'utf8'));
+  console.log(`Resuming: ${allRows.length} rows already collected`);
+} catch { /* first run */ }
+const doneIatas = new Set(allRows.map((r) => r.iata));
+
 const dist = { '🌧️': 0, '☀️': 0, '⛅': 0, '☁️': 0 };
+for (const r of allRows) dist[iconOf(r)]++;
+
 let done = 0;
+const failedChunks = [];
 for (const [coord, iatas] of uniquePoints) {
+  if (iatas.every((i) => doneIatas.has(i))) continue; // already collected in a previous run
   const [lat, lng] = coord.split(',').map(Number);
   const daily = { time: [], temperature_2m_max: [], precipitation_sum: [], sunshine_duration: [] };
+  let ok = true;
   for (const [y1, y2] of chunks) {
-    const part = await fetchChunk(lat, lng, y1, y2);
-    daily.time.push(...part.daily.time);
-    daily.temperature_2m_max.push(...part.daily.temperature_2m_max);
-    daily.precipitation_sum.push(...part.daily.precipitation_sum);
-    daily.sunshine_duration.push(...part.daily.sunshine_duration);
+    try {
+      const part = await fetchChunk(lat, lng, y1, y2);
+      daily.time.push(...part.daily.time);
+      daily.temperature_2m_max.push(...part.daily.temperature_2m_max);
+      daily.precipitation_sum.push(...part.daily.precipitation_sum);
+      daily.sunshine_duration.push(...part.daily.sunshine_duration);
+    } catch (err) {
+      console.error(`✗ ${iatas.join('+')} ${y1}-${y2}: ${err.message} — skipped, rerun refills`);
+      failedChunks.push(`${iatas.join('+')} ${y1}-${y2}`);
+      ok = false;
+      break;
+    }
     done++;
-    if (done % 60 === 0) console.log(`  …${done}/${totalRequests} requests`);
+    if (done % 30 === 0) console.log(`  …${done} requests this run`);
     await sleep(PAUSE_MS);
   }
+  if (!ok) continue;
   const monthly = aggregate(daily);
   for (const iata of iatas) {
     for (const r of monthly) {
       allRows.push({ iata, ...r });
       dist[iconOf(r)]++;
+      doneIatas.add(iata);
     }
   }
-  console.log(`${iatas.join('+')} (${coord}) — ${monthly.length} monthly rows × ${iatas.length} dest(s)`);
+  console.log(`${iatas.join('+')} (${coord}) — ${monthly.length} monthly rows × ${iatas.length} dest(s)  [${doneIatas.size}/${Object.keys(DEST_COORDS).length}]`);
+  await mkdir(path.join(ROOT, 'data'), { recursive: true });
+  await writeFile(PROGRESS_PATH, JSON.stringify(allRows, null, 2));
+}
+if (failedChunks.length) {
+  console.log(`\n⚠ ${failedChunks.length} chunk(s) failed this run — rerun the script to refill:`);
+  for (const f of failedChunks) console.log(`  ${f}`);
 }
 
 // ── artifacts ─────────────────────────────────────────────────────────────────
