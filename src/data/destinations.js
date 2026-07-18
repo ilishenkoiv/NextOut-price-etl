@@ -49,7 +49,6 @@ export const DESTINATIONS = [
   { iata: 'KEF', stops: 0, bestMonths: [6, 7, 8] },
   { iata: 'DUB', stops: 0, bestMonths: [5, 6, 7, 8, 9] },
   { iata: 'EDI', stops: 0, bestMonths: [5, 6, 7, 8] },
-  { iata: 'INN', stops: 0, bestMonths: [1, 2, 3, 6, 7, 8, 9, 12] },
   { iata: 'GVA', stops: 0, bestMonths: [1, 2, 3, 6, 7, 8, 9, 12] },
   { iata: 'ZRH', stops: 1, bestMonths: [1, 2, 3, 6, 7, 8, 9, 12] },
   { iata: 'BRN', stops: 1, bestMonths: [6, 7, 8, 9] },

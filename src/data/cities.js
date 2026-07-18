@@ -96,7 +96,6 @@ export const CITIES = {
   DUB: { city: 'Dublin', country: 'Ireland' },
   AMS: { city: 'Amsterdam', country: 'Netherlands' },
   VIE: { city: 'Vienna', country: 'Austria' },
-  INN: { city: 'Innsbruck', country: 'Austria' },
   PRG: { city: 'Prague', country: 'Czechia' },
   BUD: { city: 'Budapest', country: 'Hungary' },
   KRK: { city: 'Krakow', country: 'Poland' },
