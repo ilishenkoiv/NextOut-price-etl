@@ -19,6 +19,8 @@ export const ORIGIN_COORDS = {
   NRN: [51.6024, 6.1422],
   BTS: [48.1694, 17.212],
   EIN: [51.45, 5.375],
+  DRS: [51.1328, 13.7672],
+  LEJ: [51.4239, 12.2364],
 };
 
 export const DEST_COORDS = {

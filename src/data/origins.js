@@ -11,5 +11,7 @@
 export const HUB_AIRPORTS = ['FRA', 'MUC', 'BER', 'DUS', 'HAM', 'STR', 'CGN', 'VIE', 'ZRH', 'GVA', 'BSL', 'SZG'];
 // Ryanair/Wizz/Eurowings/Transavia bases. BTS (Bratislava, 60 km from Vienna) and EIN
 // (Eindhoven, ~100 km from Düsseldorf) added as major low-cost hubs near existing DACH cities.
-export const LOWCOST_AIRPORTS = ['NUE', 'FMM', 'HHN', 'NRN', 'BTS', 'EIN'];
+// DRS (Dresden) and LEJ (Leipzig/Halle) are secondary Saxon airports served by Eurowings and
+// Ryanair rather than network carriers — same profile as NUE/FMM, so they group here.
+export const LOWCOST_AIRPORTS = ['NUE', 'FMM', 'HHN', 'NRN', 'BTS', 'EIN', 'DRS', 'LEJ'];
 export const ORIGINS_ALL = [...HUB_AIRPORTS, ...LOWCOST_AIRPORTS];
