@@ -65,8 +65,10 @@ jobs:
       github.event.inputs.scope == 'near' ||
       github.event.inputs.scope == 'both'
     runs-on: ubuntu-latest
-    # ~247 min typical for 6 months (2247 routes); 340 leaves headroom for retries, under the 6h cap.
-    timeout-minutes: 340
+    # Observed 269–311 min for 6 months (2391 route-pairs, 18 origins). Adding DRS+LEJ takes it to
+    # 2657 pairs (+11%) → worst case ~346 min, over the old 340. 355 is a STOPGAP ceiling (GitHub
+    # hosted-runner hard cap is 360). Proper fix is a 3-way month split — planned, separate session.
+    timeout-minutes: 355
     env:
       MONTH_START: '1'
       MONTH_COUNT: '6'
