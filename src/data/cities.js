@@ -170,7 +170,8 @@ export const CITIES = {
     photoQuery: 'Gyeongbokgung Palace Seoul',
     photoQueryFallbacks: ['N Seoul Tower night', 'Bukchon Hanok Village Seoul'],
   },
-  // ── East Asia expansion (2026-07-18). NRT shares Tokyo's queries (same city as HND).
+  // ── East Asia expansion (2026-07-18). Tokyo is HND only — NRT was a duplicate entry
+  // for the same city and was dropped (2026-07-21); the app's catalog keys Tokyo on HND.
   PEK: {
     city: 'Beijing', country: 'China',
     photoQuery: 'Great Wall of China',
@@ -190,11 +191,6 @@ export const CITIES = {
     city: 'Chengdu', country: 'China',
     photoQuery: 'Chengdu skyline',
     photoQueryFallbacks: ['Chengdu Anshun bridge', 'Chengdu Jinli ancient street', 'Chengdu teahouse people', 'Giant panda Chengdu'],
-  },
-  NRT: {
-    city: 'Tokyo', country: 'Japan',
-    photoQuery: 'Tokyo Tower Japan',
-    photoQueryFallbacks: ['Shibuya crossing Tokyo', 'Senso-ji temple Tokyo'],
   },
   CTS: {
     city: 'Sapporo', country: 'Japan',
