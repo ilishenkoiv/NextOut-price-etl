@@ -29,14 +29,13 @@ create policy "anon read flight_estimates"
   using (true);
 
 -- Seed: every stops=1 destination with <10 dated offers in the cache (2026-07-18).
--- The 9 new East-Asia routes get live prices from the next ETL run — these are stopgaps;
+-- The 8 new East-Asia routes get live prices from the next ETL run — these are stopgaps;
 -- a live price always takes priority in the app.
 insert into public.flight_estimates (iata, from_price_eur, note, updated_at) values
   ('PEK', 480, 'Beijing — new route, stopgap until ETL collects', now()),
   ('PVG', 520, 'Shanghai — new route, stopgap until ETL collects', now()),
   ('CAN', 500, 'Guangzhou — new route, stopgap until ETL collects', now()),
   ('TFU', 540, 'Chengdu — new route, stopgap until ETL collects', now()),
-  ('NRT', 600, 'Tokyo Narita — new route, stopgap until ETL collects', now()),
   ('CTS', 650, 'Sapporo — new route, stopgap until ETL collects', now()),
   ('FUK', 620, 'Fukuoka — new route, stopgap until ETL collects', now()),
   ('PUS', 560, 'Busan — new route, stopgap until ETL collects', now()),

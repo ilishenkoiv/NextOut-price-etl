@@ -79,7 +79,6 @@ export const DESTINATIONS = [
   { iata: 'PVG', stops: 1, bestMonths: [4, 5, 9, 10, 11] },
   { iata: 'CAN', stops: 1, bestMonths: [1, 2, 3, 10, 11, 12] },
   { iata: 'TFU', stops: 1, bestMonths: [3, 4, 5, 9, 10, 11] },
-  { iata: 'NRT', stops: 1, bestMonths: [3, 4, 5, 10, 11] },
   { iata: 'CTS', stops: 1, bestMonths: [1, 2, 7, 8] },
   { iata: 'FUK', stops: 1, bestMonths: [3, 4, 5, 10, 11] },
   { iata: 'PUS', stops: 1, bestMonths: [4, 5, 6, 9, 10] },
