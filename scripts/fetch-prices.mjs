@@ -277,6 +277,63 @@ function httpStatusOf(result, err) {
   return null;
 }
 
+// ── Retrying a Supabase WRITE ────────────────────────────────────────────────
+// The read side has been protected for a while — a failed Travelpayouts request writes
+// nothing and the previous value survives. The WRITE side had no such symmetry: Supabase
+// answered a 520 through Cloudflare (origin unreachable), an upsert of 30 offers failed, the
+// buffer was already spliced, and those rows were gone for good. The next run does not pick
+// them up, because nothing records that they were owed.
+//
+// Note that supabase-js does not cover this itself: postgrest-js retries 520 only for
+// GET/HEAD/OPTIONS, deliberately, since it cannot know whether a POST is safe to repeat.
+// Ours are: prices and offers upsert on their primary keys, the prune is a bounded DELETE,
+// and the Storage upload is upsert:true. Repeating any of them lands on the same state.
+// price_history is the one INSERT — a repeat after a write that secretly succeeded could
+// duplicate an observation. That is acceptable and it is the cheap direction: the table is
+// an append-only log of changes, a duplicated row reads as the same price observed twice,
+// and losing the row loses the change forever.
+//
+// Only TRANSIENT failures are repeated: a request that never completed, and any HTTP 5xx
+// (520, 502, 503 …). A 4xx is our own data or our own rights — a repeat changes nothing and
+// only spends time.
+const WRITE_RETRY_BACKOFF_MS = [2000, 5000, 15000];
+const WRITE_MAX_ATTEMPTS = WRITE_RETRY_BACKOFF_MS.length + 1;
+
+function isTransientWriteFailure(status) {
+  if (status == null) return true; // thrown before any response existed → network/socket
+  if (status === 0) return true;   // postgrest-js: fetch itself never completed
+  return status >= 500;            // 5xx, Cloudflare's 52x included
+}
+
+// Run one Supabase write, repeating it while it fails transiently. `run` must return a
+// supabase-js result ({ data, error, status }) or throw. Returns the same shape plus `ok`,
+// `attempts` and the last error already formatted for the log.
+async function writeWithRetry(label, run) {
+  for (let attempt = 1; ; attempt += 1) {
+    let res = null;
+    let err = null;
+    let threw = false;
+    try {
+      res = await run();
+      err = res?.error ?? null;
+    } catch (e) {
+      threw = true;
+      err = e;
+    }
+    if (!err) return { ok: true, data: res?.data ?? null, error: null, attempts: attempt };
+
+    const status = threw ? httpStatusOf(null, err) : httpStatusOf(res, err);
+    const why = describeError(status, err);
+    const transient = threw || isTransientWriteFailure(status);
+    if (!transient || attempt >= WRITE_MAX_ATTEMPTS) {
+      return { ok: false, data: null, error: err, why, attempts: attempt, transient };
+    }
+    const wait = WRITE_RETRY_BACKOFF_MS[attempt - 1];
+    console.warn(`    ⚠ ${label} — ${why}  · attempt ${attempt}/${WRITE_MAX_ATTEMPTS}, retrying in ${wait / 1000}s`);
+    await sleep(wait);
+  }
+}
+
 // Fetch JSON with a timeout. Never throws — logs and returns null on any failure.
 async function getJson(url) {
   const ctrl = new AbortController();
@@ -480,15 +537,14 @@ async function uploadSnapshot(rows, scope) {
         'the upload will probably be rejected.',
       );
     }
-    const res = await supabase.storage
+    const r = await writeWithRetry(`snapshot upload ${key}`, () => supabase.storage
       .from(SNAPSHOT_BUCKET)
-      .upload(key, gz, { contentType: 'application/gzip', upsert: true });
-    if (res.error) {
-      const why = describeError(httpStatusOf(res, res.error), res.error);
-      console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
-      return { ok: false, key, kb, rows: rows.length, error: why };
+      .upload(key, gz, { contentType: 'application/gzip', upsert: true }));
+    if (!r.ok) {
+      console.warn(`⚠ snapshot upload failed after ${r.attempts} attempt(s) (non-fatal, ETL unaffected): ${r.why}`);
+      return { ok: false, key, kb, rows: rows.length, error: r.why, attempts: r.attempts };
     }
-    return { ok: true, key, kb, rows: rows.length, error: null };
+    return { ok: true, key, kb, rows: rows.length, error: null, attempts: r.attempts };
   } catch (e) {
     const why = describeError(httpStatusOf(null, e), e);
     console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
@@ -563,6 +619,11 @@ async function main() {
   console.log(`Flight requests: ${totalRequests} (1 per route-month)`);
   console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min\n`);
 
+  // Batches that exhausted every retry and are gone for good. Row counts live in the
+  // per-table *WriteErrors counters; this counts the LOSSES, so the summary can state the
+  // damage in one line instead of leaving it as a warning somewhere in the middle of the log.
+  const lostBatches = { prices: 0, offers: 0, history: 0 };
+
   // Supabase write buffer + counters. We flush in BATCH-sized upserts, and flush
   // periodically during the (multi-hour) run so partial progress is persisted.
   const priceBuf = [];
@@ -573,15 +634,13 @@ async function main() {
   async function flushPrices(force = false) {
     while (priceBuf.length >= BATCH || (force && priceBuf.length > 0)) {
       const rows = priceBuf.splice(0, BATCH);
-      try {
-        const res = await supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' });
-        if (res.error) {
-          console.warn(`    ⚠ prices upsert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
-          priceWriteErrors += rows.length;
-        } else pricesWritten += rows.length;
-      } catch (e) {
-        console.warn(`    ⚠ prices upsert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
+      const r = await writeWithRetry(`prices upsert (${rows.length} rows)`, () =>
+        supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' }));
+      if (r.ok) pricesWritten += rows.length;
+      else {
+        console.warn(`    ⚠ prices upsert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
         priceWriteErrors += rows.length;
+        lostBatches.prices += 1;
       }
     }
   }
@@ -598,15 +657,13 @@ async function main() {
   async function flushHistory(force = false) {
     while (historyBuf.length >= BATCH || (force && historyBuf.length > 0)) {
       const rows = historyBuf.splice(0, BATCH);
-      try {
-        const res = await supabase.from('price_history').insert(rows);
-        if (res.error) {
-          console.warn(`    ⚠ price_history insert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
-          historyWriteErrors += rows.length;
-        } else historyWritten += rows.length;
-      } catch (e) {
-        console.warn(`    ⚠ price_history insert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
+      const r = await writeWithRetry(`price_history insert (${rows.length} rows)`, () =>
+        supabase.from('price_history').insert(rows));
+      if (r.ok) historyWritten += rows.length;
+      else {
+        console.warn(`    ⚠ price_history insert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
         historyWriteErrors += rows.length;
+        lostBatches.history += 1;
       }
     }
   }
@@ -625,17 +682,14 @@ async function main() {
   async function flushOffers(force = false) {
     while (offerBuf.length >= BATCH || (force && offerBuf.length > 0)) {
       const rows = offerBuf.splice(0, BATCH);
-      try {
-        const res = await supabase
-          .from('offers')
-          .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' });
-        if (res.error) {
-          console.warn(`    ⚠ offers upsert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
-          offerWriteErrors += rows.length;
-        } else offersWritten += rows.length;
-      } catch (e) {
-        console.warn(`    ⚠ offers upsert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
+      const r = await writeWithRetry(`offers upsert (${rows.length} rows)`, () => supabase
+        .from('offers')
+        .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }));
+      if (r.ok) offersWritten += rows.length;
+      else {
+        console.warn(`    ⚠ offers upsert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
         offerWriteErrors += rows.length;
+        lostBatches.offers += 1;
       }
     }
   }
@@ -645,22 +699,18 @@ async function main() {
   // month whose request FAILED this run keeps its previous offers instead of being wiped.
   // .select() returns the deleted rows so we can count them.
   async function pruneStaleOffers(origin, dest, flightType, months) {
-    try {
-      const res = await supabase
-        .from('offers')
-        .delete()
-        .eq('origin', origin)
-        .eq('dest', dest)
-        .eq('flight_type', flightType)
-        .in('month', months)
-        .lt('updated_at', RUN_START_ISO)
-        .select('origin');
-      if (res.error) {
-        console.warn(`    ⚠ offers prune error ${origin}→${dest} — ${describeError(httpStatusOf(res, res.error), res.error)}`);
-        offerDeleteErrors += 1;
-      } else offersDeleted += (res.data?.length ?? 0);
-    } catch (e) {
-      console.warn(`    ⚠ offers prune threw ${origin}→${dest} — ${describeError(httpStatusOf(null, e), e)}`);
+    const r = await writeWithRetry(`offers prune ${origin}→${dest}`, () => supabase
+      .from('offers')
+      .delete()
+      .eq('origin', origin)
+      .eq('dest', dest)
+      .eq('flight_type', flightType)
+      .in('month', months)
+      .lt('updated_at', RUN_START_ISO)
+      .select('origin'));
+    if (r.ok) offersDeleted += (r.data?.length ?? 0);
+    else {
+      console.warn(`    ⚠ offers prune FAILED ${origin}→${dest} after ${r.attempts} attempt(s) — ${r.why}`);
       offerDeleteErrors += 1;
     }
   }
@@ -817,6 +867,11 @@ async function main() {
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
   console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
+  const lostTotal = lostBatches.prices + lostBatches.offers + lostBatches.history;
+  const lostRows = priceWriteErrors + offerWriteErrors + historyWriteErrors;
+  console.log(lostTotal
+    ? `Write failures: ${lostTotal} batches lost (prices ${lostBatches.prices}, offers ${lostBatches.offers}, history ${lostBatches.history}) — ${lostRows} rows never written, after ${WRITE_MAX_ATTEMPTS} attempts each`
+    : `Write failures: 0 batches lost (prices 0, offers 0, history 0)`);
   console.log(snapshot.ok
     ? `Snapshot upload: OK → ${SNAPSHOT_BUCKET}/${snapshot.key}  (${snapshot.rows} rows, ${snapshot.kb} KB gz)`
     : `Snapshot upload: FAILED — ${snapshot.error}  (${snapshot.rows} rows${snapshot.kb ? `, ${snapshot.kb} KB gz` : ''} NOT uploaded)`);
