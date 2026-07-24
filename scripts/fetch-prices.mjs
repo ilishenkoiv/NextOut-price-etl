@@ -180,6 +180,46 @@ const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
 // name a 3-month slice after a 6-month one. Older objects in the bucket keep their names.
 const SCOPE = `m${MONTH_START}-${MONTH_START + MONTH_COUNT - 1}`;
 const now = new Date();
+
+// ── The run's day number: the single seed behind everything date-dependent here ───────────
+// Days since the Unix epoch, in UTC. Deliberately NOT a day-of-year: 365 % 7 === 1, so
+// Dec 31 and Jan 1 would fall in the same weekly slot and one slot would be skipped for a
+// year. PLAN_DATE (YYYY-MM-DD) pins it, so a past run can be reproduced exactly.
+// NOTE: the four CI jobs each compute this themselves, so a sweep that starts before
+// midnight UTC and ends after it uses two consecutive day numbers — a different route order
+// and a different dead-pair slice for the later months. Harmless; both are valid plans.
+const PLAN_DATE = process.env.PLAN_DATE ? new Date(`${process.env.PLAN_DATE}T00:00:00Z`) : now;
+if (Number.isNaN(PLAN_DATE.getTime())) {
+  console.error(`ERROR: PLAN_DATE="${process.env.PLAN_DATE}" is not a valid YYYY-MM-DD date.`);
+  process.exit(1);
+}
+const PLAN_DAY = Math.floor(
+  Date.UTC(PLAN_DATE.getUTCFullYear(), PLAN_DATE.getUTCMonth(), PLAN_DATE.getUTCDate()) / 86400000,
+);
+
+// mulberry32 — a tiny deterministic PRNG. Same seed, same sequence, so the whole plan is
+// reproducible from the date alone; Math.random() would make a cancelled run impossible to
+// replay and impossible to reason about.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Fisher-Yates with a seeded PRNG.
+function shuffledBySeed(items, seed) {
+  const a = [...items];
+  const rnd = mulberry32(seed);
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 const MONTHS = [];
 for (let i = 0; i < MONTH_COUNT; i += 1) {
   // +MONTH_START skips the current partially-elapsed month; +i walks the window.
@@ -382,8 +422,18 @@ async function uploadSnapshot(rows, scope) {
 
 async function main() {
   // Plan the run so we can print totals and a live ETA.
-  const plan = ORIGINS_ALL.map((o) => ({ origin: o, targets: targetsFor(o) }));
-  const routeTotal = plan.reduce((s, p) => s + p.targets.length, 0);
+  //
+  // ORDER IS SHUFFLED, deterministically, with the day number as the seed. The plan used to
+  // be walked in catalog order, so anything that cut a run short — a timeout, a cancellation,
+  // a 502 burst — always cost the SAME airports, the ones sitting in the tail (DRS, LEJ went
+  // uncollected repeatedly). Shuffling spreads that damage over the whole network instead of
+  // concentrating it, while the seed keeps the run replayable: same date, same order.
+  const catalogRoutes = [];
+  for (const origin of ORIGINS_ALL) {
+    for (const dest of targetsFor(origin)) catalogRoutes.push({ origin, dest });
+  }
+  const routes = shuffledBySeed(catalogRoutes, PLAN_DAY);
+  const routeTotal = routes.length;
   const totalRequests = routeTotal * MONTHS.length; // ONE request per route-month
 
   console.log(`Supabase: ${SUPABASE_URL}`);
@@ -512,106 +562,104 @@ async function main() {
   const paceT0 = Date.now(); // start of the collection window, for the achieved req/min
   const etaMin = () => Math.round((totalRequests - reqDone) * TARGET_INTERVAL_MS / 60000);
 
-  for (const { origin, targets } of plan) {
-    for (const dest of targets) {
-      route += 1;
-      const stops = STOPS[dest];
-      const flightHasStop = stops === 1; // long-haul default: cheapest 1+ stop
-      const flightType = flightHasStop ? 'any' : 'direct';
-      const byMonth = {};
-      const okMonths = []; // months the API answered → the only ones we may prune
-      for (const ym of MONTHS) {
-        // ONE request per route-month, chosen by distance: near = direct, far = any.
-        const reqT0 = Date.now();
-        const { ok, min, offers, reason } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
-        const reqMs = Date.now() - reqT0;
-        reqDone += 1;
-        reqMsTotal += reqMs;
+  for (const { origin, dest } of routes) {
+    route += 1;
+    const stops = STOPS[dest];
+    const flightHasStop = stops === 1; // long-haul default: cheapest 1+ stop
+    const flightType = flightHasStop ? 'any' : 'direct';
+    const byMonth = {};
+    const okMonths = []; // months the API answered → the only ones we may prune
+    for (const ym of MONTHS) {
+      // ONE request per route-month, chosen by distance: near = direct, far = any.
+      const reqT0 = Date.now();
+      const { ok, min, offers, reason } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
+      const reqMs = Date.now() - reqT0;
+      reqDone += 1;
+      reqMsTotal += reqMs;
 
-        // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see the regression test
-        // in fetch-prices.test.cjs. A FAILED request is not an observation: fetchFlightMonth
-        // returns ok:false with min:null for a timeout, a non-2xx (429 included) or a malformed
-        // body. Upserting that null would overwrite a REAL price with nothing, and price_history
-        // would not even log the loss (hasPrice is false), so the destruction left no trace
-        // anywhere. A failed route-month now writes nothing at all and keeps whatever the
-        // previous run collected, until the next run re-asks.
-        //
-        // The asymmetry is deliberate: ok:true with min:null IS written. That is a genuine
-        // observation — "this route-month really has no flights" — and about half of all
-        // route-months legitimately look like that. Skipping it would freeze a price that has
-        // since disappeared: the same silent-staleness bug, pointing the other way.
-        if (ok) {
-          okRouteMonths += 1;
-          okMonths.push(ym);
-          const pair = flightHasStop ? { direct: null, any: min } : { direct: min, any: null };
-          byMonth[ym] = pair;
-          // One prices row per route-month → upsert on PK (origin,dest,month).
-          priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
-          // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
-          snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
+      // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see the regression test
+      // in fetch-prices.test.cjs. A FAILED request is not an observation: fetchFlightMonth
+      // returns ok:false with min:null for a timeout, a non-2xx (429 included) or a malformed
+      // body. Upserting that null would overwrite a REAL price with nothing, and price_history
+      // would not even log the loss (hasPrice is false), so the destruction left no trace
+      // anywhere. A failed route-month now writes nothing at all and keeps whatever the
+      // previous run collected, until the next run re-asks.
+      //
+      // The asymmetry is deliberate: ok:true with min:null IS written. That is a genuine
+      // observation — "this route-month really has no flights" — and about half of all
+      // route-months legitimately look like that. Skipping it would freeze a price that has
+      // since disappeared: the same silent-staleness bug, pointing the other way.
+      if (ok) {
+        okRouteMonths += 1;
+        okMonths.push(ym);
+        const pair = flightHasStop ? { direct: null, any: min } : { direct: min, any: null };
+        byMonth[ym] = pair;
+        // One prices row per route-month → upsert on PK (origin,dest,month).
+        priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+        // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
+        snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
-          // price_history: log ONLY when this price differs from the baseline (or the route is new).
-          // Compare each column against the loaded snapshot (null-normalized so null===null matches).
-          // We DON'T log a change that has no price at all (both null) — a route that returned no
-          // data is noise, not a real observation. Genuine prices (including a price appearing
-          // where there was none) are logged.
-          const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
-          const hasPrice = pair.direct != null || pair.any != null;
-          const changed = !prev
-            || (prev.direct ?? null) !== (pair.direct ?? null)
-            || (prev.any_stops ?? null) !== (pair.any ?? null);
-          if (changed && hasPrice) {
-            historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
-            pricesChanged += 1;
-          } else if (!changed) {
-            pricesUnchanged += 1;
-          }
-
-          // COMBO selection → the offers buffer. From the full ≤500 response we keep the cheap
-          // pool + one offer per distance-matrix target, tagged (in_cheap_pool / target_nights).
-          // offersCollected counts what we STORE.
-          const combo = selectCombo(offers, origin, dest);
-          for (const o of combo) offerBuf.push(o);
-          offersCollected += combo.length;
-        } else {
-          // Counted and reported, per route and in the summary. A failed request used to be
-          // indistinguishable from "no flights" — which is exactly how the null-clobbering
-          // stayed invisible for as long as it did.
-          reqFailed += 1;
-          if (reason === 'body') reqBadBody += 1;
+        // price_history: log ONLY when this price differs from the baseline (or the route is new).
+        // Compare each column against the loaded snapshot (null-normalized so null===null matches).
+        // We DON'T log a change that has no price at all (both null) — a route that returned no
+        // data is noise, not a real observation. Genuine prices (including a price appearing
+        // where there was none) are logged.
+        const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
+        const hasPrice = pair.direct != null || pair.any != null;
+        const changed = !prev
+          || (prev.direct ?? null) !== (pair.direct ?? null)
+          || (prev.any_stops ?? null) !== (pair.any ?? null);
+        if (changed && hasPrice) {
+          historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
+          pricesChanged += 1;
+        } else if (!changed) {
+          pricesUnchanged += 1;
         }
 
-        // Sleep only the REMAINDER of the interval. The request we just made already consumed
-        // part of it, so the spacing between two starts stays TARGET_INTERVAL_MS regardless of
-        // how slow the API was — the whole point of the change. When the request alone outran
-        // the interval there is nothing to sleep off; count it, because that is the only case
-        // where TP's latency still lengthens the run.
-        const remaining = TARGET_INTERVAL_MS - reqMs;
-        if (remaining > 0) await sleep(remaining);
-        else reqOverInterval += 1;
-      }
-      await flushPrices(false);
-      await flushHistory(false);
-
-      // Force-flush THIS route's offers so they are persisted BEFORE we prune stale ones.
-      // Only prune when the write raised no error (else we'd delete old data without a
-      // replacement) and only for months that actually responded.
-      const offerErrBefore = offerWriteErrors;
-      await flushOffers(true);
-      if (okMonths.length && offerWriteErrors === offerErrBefore) {
-        await pruneStaleOffers(origin, dest, flightType, okMonths);
+        // COMBO selection → the offers buffer. From the full ≤500 response we keep the cheap
+        // pool + one offer per distance-matrix target, tagged (in_cheap_pool / target_nights).
+        // offersCollected counts what we STORE.
+        const combo = selectCombo(offers, origin, dest);
+        for (const o of combo) offerBuf.push(o);
+        offersCollected += combo.length;
+      } else {
+        // Counted and reported, per route and in the summary. A failed request used to be
+        // indistinguishable from "no flights" — which is exactly how the null-clobbering
+        // stayed invisible for as long as it did.
+        reqFailed += 1;
+        if (reason === 'body') reqBadBody += 1;
       }
 
-      const got = Object.values(byMonth).some((p) => p.direct != null || p.any != null);
-      if (got) withPrice += 1; else noData += 1;
-      const vals = Object.values(byMonth).map((p) => (flightHasStop ? p.any : p.direct)).filter((p) => p != null);
-      const min = vals.length ? `€${Math.min(...vals)}` : '—';
-      // byMonth only holds ANSWERED months now, so a gap here means the API never replied for
-      // those — surfaced per route so a bad patch is visible while the run is still going.
-      const failedHere = MONTHS.length - okMonths.length;
-      const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} req failed, kept previous` : '';
-      console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}   ~${etaMin()}m left`);
+      // Sleep only the REMAINDER of the interval. The request we just made already consumed
+      // part of it, so the spacing between two starts stays TARGET_INTERVAL_MS regardless of
+      // how slow the API was — the whole point of the change. When the request alone outran
+      // the interval there is nothing to sleep off; count it, because that is the only case
+      // where TP's latency still lengthens the run.
+      const remaining = TARGET_INTERVAL_MS - reqMs;
+      if (remaining > 0) await sleep(remaining);
+      else reqOverInterval += 1;
     }
+    await flushPrices(false);
+    await flushHistory(false);
+
+    // Force-flush THIS route's offers so they are persisted BEFORE we prune stale ones.
+    // Only prune when the write raised no error (else we'd delete old data without a
+    // replacement) and only for months that actually responded.
+    const offerErrBefore = offerWriteErrors;
+    await flushOffers(true);
+    if (okMonths.length && offerWriteErrors === offerErrBefore) {
+      await pruneStaleOffers(origin, dest, flightType, okMonths);
+    }
+
+    const got = Object.values(byMonth).some((p) => p.direct != null || p.any != null);
+    if (got) withPrice += 1; else noData += 1;
+    const vals = Object.values(byMonth).map((p) => (flightHasStop ? p.any : p.direct)).filter((p) => p != null);
+    const min = vals.length ? `€${Math.min(...vals)}` : '—';
+    // byMonth only holds ANSWERED months now, so a gap here means the API never replied for
+    // those — surfaced per route so a bad patch is visible while the run is still going.
+    const failedHere = MONTHS.length - okMonths.length;
+    const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} req failed, kept previous` : '';
+    console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}   ~${etaMin()}m left`);
   }
   // End of the collection window — everything after this is flushing and reporting, so the
   // achieved rate is measured over exactly the part of the run that made requests.
