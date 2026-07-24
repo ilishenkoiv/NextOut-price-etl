@@ -227,6 +227,21 @@ for (let i = 0; i < MONTH_COUNT; i += 1) {
   MONTHS.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`);
 }
 
+// The WHOLE horizon, independent of which slice this job collects — months 1..12 from the
+// current one. Used only to judge whether a route-pair is dead: "no price in ANY month" has
+// to mean the full horizon, not the three months this particular job happens to hold. It
+// also excludes months that have fallen out of the horizon, whose stale rows would otherwise
+// keep a long-dead pair looking alive. HORIZON_MONTH_COUNT tracks the app's `horizonMonths`.
+const HORIZON_MONTH_COUNT = Number(process.env.HORIZON_MONTH_COUNT) || 12;
+const HORIZON_MONTHS = new Set();
+for (let i = 0; i < HORIZON_MONTH_COUNT; i += 1) {
+  const d = new Date(now.getFullYear(), now.getMonth() + 1 + i, 1);
+  HORIZON_MONTHS.add(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`);
+}
+
+// How much of the dead-pair list is re-checked per run: 1/7, so a full pass takes a week.
+const DEAD_SLICES = 7;
+
 // Fetch JSON with a timeout. Never throws — logs and returns null on any failure.
 async function getJson(url) {
   const ctrl = new AbortController();
@@ -331,14 +346,23 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
   return { ok: true, min, offers };
 }
 
-// Load the CURRENT price for every route-month from `prices` in ONE paginated scan, keyed by
-// `origin|dest|month`. This is the baseline the run compares against so price_history only logs
-// CHANGES. PostgREST silently caps a .select() at 1000 rows (we have ~7000+) — we page with
-// .range() and a STABLE .order(), because unordered pages can repeat or skip rows across the cap.
-async function loadExistingPrices() {
+// ONE paginated scan of `prices` that answers two questions at once:
+//   • map   — the CURRENT price of every route-month, keyed `origin|dest|month`. The baseline
+//             the run compares against so price_history only logs CHANGES.
+//   • seen / alive — which route-PAIRS have any row inside the horizon at all, and which of
+//             those have ever shown a non-null price there. Their difference is the dead list
+//             (see planRoutes): ~33 000 rows read once, instead of a second scan of the same
+//             table for the same bytes.
+// PostgREST silently caps a .select() at 1000 rows (we hold ~33 000) — we page with .range()
+// and a STABLE .order() over the primary key, because unordered pages can repeat or skip rows
+// across the cap, silently and with no error.
+async function loadPriceBaseline() {
   const map = new Map();
+  const seen = new Set();   // pairs with at least one row inside the horizon
+  const alive = new Set();  // pairs with at least one non-null price inside the horizon
   const PAGE = 1000;
   let from = 0;
+  let rowsRead = 0;
   for (;;) {
     const { data, error } = await supabase
       .from('prices')
@@ -348,16 +372,25 @@ async function loadExistingPrices() {
       .order('month', { ascending: true })
       .range(from, from + PAGE - 1);
     if (error) {
-      // A read failure here would make EVERY route look "changed" and flood price_history.
-      // Abort loudly instead of silently logging a spurious full snapshot.
+      // A read failure here would make EVERY route look "changed" and flood price_history —
+      // and would also wipe the dead list, silently turning the skip off. Abort loudly.
       throw new Error(`could not load existing prices (baseline): ${error.message}`);
     }
     if (!data || data.length === 0) break;
-    for (const r of data) map.set(`${r.origin}|${r.dest}|${r.month}`, { direct: r.direct, any_stops: r.any_stops });
+    for (const r of data) {
+      map.set(`${r.origin}|${r.dest}|${r.month}`, { direct: r.direct, any_stops: r.any_stops });
+      // Deadness is judged over the CURRENT horizon only. A row for a month that has already
+      // passed says nothing about whether the route flies in the months we are collecting.
+      if (!HORIZON_MONTHS.has(r.month)) continue;
+      const pair = `${r.origin}|${r.dest}`;
+      seen.add(pair);
+      if (r.direct != null || r.any_stops != null) alive.add(pair);
+    }
+    rowsRead += data.length;
     if (data.length < PAGE) break;
     from += PAGE;
   }
-  return map;
+  return { map, seen, alive, rowsRead };
 }
 
 // ── Price snapshot: gzip-CSV history uploaded to Supabase Storage ─────────────
@@ -420,7 +453,55 @@ async function uploadSnapshot(rows, scope) {
   }
 }
 
+// Build the day's route list from the catalog and what the database already knows.
+//
+// SKIPPING THE DEAD. Half the network is not a network: 1313 of the 2637 pairs have no price
+// in ANY month of the horizon — they are airport combinations nobody flies, and asking about
+// them costs half the run for nothing. They are not dropped, though: routes DO open, and a
+// pair that is never asked can never be seen to open. Each run re-checks 1/7 of the dead list,
+// so the whole list is covered every week.
+//
+// WHICH seventh is decided by the run's day number, not at random and not by "what we checked
+// last time" — the dead pairs are sorted into a stable order and sliced by index % 7, and the
+// day number picks the slice. Consecutive days therefore take consecutive, disjoint slices:
+// no pair is checked twice in a week and none is missed.
+//
+// A pair with NO rows at all inside the horizon is treated as live, never as dead. That is a
+// pair we have no evidence about (a new destination, a new origin), and the failure direction
+// matters: calling an unknown pair dead would hide it for a week at a time.
+function planRoutes(seen, alive) {
+  const live = [];
+  const dead = [];
+  for (const origin of ORIGINS_ALL) {
+    for (const dest of targetsFor(origin)) {
+      const key = `${origin}|${dest}`;
+      if (seen.has(key) && !alive.has(key)) dead.push({ origin, dest, key });
+      else live.push({ origin, dest, key });
+    }
+  }
+  dead.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)); // stable slicing order
+  const slice = ((PLAN_DAY % DEAD_SLICES) + DEAD_SLICES) % DEAD_SLICES;
+  const probed = dead.filter((_, i) => i % DEAD_SLICES === slice);
+  return { live, dead, probed, slice };
+}
+
 async function main() {
+  console.log(`Supabase: ${SUPABASE_URL}`);
+  console.log(`Supabase key role: ${SERVICE_KEY_ROLE}`);
+  console.log(`Origins (${ORIGINS_ALL.length}, all query the full ${DEST_IATAS.length}-destination network): ${ORIGINS_ALL.join(', ')}`);
+  console.log(`  hubs (${HUB_AIRPORTS.length}): ${HUB_AIRPORTS.join(', ')}`);
+  console.log(`  low-cost bases (${LOWCOST_AIRPORTS.length}): ${LOWCOST_AIRPORTS.join(', ')}`);
+  console.log(`Flight months (${MONTHS.length}): ${MONTHS[0]} … ${MONTHS[MONTHS.length - 1]}  (MONTH_START=${MONTH_START}, MONTH_COUNT=${MONTH_COUNT})`);
+
+  // Start-of-run timestamp. Rows written this run get updated_at >= this; stale-offer
+  // pruning deletes only rows OLDER than it, so a fresh row is never removed.
+  const RUN_START_ISO = new Date().toISOString();
+
+  // Baseline: the current price of every route-month, loaded ONCE (paginated) BEFORE the plan
+  // is built — it feeds both change detection and the dead-pair list.
+  const { map: existingPrices, seen, alive, rowsRead } = await loadPriceBaseline();
+  console.log(`Loaded ${rowsRead} existing price rows (baseline for change detection; ${existingPrices.size} route-months)`);
+
   // Plan the run so we can print totals and a live ETA.
   //
   // ORDER IS SHUFFLED, deterministically, with the day number as the seed. The plan used to
@@ -428,31 +509,16 @@ async function main() {
   // a 502 burst — always cost the SAME airports, the ones sitting in the tail (DRS, LEJ went
   // uncollected repeatedly). Shuffling spreads that damage over the whole network instead of
   // concentrating it, while the seed keeps the run replayable: same date, same order.
-  const catalogRoutes = [];
-  for (const origin of ORIGINS_ALL) {
-    for (const dest of targetsFor(origin)) catalogRoutes.push({ origin, dest });
-  }
-  const routes = shuffledBySeed(catalogRoutes, PLAN_DAY);
+  const { live, dead, probed, slice } = planRoutes(seen, alive);
+  const deadProbed = new Set(probed.map((r) => r.key));
+  const routes = shuffledBySeed([...live, ...probed], PLAN_DAY);
   const routeTotal = routes.length;
+  const catalogTotal = live.length + dead.length;
   const totalRequests = routeTotal * MONTHS.length; // ONE request per route-month
 
-  console.log(`Supabase: ${SUPABASE_URL}`);
-  console.log(`Supabase key role: ${SERVICE_KEY_ROLE}`);
-  console.log(`Origins (${ORIGINS_ALL.length}, all query the full ${DEST_IATAS.length}-destination network): ${ORIGINS_ALL.join(', ')}`);
-  console.log(`  hubs (${HUB_AIRPORTS.length}): ${HUB_AIRPORTS.join(', ')}`);
-  console.log(`  low-cost bases (${LOWCOST_AIRPORTS.length}): ${LOWCOST_AIRPORTS.join(', ')}`);
-  console.log(`Flight months (${MONTHS.length}): ${MONTHS[0]} … ${MONTHS[MONTHS.length - 1]}  (MONTH_START=${MONTH_START}, MONTH_COUNT=${MONTH_COUNT})`);
-  console.log(`Route-pairs: ${routeTotal}  ·  Flight requests: ${totalRequests} (1 per route-month)`);
+  console.log(`Route plan: ${live.length} live + ${probed.length} of ${dead.length} dead (slice ${slice + 1}/${DEAD_SLICES}, whole list every ${DEAD_SLICES} days) = ${routeTotal} of ${catalogTotal} pairs`);
+  console.log(`Flight requests: ${totalRequests} (1 per route-month)`);
   console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min\n`);
-
-  // Start-of-run timestamp. Rows written this run get updated_at >= this; stale-offer
-  // pruning deletes only rows OLDER than it, so a fresh row is never removed.
-  const RUN_START_ISO = new Date().toISOString();
-
-  // Baseline: the current price of every route-month, loaded ONCE (paginated) before the run.
-  // price_history rows are written only where this run's price differs from this snapshot.
-  const existingPrices = await loadExistingPrices();
-  console.log(`Loaded ${existingPrices.size} existing price rows (baseline for change detection)\n`);
 
   // Supabase write buffer + counters. We flush in BATCH-sized upserts, and flush
   // periodically during the (multi-hour) run so partial progress is persisted.
@@ -553,6 +619,7 @@ async function main() {
   let reqDone = 0;
   let reqFailed = 0;  // requests the API never answered → nothing written, old value kept
   let reqBadBody = 0; // subset of the above: HTTP 200, but success:false or a non-array `data`
+  let deadRevived = 0; // dead pairs re-checked this run that came back with a price
   let route = 0;
   // Pacing metrics for the summary: how fast we ACTUALLY went, and how often the API itself
   // was slower than the interval (those requests set the pace, we can't sleep negative time).
@@ -653,13 +720,18 @@ async function main() {
 
     const got = Object.values(byMonth).some((p) => p.direct != null || p.any != null);
     if (got) withPrice += 1; else noData += 1;
+    // A pair from the dead slice that answered with a price is back in service — it rejoins
+    // the live list on the next run automatically, since the list is derived from `prices`.
+    const wasDead = deadProbed.has(`${origin}|${dest}`);
+    if (wasDead && got) deadRevived += 1;
     const vals = Object.values(byMonth).map((p) => (flightHasStop ? p.any : p.direct)).filter((p) => p != null);
     const min = vals.length ? `€${Math.min(...vals)}` : '—';
     // byMonth only holds ANSWERED months now, so a gap here means the API never replied for
     // those — surfaced per route so a bad patch is visible while the run is still going.
     const failedHere = MONTHS.length - okMonths.length;
     const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} req failed, kept previous` : '';
-    console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}   ~${etaMin()}m left`);
+    const deadMark = wasDead ? (got ? '  ⟲ dead pair REVIVED' : '  (dead re-check)') : '';
+    console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}${deadMark}   ~${etaMin()}m left`);
   }
   // End of the collection window — everything after this is flushing and reporting, so the
   // achieved rate is measured over exactly the part of the run that made requests.
@@ -681,6 +753,8 @@ async function main() {
   console.log(`TP requests: ${totalRequests}`);
   console.log(`Origins: ${ORIGINS_ALL.length} (${HUB_AIRPORTS.length} hubs + ${LOWCOST_AIRPORTS.length} low-cost)`);
   console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
+  console.log(`Route plan: ${live.length} live  ·  ${dead.length} dead, of which ${probed.length} re-checked (slice ${slice + 1}/${DEAD_SLICES})  ·  ${catalogTotal - routeTotal} pairs skipped this run`);
+  console.log(`Dead pairs revived this run: ${deadRevived} of ${probed.length} re-checked`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
   console.log(`Failed requests: ${reqFailed} of ${totalRequests} — nothing written for those, previous values kept`);
   console.log(`  of those, unusable 200s (success:false or non-array data): ${reqBadBody}  ·  transport/HTTP failures: ${reqFailed - reqBadBody}`);
