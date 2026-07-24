@@ -246,8 +246,17 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
     // (TP rate-limits per REQUEST, not per row) — no extra API calls.
     `&currency=eur&limit=500&token=${TP_TOKEN}`;
   const r = await getJson(url);
-  if (!r || !r.success || !Array.isArray(r.data)) {
-    return { ok: false, min: null, offers: [] };
+  // Transport failure — getJson already logged the status or the exception.
+  if (!r) return { ok: false, min: null, offers: [], reason: 'request' };
+  // An HONEST 200 that still carries nothing usable: success:false, or `data` that is not an
+  // array. This branch used to return ok:false SILENTLY, which made it indistinguishable from
+  // "no flights on this route" in both the log and the database — the same class of invisible
+  // loss as the null-clobbering. Log it and count it separately.
+  if (!r.success || !Array.isArray(r.data)) {
+    const shape = Array.isArray(r.data) ? 'array' : `${typeof r.data}${r.data === undefined ? ' (absent)' : ''}`;
+    const why = typeof r.error === 'string' ? ` error="${r.error}"` : '';
+    console.warn(`    unusable 200 ${origin}→${dest} ${ym} (${direct ? 'direct' : 'any'}): success=${r.success}, data=${shape}${why}`);
+    return { ok: false, min: null, offers: [], reason: 'body' };
   }
 
   // `prices` table: min over any price>0 — IDENTICAL to the previous implementation, so
@@ -493,6 +502,7 @@ async function main() {
   let noData = 0;     // routes with no price at all
   let reqDone = 0;
   let reqFailed = 0;  // requests the API never answered → nothing written, old value kept
+  let reqBadBody = 0; // subset of the above: HTTP 200, but success:false or a non-array `data`
   let route = 0;
   // Pacing metrics for the summary: how fast we ACTUALLY went, and how often the API itself
   // was slower than the interval (those requests set the pace, we can't sleep negative time).
@@ -513,7 +523,7 @@ async function main() {
       for (const ym of MONTHS) {
         // ONE request per route-month, chosen by distance: near = direct, far = any.
         const reqT0 = Date.now();
-        const { ok, min, offers } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
+        const { ok, min, offers, reason } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
         const reqMs = Date.now() - reqT0;
         reqDone += 1;
         reqMsTotal += reqMs;
@@ -568,6 +578,7 @@ async function main() {
           // indistinguishable from "no flights" — which is exactly how the null-clobbering
           // stayed invisible for as long as it did.
           reqFailed += 1;
+          if (reason === 'body') reqBadBody += 1;
         }
 
         // Sleep only the REMAINDER of the interval. The request we just made already consumed
@@ -624,6 +635,7 @@ async function main() {
   console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
   console.log(`Failed requests: ${reqFailed} of ${totalRequests} — nothing written for those, previous values kept`);
+  console.log(`  of those, unusable 200s (success:false or non-array data): ${reqBadBody}  ·  transport/HTTP failures: ${reqFailed - reqBadBody}`);
   console.log(`Pace: target ${TARGET_INTERVAL_MS}ms (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min)  ·  achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
   console.log(`  requests slower than the interval: ${reqOverInterval} (those set the pace themselves — nothing left to sleep off)`);
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
