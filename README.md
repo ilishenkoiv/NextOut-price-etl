@@ -24,6 +24,7 @@ daily, into a database the app reads.
 | Storage | Supabase (Postgres) via `@supabase/supabase-js` (REST upsert / insert / delete) |
 | Scheduling | GitHub Actions (`cron`, twice daily) |
 | Deps | `@supabase/supabase-js`, `ws` — plus `sharp` as a devDependency for the photo scripts |
+| Tests | `node --test` (`node:test`, built into Node 22 — no test dependency) |
 
 ## Schedule
 
@@ -33,13 +34,21 @@ and shift one hour earlier in winter.
 
 | Cron (UTC) | Berlin (CEST) | What it collects |
 | --- | --- | --- |
-| `0 23 * * *` | 01:00 | full 12-month sweep — job `near` (months 1–6), then job `far` (months 7–12) |
-| `0 10 * * *` | 12:00 | near months 1–6 only |
+| `0 23 * * *` | 01:00 | full 12-month sweep — all four jobs, months 1–3 → 4–6 → 7–9 → 10–12 |
+| `0 10 * * *` | 12:00 | near months 1–6 only — jobs `months_1_3` and `months_4_6` |
 
 Near months are therefore refreshed twice daily, far months once daily on the night run.
-The two jobs never collect in parallel: `far` declares `needs: near`, and a workflow-level
-`concurrency` group (`cancel-in-progress: false`) makes a new run wait for an in-progress
-one instead of doubling the request rate.
+
+The 12-month horizon is split across **four jobs of three months** (`MONTH_START` 1 / 4 / 7 /
+10, `MONTH_COUNT=3`). They run **strictly one after another**: each declares `needs:` on its
+predecessor, because two jobs spending the same token in parallel would collide with the
+60 req/min API limit. A workflow-level `concurrency` group (`cancel-in-progress: false`) makes
+a new *run* wait for an in-progress one instead of doubling the request rate.
+
+Each job is capped at `timeout-minutes: 180`. A 3-month job is ~4536 requests ≈ 82 min in
+practice, ~7911 ≈ 144 min in the worst case where no route-pair is skipped. The previous
+2×6-month split put ~15 822 requests in one job — ~315 min against GitHub's 360-minute hard
+cap, and two runs were cancelled on timeout before it was split.
 
 Manual runs go through `workflow_dispatch` with a `scope` input: `both` (default), `near`
 or `far`.
@@ -51,18 +60,34 @@ or `far`.
    destinations** from `src/data/destinations.js`, minus the origin itself where it is
    also a destination. That is **2637 route-pairs** — hubs and low-cost bases alike query
    the full network.
-2. **Collect** — one request per route-month. A single invocation collects 6 consecutive
-   months by default, and the night run chains two of them for a full **12-month horizon**
-   (see [Schedule](#schedule)): **15 822 requests** per 6-month job, **31 644** for the
-   full sweep. Near destinations (`stops: 0`, 76 of the 132) query direct flights,
-   long-haul (`stops: 1`, 56 of them) query cheapest-with-stops. A ≥1100 ms pause between
-   every call keeps it under the rate limit.
+
+   Two things then shape the day's plan. **Dead pairs are skipped**: 1313 of the 2637 have
+   no price in any month of the horizon, and only **1/7 of them is re-checked per run**, so
+   the whole dead list is covered every week and a route that opens is still found. Which
+   seventh is picked by the run's day number, so consecutive days take consecutive, disjoint
+   slices. A pair with no rows at all in the horizon counts as live, never dead. **The order
+   is then shuffled**, seeded by the same day number: in catalog order a truncated run always
+   cost the same tail airports (DRS, LEJ), and the seed keeps the run reproducible.
+2. **Collect** — one request per route-month, ~1512 pairs × 3 months ≈ **4536 requests** per
+   job and ~18 100 for the full **12-month horizon** (see [Schedule](#schedule)). Near
+   destinations (`stops: 0`, 76 of the 132) query direct flights, long-haul (`stops: 1`, 56
+   of them) query cheapest-with-stops. Pacing is a fixed **interval**, not a fixed pause: the
+   request is timed and the collector sleeps only the remainder of `TARGET_INTERVAL_MS`
+   (1091 ms = 55 req/min), so run length does not track the API's own latency.
 3. **Load** — rows are buffered and written to Supabase in batches (`upsert` for `prices`
    and `offers`, `insert` for `price_history`), flushed periodically so a multi-hour run
    persists partial progress. Request and write failures are logged and never crash the
    run; the script ends with a written/errors summary. The one fatal case is the baseline
    read at startup: if the current contents of `prices` cannot be loaded, the run aborts
-   rather than log every route-month as changed.
+   rather than log every route-month as changed — that read is also what the dead-pair list
+   is derived from, so losing it would silently turn the skipping off as well.
+
+A **failed request writes nothing at all.** A timeout, a non-2xx, or an honest 200 whose body
+carries `success:false` keeps whatever the previous run collected; only a successful response
+is written, including a successful "no flights here". Writing the failure would upsert `null`
+over a live price, and `price_history` does not log an all-null row either, so the loss would
+leave no trace anywhere. `scripts/fetch-prices.test.cjs` fails the build if a write buffer is
+ever pushed outside that guard again.
 
 ## Data schema
 
@@ -194,12 +219,14 @@ All secrets come from environment variables — **nothing is hardcoded or commit
 | `TP_TOKEN` | yes | Travelpayouts API token. **Secret.** |
 | `SUPABASE_SERVICE_KEY` | yes | Supabase service-role key (writes past RLS). **Secret.** |
 | `SUPABASE_URL` | no | Project URL (public, not a secret). Falls back to the project URL built into the script. |
-| `TP_PAUSE_MS` | no | Override the inter-request pause (default 1100 ms). |
+| `TP_TARGET_INTERVAL_MS` | no | Target interval between request *starts* (default 1091 ms = 55 req/min). The collector sleeps only the remainder after the request itself. Do not go below ~1091 against the live API. |
 | `MONTH_START` | no | 1-based offset from the current month (default 1). The current, partly elapsed month is never collected. |
 | `MONTH_COUNT` | no | How many consecutive months to collect (default 6). |
+| `HORIZON_MONTH_COUNT` | no | The full horizon a pair must be empty across to count as dead (default 12). Tracks the app's `horizonMonths` — it is not the size of one job. |
+| `PLAN_DATE` | no | `YYYY-MM-DD`, pins the day number that seeds the route order and the dead-pair slice. For replaying a specific past plan. |
 
 In GitHub Actions these are read from repository **Secrets**; the workflow sets
-`MONTH_START` / `MONTH_COUNT` per job (`1`/`6` for near, `7`/`6` for far).
+`MONTH_START` / `MONTH_COUNT` per job (`1`, `4`, `7`, `10` — all with `MONTH_COUNT=3`).
 
 ## Run locally
 
@@ -214,11 +241,14 @@ TP_TOKEN=... SUPABASE_SERVICE_KEY=... SUPABASE_URL=https://<project>.supabase.co
 $env:TP_TOKEN="..."; $env:SUPABASE_SERVICE_KEY="..."; node scripts/fetch-prices.mjs
 ```
 
-With the defaults (6 months, 1100 ms pause) a run issues **15 822 API calls** and takes
-**~4 h 50 min at minimum** — that is the enforced pause alone, and it is the same figure
-the script prints as its ETA on startup. Collecting all 12 months means two runs: 31 644
-calls, ~9 h 40 min. Set `TP_PAUSE_MS` lower only for small test runs, never against the
-live API at scale.
+With the defaults (6 months) and the dead pairs skipped, a run issues roughly **9070 API
+calls** and takes **~2 h 45 min** — the interval alone, which is the figure the script prints
+as its ETA on startup. The whole 12-month horizon is about double that. Set
+`TP_TARGET_INTERVAL_MS` lower only for small test runs, never against the live API at scale.
+
+```bash
+npm test          # node --test — static invariants over the collector, no network, no secrets
+```
 
 ---
 
