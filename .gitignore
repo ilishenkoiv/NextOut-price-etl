@@ -10,6 +10,11 @@ node_modules/
 *.log
 .DS_Store
 
+# price snapshots — uploaded to the private `price-snapshots` Supabase Storage bucket by
+# scripts/fetch-prices.mjs, no longer committed here. Files already in history are left
+# alone on purpose (no git rm yet — that decision is still open).
+snapshots/
+
 # curated destination photos — downloaded/generated locally, NOT committed (public repo).
 # Includes candidates, optimized WebP, manifest.json, selected.json, review.html.
 photos/

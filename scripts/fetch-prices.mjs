@@ -38,8 +38,6 @@
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
@@ -302,11 +300,19 @@ async function loadExistingPrices() {
   return map;
 }
 
-// ── Price snapshot: append-only gzip-CSV history for future analysis ──────────
-// PURELY ADDITIVE. Runs AFTER all Supabase writes; never changes what/how we collect
-// or what we write to Supabase. Any failure is logged and swallowed so a snapshot
-// problem can NEVER fail the ETL. Path: snapshots/YYYY/MM/YYYY-MM-DD_HHMM_<scope>.csv.gz
-// (HHMM = Europe/Berlin, matching the ETL schedule). Columns are explicit + stable.
+// ── Price snapshot: gzip-CSV history uploaded to Supabase Storage ─────────────
+// PURELY ADDITIVE. Runs AFTER all Supabase TABLE writes; never changes what/how we collect
+// or what we write to prices/offers/price_history. Any failure is logged and swallowed so a
+// snapshot problem can NEVER fail the ETL — same contract as the prices/offers write errors.
+//
+// Snapshots used to be written to disk and pushed back to the repo by a workflow step; they
+// now go to the PRIVATE `price-snapshots` bucket, written with the SAME service_role key as
+// the tables (no new secret). The in-bucket key is unchanged from the git era:
+//   snapshots/YYYY/MM/YYYY-MM-DD_HHMM_<scope>.csv.gz   (HHMM = Europe/Berlin, matching the
+// ETL schedule). upsert:true so re-running a job within the same minute replaces the object
+// instead of failing. Columns are explicit + stable.
+const SNAPSHOT_BUCKET = 'price-snapshots';
+const SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024; // Supabase free tier: 50 MB per object.
 function berlinStampParts(d = new Date()) {
   const p = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -315,22 +321,42 @@ function berlinStampParts(d = new Date()) {
   const g = (t) => p.find((x) => x.type === t).value;
   return { y: g('year'), mo: g('month'), da: g('day'), hh: g('hour'), mi: g('minute') };
 }
-function writeSnapshot(rows, scope) {
+async function uploadSnapshot(rows, scope) {
+  let gz = null;
   try {
     const { y, mo, da, hh, mi } = berlinStampParts(new Date());
-    const dir = join('snapshots', y, mo);
-    mkdirSync(dir, { recursive: true });
-    const file = join(dir, `${y}-${mo}-${da}_${hh}${mi}_${scope}.csv.gz`);
+    // Storage object keys are ALWAYS '/'-separated — built as a plain string, never
+    // path.join(), which on Windows emits backslashes and would create a differently-named
+    // object for a local run than for CI.
+    const key = `snapshots/${y}/${mo}/${y}-${mo}-${da}_${hh}${mi}_${scope}.csv.gz`;
     const esc = (v) => (v == null ? '' : String(v));
     let csv = 'origin,dest,depart_month,price_direct,price_any,currency,fetched_at,scope\n';
     for (const r of rows) {
       csv += [r.origin, r.dest, r.month, esc(r.direct), esc(r.any), 'EUR', r.fetched_at, scope].join(',') + '\n';
     }
-    const gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
-    writeFileSync(file, gz);
-    console.log(`Snapshot: ${file}  (${rows.length} rows, ${(gz.length / 1024).toFixed(1)} KB gz)`);
+    gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
+    const kb = (gz.length / 1024).toFixed(1);
+    // A full 12-month sweep gzips to ~60 KB, so 50 MB is a tripwire rather than a real
+    // bound. Warn loudly but still attempt the upload, so the server's own answer lands in
+    // the log instead of our guess about what it would have said.
+    if (gz.length > SNAPSHOT_MAX_BYTES) {
+      console.warn(
+        `⚠ snapshot is ${(gz.length / 1048576).toFixed(1)} MB — over the ` +
+        `${SNAPSHOT_MAX_BYTES / 1048576} MB per-object cap of the Supabase free tier; ` +
+        'the upload will probably be rejected.',
+      );
+    }
+    const { error } = await supabase.storage
+      .from(SNAPSHOT_BUCKET)
+      .upload(key, gz, { contentType: 'application/gzip', upsert: true });
+    if (error) {
+      console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${error.message}`);
+      return { ok: false, key, kb, rows: rows.length, error: error.message };
+    }
+    return { ok: true, key, kb, rows: rows.length, error: null };
   } catch (e) {
-    console.warn(`⚠ snapshot write failed (non-fatal, ETL unaffected): ${e.message}`);
+    console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${e.message}`);
+    return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: e.message };
   }
 }
 
@@ -452,9 +478,10 @@ async function main() {
     }
   }
 
-  let withPrice = 0; // routes that got at least one price
-  let noData = 0;    // routes with no price at all
+  let withPrice = 0;  // routes that got at least one price
+  let noData = 0;     // routes with no price at all
   let reqDone = 0;
+  let reqFailed = 0;  // requests the API never answered → nothing written, old value kept
   let route = 0;
   const t0 = Date.now();
   const etaMin = () => Math.round((totalRequests - reqDone) * PAUSE_MS / 60000);
@@ -471,38 +498,57 @@ async function main() {
         // ONE request per route-month, chosen by distance: near = direct, far = any.
         const { ok, min, offers } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
         reqDone += 1;
-        const pair = flightHasStop ? { direct: null, any: min } : { direct: min, any: null };
-        byMonth[ym] = pair;
-        // One prices row per route-month → upsert on PK (origin,dest,month). Unchanged.
-        priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
-        // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
-        snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
-        // price_history: log ONLY when this price differs from the baseline (or the route is new).
-        // Compare each column against the loaded snapshot (null-normalized so null===null matches).
-        // We DON'T log a change that has no price at all (both null) — a route that returned no
-        // data, or a transient API failure clobbering prices to null, is noise, not a real
-        // observation. Genuine prices (including a price appearing where there was none) are logged.
-        const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
-        const hasPrice = pair.direct != null || pair.any != null;
-        const changed = !prev
-          || (prev.direct ?? null) !== (pair.direct ?? null)
-          || (prev.any_stops ?? null) !== (pair.any ?? null);
-        if (changed && hasPrice) {
-          historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
-          pricesChanged += 1;
-        } else if (!changed) {
-          pricesUnchanged += 1;
-        }
-        // COMBO selection → the offers buffer (only when the API actually answered). From the
-        // full ≤500 response we keep the cheap pool + one offer per distance-matrix target,
-        // tagged (in_cheap_pool / target_nights). offersCollected counts what we STORE.
+        // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see the regression test
+        // in fetch-prices.test.cjs. A FAILED request is not an observation: fetchFlightMonth
+        // returns ok:false with min:null for a timeout, a non-2xx (429 included) or a malformed
+        // body. Upserting that null would overwrite a REAL price with nothing, and price_history
+        // would not even log the loss (hasPrice is false), so the destruction left no trace
+        // anywhere. A failed route-month now writes nothing at all and keeps whatever the
+        // previous run collected, until the next run re-asks.
+        //
+        // The asymmetry is deliberate: ok:true with min:null IS written. That is a genuine
+        // observation — "this route-month really has no flights" — and about half of all
+        // route-months legitimately look like that. Skipping it would freeze a price that has
+        // since disappeared: the same silent-staleness bug, pointing the other way.
         if (ok) {
           okRouteMonths += 1;
           okMonths.push(ym);
+          const pair = flightHasStop ? { direct: null, any: min } : { direct: min, any: null };
+          byMonth[ym] = pair;
+          // One prices row per route-month → upsert on PK (origin,dest,month).
+          priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+          // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
+          snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
+
+          // price_history: log ONLY when this price differs from the baseline (or the route is new).
+          // Compare each column against the loaded snapshot (null-normalized so null===null matches).
+          // We DON'T log a change that has no price at all (both null) — a route that returned no
+          // data is noise, not a real observation. Genuine prices (including a price appearing
+          // where there was none) are logged.
+          const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
+          const hasPrice = pair.direct != null || pair.any != null;
+          const changed = !prev
+            || (prev.direct ?? null) !== (pair.direct ?? null)
+            || (prev.any_stops ?? null) !== (pair.any ?? null);
+          if (changed && hasPrice) {
+            historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
+            pricesChanged += 1;
+          } else if (!changed) {
+            pricesUnchanged += 1;
+          }
+
+          // COMBO selection → the offers buffer. From the full ≤500 response we keep the cheap
+          // pool + one offer per distance-matrix target, tagged (in_cheap_pool / target_nights).
+          // offersCollected counts what we STORE.
           const combo = selectCombo(offers, origin, dest);
           for (const o of combo) offerBuf.push(o);
           offersCollected += combo.length;
+        } else {
+          // Counted and reported, per route and in the summary. A failed request used to be
+          // indistinguishable from "no flights" — which is exactly how the null-clobbering
+          // stayed invisible for as long as it did.
+          reqFailed += 1;
         }
         await sleep(PAUSE_MS);
       }
@@ -522,12 +568,20 @@ async function main() {
       if (got) withPrice += 1; else noData += 1;
       const vals = Object.values(byMonth).map((p) => (flightHasStop ? p.any : p.direct)).filter((p) => p != null);
       const min = vals.length ? `€${Math.min(...vals)}` : '—';
-      console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}   ~${etaMin()}m left`);
+      // byMonth only holds ANSWERED months now, so a gap here means the API never replied for
+      // those — surfaced per route so a bad patch is visible while the run is still going.
+      const failedHere = MONTHS.length - okMonths.length;
+      const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} req failed, kept previous` : '';
+      console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}   ~${etaMin()}m left`);
     }
   }
   await flushPrices(true);
   await flushHistory(true);
   await flushOffers(true); // safety net; per-route force-flushes normally drain it already
+
+  // Additive history step — AFTER every Supabase TABLE write, so a Storage problem can never
+  // affect what was collected. Its outcome is reported in the summary below.
+  const snapshot = await uploadSnapshot(snapshotRows, SCOPE);
 
   const elapsedMin = ((Date.now() - t0) / 60000).toFixed(1);
   const avgOffers = okRouteMonths ? (offersCollected / okRouteMonths).toFixed(1) : '0';
@@ -536,16 +590,17 @@ async function main() {
   console.log(`Origins: ${ORIGINS_ALL.length} (${HUB_AIRPORTS.length} hubs + ${LOWCOST_AIRPORTS.length} low-cost)`);
   console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
+  console.log(`Failed requests: ${reqFailed} of ${totalRequests} — nothing written for those, previous values kept`);
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
   console.log(`Price changes: ${pricesChanged} changed/new  ·  ${pricesUnchanged} unchanged (baseline ${existingPrices.size})`);
   console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
   console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
+  console.log(snapshot.ok
+    ? `Snapshot upload: OK → ${SNAPSHOT_BUCKET}/${snapshot.key}  (${snapshot.rows} rows, ${snapshot.kb} KB gz)`
+    : `Snapshot upload: FAILED — ${snapshot.error}  (${snapshot.rows} rows${snapshot.kb ? `, ${snapshot.kb} KB gz` : ''} NOT uploaded)`);
   console.log(`Elapsed: ${elapsedMin} min`);
-
-  // Additive history step — AFTER every Supabase write. Non-blocking (see writeSnapshot).
-  writeSnapshot(snapshotRows, SCOPE);
 }
 
 main().catch((e) => {
