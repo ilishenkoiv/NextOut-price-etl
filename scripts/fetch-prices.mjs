@@ -146,10 +146,18 @@ function selectCombo(offers, origin, dest) {
   return [...chosen.values()];
 }
 
-// ≥1100ms between ALL TP calls keeps us under the 60/min limit with margin. Overridable
-// via TP_PAUSE_MS for CI/re-runs; do NOT drop below ~1100 against the live API.
-const PAUSE_MS = Number(process.env.TP_PAUSE_MS) || 1100;
-const TIMEOUT_MS = 15000;
+// Fixed INTERVAL, not a fixed pause. We used to sleep 1100 ms AFTER each response, which
+// makes the real spacing HTTP + 1100 — so the run's length was set by Travelpayouts' latency,
+// not by us. Measured: 1196 ms average spacing (50.1 req/min, not the 54.5 the pause implied),
+// and when TP slowed from 96 ms to 200–390 ms the same sweep grew from 315 to 355+ min and
+// two runs were cancelled on timeout. Now we time the request and sleep only the remainder of
+// TARGET_INTERVAL_MS, so a slower API costs nothing until it exceeds the interval outright.
+// 1091 ms = 55 req/min against the 60/min ceiling. Overridable via TP_TARGET_INTERVAL_MS for
+// CI/re-runs; do NOT drop below ~1091 against the live API.
+const TARGET_INTERVAL_MS = Number(process.env.TP_TARGET_INTERVAL_MS) || 1091;
+// 8s, down from 15s. Nothing useful ever arrived that late — TP answers in 96–390 ms, and the
+// observed failures are 502/503 bursts, so a long ceiling only bought dead waiting time.
+const TIMEOUT_MS = 8000;
 const BATCH = 500; // rows per Supabase upsert — batched, not row-by-row
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
@@ -376,7 +384,7 @@ async function main() {
   console.log(`  low-cost bases (${LOWCOST_AIRPORTS.length}): ${LOWCOST_AIRPORTS.join(', ')}`);
   console.log(`Flight months (${MONTHS.length}): ${MONTHS[0]} … ${MONTHS[MONTHS.length - 1]}  (MONTH_START=${MONTH_START}, MONTH_COUNT=${MONTH_COUNT})`);
   console.log(`Route-pairs: ${routeTotal}  ·  Flight requests: ${totalRequests} (1 per route-month)`);
-  console.log(`At ≥${PAUSE_MS}ms/request ≈ ${Math.round(totalRequests * PAUSE_MS / 60000)} min\n`);
+  console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min\n`);
 
   // Start-of-run timestamp. Rows written this run get updated_at >= this; stale-offer
   // pruning deletes only rows OLDER than it, so a fresh row is never removed.
@@ -486,8 +494,13 @@ async function main() {
   let reqDone = 0;
   let reqFailed = 0;  // requests the API never answered → nothing written, old value kept
   let route = 0;
+  // Pacing metrics for the summary: how fast we ACTUALLY went, and how often the API itself
+  // was slower than the interval (those requests set the pace, we can't sleep negative time).
+  let reqOverInterval = 0;
+  let reqMsTotal = 0;
   const t0 = Date.now();
-  const etaMin = () => Math.round((totalRequests - reqDone) * PAUSE_MS / 60000);
+  const paceT0 = Date.now(); // start of the collection window, for the achieved req/min
+  const etaMin = () => Math.round((totalRequests - reqDone) * TARGET_INTERVAL_MS / 60000);
 
   for (const { origin, targets } of plan) {
     for (const dest of targets) {
@@ -499,8 +512,11 @@ async function main() {
       const okMonths = []; // months the API answered → the only ones we may prune
       for (const ym of MONTHS) {
         // ONE request per route-month, chosen by distance: near = direct, far = any.
+        const reqT0 = Date.now();
         const { ok, min, offers } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
+        const reqMs = Date.now() - reqT0;
         reqDone += 1;
+        reqMsTotal += reqMs;
 
         // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see the regression test
         // in fetch-prices.test.cjs. A FAILED request is not an observation: fetchFlightMonth
@@ -553,7 +569,15 @@ async function main() {
           // stayed invisible for as long as it did.
           reqFailed += 1;
         }
-        await sleep(PAUSE_MS);
+
+        // Sleep only the REMAINDER of the interval. The request we just made already consumed
+        // part of it, so the spacing between two starts stays TARGET_INTERVAL_MS regardless of
+        // how slow the API was — the whole point of the change. When the request alone outran
+        // the interval there is nothing to sleep off; count it, because that is the only case
+        // where TP's latency still lengthens the run.
+        const remaining = TARGET_INTERVAL_MS - reqMs;
+        if (remaining > 0) await sleep(remaining);
+        else reqOverInterval += 1;
       }
       await flushPrices(false);
       await flushHistory(false);
@@ -578,6 +602,10 @@ async function main() {
       console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}   ~${etaMin()}m left`);
     }
   }
+  // End of the collection window — everything after this is flushing and reporting, so the
+  // achieved rate is measured over exactly the part of the run that made requests.
+  const paceMin = (Date.now() - paceT0) / 60000;
+
   await flushPrices(true);
   await flushHistory(true);
   await flushOffers(true); // safety net; per-route force-flushes normally drain it already
@@ -588,12 +616,16 @@ async function main() {
 
   const elapsedMin = ((Date.now() - t0) / 60000).toFixed(1);
   const avgOffers = okRouteMonths ? (offersCollected / okRouteMonths).toFixed(1) : '0';
+  const achievedRpm = paceMin > 0 ? (reqDone / paceMin).toFixed(1) : '—';
+  const avgReqMs = reqDone ? Math.round(reqMsTotal / reqDone) : 0;
   console.log('\n──────── summary ────────');
   console.log(`TP requests: ${totalRequests}`);
   console.log(`Origins: ${ORIGINS_ALL.length} (${HUB_AIRPORTS.length} hubs + ${LOWCOST_AIRPORTS.length} low-cost)`);
   console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
   console.log(`Failed requests: ${reqFailed} of ${totalRequests} — nothing written for those, previous values kept`);
+  console.log(`Pace: target ${TARGET_INTERVAL_MS}ms (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min)  ·  achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
+  console.log(`  requests slower than the interval: ${reqOverInterval} (those set the pace themselves — nothing left to sleep off)`);
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
   console.log(`Price changes: ${pricesChanged} changed/new  ·  ${pricesUnchanged} unchanged (baseline ${existingPrices.size})`);
   console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
