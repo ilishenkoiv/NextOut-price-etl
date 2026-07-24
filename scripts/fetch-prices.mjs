@@ -160,14 +160,17 @@ const pad = (n) => String(n).padStart(2, '0');
 //                 full month; the current, partially-elapsed month is never collected
 //                 (matches the app's horizon — lib/prices.ts horizonMonths).
 //   MONTH_COUNT — how many consecutive months to collect (default 6).
-// Examples:  MONTH_START=1 MONTH_COUNT=6 → the near 6 months (default).
-//            MONTH_START=7 MONTH_COUNT=6 → the far months 7–12.
+// CI splits the 12-month horizon into FOUR sequential 3-month jobs (see the workflow):
+//   MONTH_START=1  MONTH_COUNT=3 → months 1–3
+//   MONTH_START=4  MONTH_COUNT=3 → months 4–6
+//   MONTH_START=7  MONTH_COUNT=3 → months 7–9
+//   MONTH_START=10 MONTH_COUNT=3 → months 10–12
 const MONTH_START = Number(process.env.MONTH_START) || 1;
 const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
-// Snapshot scope label = which month-slice THIS job collected (near=1–6, far=7–12).
-const SCOPE = MONTH_START <= 1 ? 'near'
-  : MONTH_START === 7 ? 'far'
-  : `m${MONTH_START}-${MONTH_START + MONTH_COUNT - 1}`;
+// Snapshot scope label = which month-slice THIS job collected. Uniform `mA-B` since the
+// split went from 2 jobs to 4: the old `near`/`far` labels meant 1–6 and 7–12 and would now
+// name a 3-month slice after a 6-month one. Older objects in the bucket keep their names.
+const SCOPE = `m${MONTH_START}-${MONTH_START + MONTH_COUNT - 1}`;
 const now = new Date();
 const MONTHS = [];
 for (let i = 0; i < MONTH_COUNT; i += 1) {
