@@ -10,14 +10,13 @@ name: Twice-daily price fetch
 #   months 10–12 (MONTH_START=10) needs: months 7–9
 #
 # WHY FOUR, AND WHY NEVER IN PARALLEL. The previous 2×6-month split put ~2637 route-pairs ×
-# 6 months = 15 822 requests in one job. At the collector's real per-request interval that is
-# ~315 min against a 360-min GitHub hosted-runner hard cap, and the last two runs were
-# CANCELLED on timeout: the pause was applied AFTER the response, so job length tracked
-# Travelpayouts' own latency, which rose from 96 ms to 200–390 ms. Halving the month slice
-# halves the request count per job (7911) and puts each one back at roughly 158 min — real
-# headroom under the 180-minute ceiling below. Running them in parallel is NOT an option:
-# both would spend the same token and two streams collide with the 60 req/min API limit,
-# so every job waits for its predecessor via `needs:`.
+# 6 months = 15 822 requests in one job — ~315 min against a 360-min GitHub hosted-runner
+# hard cap, and the last two runs were CANCELLED on timeout. Halving the month slice halves
+# the request count per job to 7911, which at the collector's 1091 ms target interval is
+# ~144 min — real headroom under the 180-minute ceiling below, and less still once the
+# collector skips the dead route-pairs. Running the jobs in parallel is NOT an option: both
+# would spend the same token and two streams collide with the 60 req/min API limit, so every
+# job waits for its predecessor via `needs:`.
 #
 # The horizon stays 12 months on purpose. Cutting it to 9 would need a matching change to
 # `horizonMonths` in the app (lib/prices.ts) — without it the user can pick a month nothing
@@ -25,8 +24,8 @@ name: Twice-daily price fetch
 #
 # Tiered schedule: far months (7–12) change slowly — refreshed once daily. Near months
 # (1–6) change fast and are refreshed twice daily for the evening search peak.
-#   01:00 Berlin start + ~10h30 full sweep (4 jobs)   → 12 months ready in the morning.
-#   12:00 Berlin start + ~5h15 near sweep (2 jobs)    → months 1–6 ready by ~17:15.
+#   01:00 Berlin start + ~9h35 full sweep (4 jobs)   → 12 months ready in the morning.
+#   12:00 Berlin start + ~4h50 near sweep (2 jobs)   → months 1–6 ready by ~17:00.
 #
 # WINTER TIME: GitHub Actions cron is UTC and does NOT follow the CET switch. The times
 # above assume CEST (summer, UTC+2). In winter (CET, UTC+1) the runs land one hour earlier
@@ -76,7 +75,7 @@ jobs:
       github.event.inputs.scope == 'near' ||
       github.event.inputs.scope == 'both'
     runs-on: ubuntu-latest
-    # 2637 route-pairs × 3 months = 7911 requests ≈ 158 min at the measured interval.
+    # 2637 route-pairs × 3 months = 7911 requests ≈ 144 min at the 1091 ms target interval.
     # 180 leaves headroom for a slow API day and stays well under GitHub's 360-min cap.
     timeout-minutes: 180
     env:
