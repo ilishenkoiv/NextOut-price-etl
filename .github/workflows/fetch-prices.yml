@@ -51,10 +51,12 @@ concurrency:
   group: price-fetch
   cancel-in-progress: false
 
-# The snapshot commit steps push the generated snapshots/ files back to the repo using the
-# built-in GITHUB_TOKEN — that needs write access to contents.
+# Nothing in this workflow writes to the repo any more: the price snapshot is uploaded to the
+# private `price-snapshots` Supabase Storage bucket by the collector itself. Only checkout
+# needs the token, and read is enough. Kept EXPLICIT rather than deleted — an absent block
+# falls back to the repository default, which may still grant write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   near:
@@ -93,24 +95,6 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
 
-      - name: Commit price snapshot (near)
-        if: always()          # snapshot a partial run too; never gate on the fetch step's status
-        env:
-          SCOPE: near
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add snapshots/
-          if git diff --staged --quiet; then
-            echo "No snapshot to commit."
-          else
-            git commit -m "snapshot: $(TZ=Europe/Berlin date '+%Y-%m-%d %H%M') ${SCOPE}"
-            for i in 1 2 3; do
-              git pull --rebase --autostash origin main && git push && break
-              echo "push retry $i"; sleep 5
-            done
-          fi
-
   far:
     # Far months only on the nightly full sweep (cron '0 23'), or a manual far/both run —
     # never on the noon near-only run ('0 10'). `needs: near` keeps it strictly after near
@@ -147,21 +131,3 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
-
-      - name: Commit price snapshot (far)
-        if: always()          # snapshot a partial run too; never gate on the fetch step's status
-        env:
-          SCOPE: far
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add snapshots/
-          if git diff --staged --quiet; then
-            echo "No snapshot to commit."
-          else
-            git commit -m "snapshot: $(TZ=Europe/Berlin date '+%Y-%m-%d %H%M') ${SCOPE}"
-            for i in 1 2 3; do
-              git pull --rebase --autostash origin main && git push && break
-              echo "push retry $i"; sleep 5
-            done
-          fi
