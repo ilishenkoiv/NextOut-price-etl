@@ -242,6 +242,41 @@ for (let i = 0; i < HORIZON_MONTH_COUNT; i += 1) {
 // How much of the dead-pair list is re-checked per run: 1/7, so a full pass takes a week.
 const DEAD_SLICES = 7;
 
+// ── Describing a failed call without dumping the response body ───────────────
+// postgrest-js puts the RAW response text into error.message whenever the body is not JSON.
+// A Cloudflare 5xx is a full HTML page, so `${error.message}` printed ~100 lines of markup
+// into the middle of a run log and buried everything around it. Every error path that has an
+// upstream body behind it goes through here instead.
+//   • the HTTP status is always printed — it is the one field that actually identifies the
+//     failure (520 = origin unreachable, 503 = overloaded, 4xx = our request);
+//   • the body is capped at BODY_PREVIEW characters on ONE line;
+//   • a body starting with '<' (HTML, `<!DOCTYPE`, an XML error doc) is not printed at all —
+//     there is never anything in it we act on.
+const BODY_PREVIEW = 200;
+function previewBody(raw) {
+  const s = (typeof raw === 'string' ? raw : String(raw ?? '')).trim();
+  if (!s) return '(no message)';
+  if (s.startsWith('<')) return '(HTML error page)';
+  const flat = s.replace(/\s+/g, ' ');
+  return flat.length > BODY_PREVIEW ? `${flat.slice(0, BODY_PREVIEW)}… (${flat.length} chars)` : flat;
+}
+function describeError(status, err, rowCount = null) {
+  const code = status == null ? 'no HTTP status'
+    : status === 0 ? 'HTTP — (request never completed)'
+      : `HTTP ${status}`;
+  const body = previewBody(typeof err?.message === 'string' ? err.message : err);
+  return `${code}${rowCount == null ? '' : `, ${rowCount} rows`}: ${body}`;
+}
+
+// The HTTP status of a failed Supabase call. postgrest-js carries it on the RESULT
+// ({ data, error, status }); storage-js carries it on the ERROR. A thrown request has
+// neither, and postgrest-js reports status 0 when fetch itself never completed.
+function httpStatusOf(result, err) {
+  if (typeof result?.status === 'number') return result.status;
+  if (typeof err?.status === 'number') return err.status;
+  return null;
+}
+
 // Fetch JSON with a timeout. Never throws — logs and returns null on any failure.
 async function getJson(url) {
   const ctrl = new AbortController();
@@ -254,7 +289,9 @@ async function getJson(url) {
     }
     return await res.json();
   } catch (e) {
-    console.warn(`    request failed: ${e.message}`);
+    // Also capped: a 200 whose body is HTML fails in res.json(), and Node's parse error
+    // quotes the start of that body back at us.
+    console.warn(`    request failed: ${previewBody(e.message)}`);
     return null;
   } finally {
     clearTimeout(timer);
@@ -309,7 +346,8 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
   // loss as the null-clobbering. Log it and count it separately.
   if (!r.success || !Array.isArray(r.data)) {
     const shape = Array.isArray(r.data) ? 'array' : `${typeof r.data}${r.data === undefined ? ' (absent)' : ''}`;
-    const why = typeof r.error === 'string' ? ` error="${r.error}"` : '';
+    // Capped like every other upstream string we print — it is somebody else's field.
+    const why = typeof r.error === 'string' ? ` error="${previewBody(r.error)}"` : '';
     console.warn(`    unusable 200 ${origin}→${dest} ${ym} (${direct ? 'direct' : 'any'}): success=${r.success}, data=${shape}${why}`);
     return { ok: false, min: null, offers: [], reason: 'body' };
   }
@@ -364,17 +402,20 @@ async function loadPriceBaseline() {
   let from = 0;
   let rowsRead = 0;
   for (;;) {
-    const { data, error } = await supabase
+    const res = await supabase
       .from('prices')
       .select('origin,dest,month,direct,any_stops')
       .order('origin', { ascending: true })
       .order('dest', { ascending: true })
       .order('month', { ascending: true })
       .range(from, from + PAGE - 1);
+    const { data, error } = res;
     if (error) {
       // A read failure here would make EVERY route look "changed" and flood price_history —
-      // and would also wipe the dead list, silently turning the skip off. Abort loudly.
-      throw new Error(`could not load existing prices (baseline): ${error.message}`);
+      // and would also wipe the dead list, silently turning the skip off. Abort loudly, but
+      // through describeError: this message ends up in the fatal handler, and a Cloudflare
+      // HTML page there is just as unreadable as it is mid-run.
+      throw new Error(`could not load existing prices (baseline): ${describeError(httpStatusOf(res, error), error)}`);
     }
     if (!data || data.length === 0) break;
     for (const r of data) {
@@ -439,17 +480,19 @@ async function uploadSnapshot(rows, scope) {
         'the upload will probably be rejected.',
       );
     }
-    const { error } = await supabase.storage
+    const res = await supabase.storage
       .from(SNAPSHOT_BUCKET)
       .upload(key, gz, { contentType: 'application/gzip', upsert: true });
-    if (error) {
-      console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${error.message}`);
-      return { ok: false, key, kb, rows: rows.length, error: error.message };
+    if (res.error) {
+      const why = describeError(httpStatusOf(res, res.error), res.error);
+      console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
+      return { ok: false, key, kb, rows: rows.length, error: why };
     }
     return { ok: true, key, kb, rows: rows.length, error: null };
   } catch (e) {
-    console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${e.message}`);
-    return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: e.message };
+    const why = describeError(httpStatusOf(null, e), e);
+    console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
+    return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: why };
   }
 }
 
@@ -531,11 +574,13 @@ async function main() {
     while (priceBuf.length >= BATCH || (force && priceBuf.length > 0)) {
       const rows = priceBuf.splice(0, BATCH);
       try {
-        const { error } = await supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' });
-        if (error) { console.warn(`    ⚠ prices upsert error (${rows.length} rows): ${error.message}`); priceWriteErrors += rows.length; }
-        else pricesWritten += rows.length;
+        const res = await supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' });
+        if (res.error) {
+          console.warn(`    ⚠ prices upsert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
+          priceWriteErrors += rows.length;
+        } else pricesWritten += rows.length;
       } catch (e) {
-        console.warn(`    ⚠ prices upsert threw (${rows.length} rows): ${e.message}`);
+        console.warn(`    ⚠ prices upsert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
         priceWriteErrors += rows.length;
       }
     }
@@ -554,11 +599,13 @@ async function main() {
     while (historyBuf.length >= BATCH || (force && historyBuf.length > 0)) {
       const rows = historyBuf.splice(0, BATCH);
       try {
-        const { error } = await supabase.from('price_history').insert(rows);
-        if (error) { console.warn(`    ⚠ price_history insert error (${rows.length} rows): ${error.message}`); historyWriteErrors += rows.length; }
-        else historyWritten += rows.length;
+        const res = await supabase.from('price_history').insert(rows);
+        if (res.error) {
+          console.warn(`    ⚠ price_history insert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
+          historyWriteErrors += rows.length;
+        } else historyWritten += rows.length;
       } catch (e) {
-        console.warn(`    ⚠ price_history insert threw (${rows.length} rows): ${e.message}`);
+        console.warn(`    ⚠ price_history insert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
         historyWriteErrors += rows.length;
       }
     }
@@ -579,13 +626,15 @@ async function main() {
     while (offerBuf.length >= BATCH || (force && offerBuf.length > 0)) {
       const rows = offerBuf.splice(0, BATCH);
       try {
-        const { error } = await supabase
+        const res = await supabase
           .from('offers')
           .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' });
-        if (error) { console.warn(`    ⚠ offers upsert error (${rows.length} rows): ${error.message}`); offerWriteErrors += rows.length; }
-        else offersWritten += rows.length;
+        if (res.error) {
+          console.warn(`    ⚠ offers upsert error — ${describeError(httpStatusOf(res, res.error), res.error, rows.length)}`);
+          offerWriteErrors += rows.length;
+        } else offersWritten += rows.length;
       } catch (e) {
-        console.warn(`    ⚠ offers upsert threw (${rows.length} rows): ${e.message}`);
+        console.warn(`    ⚠ offers upsert threw — ${describeError(httpStatusOf(null, e), e, rows.length)}`);
         offerWriteErrors += rows.length;
       }
     }
@@ -597,7 +646,7 @@ async function main() {
   // .select() returns the deleted rows so we can count them.
   async function pruneStaleOffers(origin, dest, flightType, months) {
     try {
-      const { data, error } = await supabase
+      const res = await supabase
         .from('offers')
         .delete()
         .eq('origin', origin)
@@ -606,10 +655,12 @@ async function main() {
         .in('month', months)
         .lt('updated_at', RUN_START_ISO)
         .select('origin');
-      if (error) { console.warn(`    ⚠ offers prune error ${origin}→${dest}: ${error.message}`); offerDeleteErrors += 1; }
-      else offersDeleted += (data?.length ?? 0);
+      if (res.error) {
+        console.warn(`    ⚠ offers prune error ${origin}→${dest} — ${describeError(httpStatusOf(res, res.error), res.error)}`);
+        offerDeleteErrors += 1;
+      } else offersDeleted += (res.data?.length ?? 0);
     } catch (e) {
-      console.warn(`    ⚠ offers prune threw ${origin}→${dest}: ${e.message}`);
+      console.warn(`    ⚠ offers prune threw ${origin}→${dest} — ${describeError(httpStatusOf(null, e), e)}`);
       offerDeleteErrors += 1;
     }
   }
