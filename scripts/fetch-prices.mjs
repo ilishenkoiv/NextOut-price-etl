@@ -305,10 +305,72 @@ function isTransientWriteFailure(status) {
   return status >= 500;            // 5xx, Cloudflare's 52x included
 }
 
+// ── Write-failure tally, reported at the very end of the job ─────────────────
+// A definitive write failure is one line somewhere inside a six-hour log. The run that lost
+// 30 offers to a Cloudflare 520 said so at 03:41 and then looked healthy for another five
+// hours; nobody scrolled back. Every failure is therefore also counted here and reprinted
+// at the end under a marker that greps in one word — ALWAYS, including when the count is
+// zero. An explicit 0 is evidence that nothing was lost; a missing line is only silence,
+// and silence is what the 520 already gave us.
+//
+// Two kinds, kept apart because they call for different reactions:
+//   permanent — HTTP 4xx, never retried. Our payload or our rights are wrong, and every
+//               following run fails identically until someone changes something.
+//   exhausted — transient (no response / 5xx) that survived all WRITE_MAX_ATTEMPTS. The
+//               data is gone, but the cause is on their side and may already be over.
+// Counted per CALL and per ROW: rows are the damage, calls tell one lost 500-row batch from
+// ten lost ones. This is bookkeeping only — nothing here changes what is retried or written.
+const WRITE_LOSS_MARKER = 'WRITE-LOSS';
+
+// Print order, and the reason the zero lines exist at all: seeded up front so every target
+// reports even in a run where it never failed. `offers_prune` is separate from `offers` —
+// it deletes rather than writes, so folding it in would inflate the rows-lost number of the
+// table with an operation that loses no rows.
+const WRITE_LOSS_TARGETS = ['prices', 'offers', 'offers_prune', 'price_history', 'storage_snapshot'];
+const newWriteLossEntry = () => ({
+  permanent: { calls: 0, rows: 0, unsized: 0 },
+  exhausted: { calls: 0, rows: 0, unsized: 0 },
+});
+const writeLosses = new Map(WRITE_LOSS_TARGETS.map((t) => [t, newWriteLossEntry()]));
+
+// Record ONE definitively-failed write. `rows` is what the caller knows it lost; pass null
+// where the count is not knowable at the call site (the prune deletes an unknown number of
+// rows) — those calls are tallied as `unsized` instead of being quietly folded in as 0.
+// An unregistered target still lands in the summary, so a future call site that forgets its
+// name is visible rather than uncounted.
+function recordWriteLoss(target, kind, rows) {
+  const name = target || 'unspecified';
+  if (!writeLosses.has(name)) writeLosses.set(name, newWriteLossEntry());
+  const bucket = writeLosses.get(name)[kind];
+  bucket.calls += 1;
+  if (typeof rows === 'number') bucket.rows += rows;
+  else bucket.unsized += 1;
+}
+
+const formatWriteLoss = (k) =>
+  `${k.calls} calls, ${k.rows} rows${k.unsized ? ` (+${k.unsized} of unknown size)` : ''}`;
+
+// One line per target plus a TOTAL, every line starting with WRITE_LOSS_MARKER so the whole
+// verdict is `grep WRITE-LOSS` on the job log.
+function logWriteLossSummary() {
+  const pad = Math.max('TOTAL'.length, ...[...writeLosses.keys()].map((t) => t.length));
+  let calls = 0;
+  let rows = 0;
+  let unsized = 0;
+  for (const [target, e] of writeLosses) {
+    calls += e.permanent.calls + e.exhausted.calls;
+    rows += e.permanent.rows + e.exhausted.rows;
+    unsized += e.permanent.unsized + e.exhausted.unsized;
+    console.log(`${WRITE_LOSS_MARKER} ${target.padEnd(pad)}  permanent ${formatWriteLoss(e.permanent)}  ·  exhausted ${formatWriteLoss(e.exhausted)}`);
+  }
+  console.log(`${WRITE_LOSS_MARKER} ${'TOTAL'.padEnd(pad)}  ${calls} failed writes, ${rows} rows never written${unsized ? `, ${unsized} calls of unknown row count` : ''}`);
+}
+
 // Run one Supabase write, repeating it while it fails transiently. `run` must return a
 // supabase-js result ({ data, error, status }) or throw. Returns the same shape plus `ok`,
-// `attempts` and the last error already formatted for the log.
-async function writeWithRetry(label, run) {
+// `attempts` and the last error already formatted for the log. `where` names the target and
+// the row count for the end-of-job tally — it affects nothing but that tally.
+async function writeWithRetry(label, run, where = {}) {
   for (let attempt = 1; ; attempt += 1) {
     let res = null;
     let err = null;
@@ -326,6 +388,8 @@ async function writeWithRetry(label, run) {
     const why = describeError(status, err);
     const transient = threw || isTransientWriteFailure(status);
     if (!transient || attempt >= WRITE_MAX_ATTEMPTS) {
+      // The single place a write is given up on, so the tally cannot miss a call site.
+      recordWriteLoss(where.target, transient ? 'exhausted' : 'permanent', where.rows ?? null);
       return { ok: false, data: null, error: err, why, attempts: attempt, transient };
     }
     const wait = WRITE_RETRY_BACKOFF_MS[attempt - 1];
@@ -539,7 +603,8 @@ async function uploadSnapshot(rows, scope) {
     }
     const r = await writeWithRetry(`snapshot upload ${key}`, () => supabase.storage
       .from(SNAPSHOT_BUCKET)
-      .upload(key, gz, { contentType: 'application/gzip', upsert: true }));
+      .upload(key, gz, { contentType: 'application/gzip', upsert: true }),
+    { target: 'storage_snapshot', rows: rows.length });
     if (!r.ok) {
       console.warn(`⚠ snapshot upload failed after ${r.attempts} attempt(s) (non-fatal, ETL unaffected): ${r.why}`);
       return { ok: false, key, kb, rows: rows.length, error: r.why, attempts: r.attempts };
@@ -547,6 +612,9 @@ async function uploadSnapshot(rows, scope) {
     return { ok: true, key, kb, rows: rows.length, error: null, attempts: r.attempts };
   } catch (e) {
     const why = describeError(httpStatusOf(null, e), e);
+    // Threw OUTSIDE writeWithRetry (building the CSV, gzipping, the timestamp) — so nothing
+    // recorded it. Permanent: no request was made, and repeating it would throw again.
+    recordWriteLoss('storage_snapshot', 'permanent', rows.length);
     console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
     return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: why };
   }
@@ -635,7 +703,8 @@ async function main() {
     while (priceBuf.length >= BATCH || (force && priceBuf.length > 0)) {
       const rows = priceBuf.splice(0, BATCH);
       const r = await writeWithRetry(`prices upsert (${rows.length} rows)`, () =>
-        supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' }));
+        supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' }),
+      { target: 'prices', rows: rows.length });
       if (r.ok) pricesWritten += rows.length;
       else {
         console.warn(`    ⚠ prices upsert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
@@ -658,7 +727,8 @@ async function main() {
     while (historyBuf.length >= BATCH || (force && historyBuf.length > 0)) {
       const rows = historyBuf.splice(0, BATCH);
       const r = await writeWithRetry(`price_history insert (${rows.length} rows)`, () =>
-        supabase.from('price_history').insert(rows));
+        supabase.from('price_history').insert(rows),
+      { target: 'price_history', rows: rows.length });
       if (r.ok) historyWritten += rows.length;
       else {
         console.warn(`    ⚠ price_history insert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
@@ -684,7 +754,8 @@ async function main() {
       const rows = offerBuf.splice(0, BATCH);
       const r = await writeWithRetry(`offers upsert (${rows.length} rows)`, () => supabase
         .from('offers')
-        .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }));
+        .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }),
+      { target: 'offers', rows: rows.length });
       if (r.ok) offersWritten += rows.length;
       else {
         console.warn(`    ⚠ offers upsert LOST ${rows.length} rows after ${r.attempts} attempt(s) — ${r.why}`);
@@ -707,7 +778,10 @@ async function main() {
       .eq('flight_type', flightType)
       .in('month', months)
       .lt('updated_at', RUN_START_ISO)
-      .select('origin'));
+      .select('origin'),
+    // rows: null — how many stale rows this DELETE would have removed is only known from
+    // its own .select(), which is exactly what we did not get back.
+    { target: 'offers_prune', rows: null });
     if (r.ok) offersDeleted += (r.data?.length ?? 0);
     else {
       console.warn(`    ⚠ offers prune FAILED ${origin}→${dest} after ${r.attempts} attempt(s) — ${r.why}`);
@@ -876,9 +950,15 @@ async function main() {
     ? `Snapshot upload: OK → ${SNAPSHOT_BUCKET}/${snapshot.key}  (${snapshot.rows} rows, ${snapshot.kb} KB gz)`
     : `Snapshot upload: FAILED — ${snapshot.error}  (${snapshot.rows} rows${snapshot.kb ? `, ${snapshot.kb} KB gz` : ''} NOT uploaded)`);
   console.log(`Elapsed: ${elapsedMin} min`);
+  // Last thing in the log, after everything else has had its say.
+  logWriteLossSummary();
 }
 
 main().catch((e) => {
   console.error('Fatal error:', e);
+  // Printed on the way out too: a job that died mid-run has lost writes worth seeing, and
+  // "always present" is what makes the marker greppable across every job in the sweep.
+  // Exit code is untouched — this handler still fails the job exactly as before.
+  logWriteLossSummary();
   process.exit(1);
 });
