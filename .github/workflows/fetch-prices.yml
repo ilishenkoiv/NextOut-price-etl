@@ -332,15 +332,15 @@ jobs:
           fail=0
           reasons=()
 
-          printf '%-13s  %-8s  %-9s  %8s  %-8s  %s\n' JOB EXPECTED RESULT ROWS SNAPSHOT DETAIL
-          printf '%s\n' '---------------------------------------------------------------------------------'
+          printf '%-13s  %-8s  %-9s  %8s  %-8s  %-8s  %s\n' JOB EXPECTED RESULT ROWS SNAPSHOT UPLOAD DETAIL
+          printf '%s\n' '--------------------------------------------------------------------------------------------'
 
           check() {
             job="$1"; scope="$2"; expected="$3"; result="$4"
             file="reports/snapshot-report-${scope}.json"
             # ASCII placeholders on purpose: printf pads by BYTES, so a multibyte dash here would
             # knock the column alignment out for exactly the rows a reader is scanning.
-            rows='-'; snap='-'; detail=''
+            rows='-'; snap='-'; up='-'; detail=''
 
             # A skipped job produced no artifact and cannot be asked for one; anything else ran.
             ran=true
@@ -350,6 +350,11 @@ jobs:
               if [ -f "$file" ]; then
                 rows=$(jq -r 'if (.rows|type) == "number" then .rows else "?" end' "$file" 2>/dev/null) || rows='?'
                 snap=$(jq -r 'if .valid == true then "valid" elif .valid == false then "INVALID" else "?" end' "$file" 2>/dev/null) || snap='?'
+                # Anything that is not a literal true lands in UNKNOWN, and that is on purpose:
+                # `uploaded: null` (the job never heard back from Storage) and an artifact written
+                # by an older collector that has no `uploaded` field at all are the same fact —
+                # nobody confirmed the object arrived. Both red. See the gate below.
+                up=$(jq -r 'if .uploaded == true then "OK" elif .uploaded == false then "FAILED" else "UNKNOWN" end' "$file" 2>/dev/null) || up='?'
                 detail=$(jq -r '(.failures // []) | join(" ; ")' "$file" 2>/dev/null) || detail='unreadable JSON'
                 in_scope=$(jq -r '.scope // ""' "$file" 2>/dev/null) || in_scope=''
                 if [ -n "$in_scope" ] && [ "$in_scope" != "$scope" ]; then
@@ -358,8 +363,21 @@ jobs:
                 if [ "$snap" != 'valid' ]; then
                   fail=1; reasons+=("$job: snapshot not valid ($snap)")
                 fi
+                # THE HOLE THIS CLOSES. Validation happens before the upload and says nothing
+                # about whether the object arrived; the collector's contract keeps a failed upload
+                # from failing the job. So a valid CSV that never reached the bucket used to be a
+                # green run with nothing in it — exactly the 24-25 July failure, eight snapshots
+                # lost, four jobs success. Only a definite true passes here.
+                if [ "$up" != 'OK' ]; then
+                  fail=1; reasons+=("$job: snapshot upload $up")
+                  # A null verdict carries no reason of its own, so give it one — otherwise the
+                  # DETAIL column is blank for the single most confusing outcome.
+                  if [ "$up" = 'UNKNOWN' ]; then
+                    detail="no Storage verdict recorded (uploaded is not true) — the job did not live to hear back${detail:+ ; $detail}"
+                  fi
+                fi
               else
-                snap='MISSING'
+                snap='MISSING'; up='MISSING'
                 detail='no snapshot-report artifact for this job'
                 fail=1; reasons+=("$job: artifact missing")
               fi
@@ -380,7 +398,7 @@ jobs:
               detail="ran though not scheduled${detail:+ ; $detail}"
             fi
 
-            printf '%-13s  %-8s  %-9s  %8s  %-8s  %s\n' "$job" "$expected" "$result" "$rows" "$snap" "$detail"
+            printf '%-13s  %-8s  %-9s  %8s  %-8s  %-8s  %s\n' "$job" "$expected" "$result" "$rows" "$snap" "$up" "$detail"
           }
 
           check 'months 1-3'   'm1-3'   "$NEAR_EXPECTED" "$R_M1_3"
@@ -390,7 +408,7 @@ jobs:
 
           echo
           if [ "$fail" -eq 0 ]; then
-            echo 'WATCHDOG OK — every scheduled job succeeded and every snapshot validated.'
+            echo 'WATCHDOG OK — every scheduled job succeeded, every snapshot validated and reached the bucket.'
             exit 0
           fi
           echo "WATCHDOG FAILED — ${#reasons[@]} problem(s):"
