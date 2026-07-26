@@ -15,6 +15,10 @@ node_modules/
 # alone on purpose (no git rm yet — that decision is still open).
 snapshots/
 
+# per-job snapshot validation trace, written to the workspace root by fetch-prices.mjs and
+# uploaded as a CI artifact for the watchdog job. Never belongs in a commit.
+snapshot-report-*.json
+
 # curated destination photos — downloaded/generated locally, NOT committed (public repo).
 # Includes candidates, optimized WebP, manifest.json, selected.json, review.html.
 photos/
