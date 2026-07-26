@@ -702,6 +702,18 @@ function logSnapshotInvalid(scope, failures) {
 // the end of the sweep. The scope is in the FILENAME as well as the body: the four jobs run on
 // four separate runners but the watchdog merges their artifacts into one directory, where a
 // fixed name would have three of the four overwrite each other.
+//
+// Shape: { scope, rows, valid, uploaded, failures }.
+//
+// WRITTEN TWICE, and the order matters. The first write goes out BEFORE the upload is attempted,
+// with `uploaded: null` — so a job that dies on Storage still leaves a trace, which is the whole
+// reason the trace exists. The second write replaces it once Storage has answered, carrying
+// `uploaded: true|false` taken from that answer.
+//
+// A file left at `uploaded: null` is therefore a real outcome and not an oversight: it says the
+// job did not live to hear back. The watchdog treats null exactly like false — anything that is
+// not a definite `true` reds the run. Bucket not found in July went unnoticed for four days
+// precisely because "we never found out" and "it worked" looked the same from outside.
 const SNAPSHOT_REPORT_PATH = `snapshot-report-${SCOPE}.json`;
 let snapshotReportWritten = false;
 function writeSnapshotReport(report) {
@@ -748,7 +760,10 @@ async function uploadSnapshot(rows, scope) {
     noteWriteLoss('storage_snapshot', validation.valid
       ? 'csv valid'
       : `csv ${SNAPSHOT_INVALID_MARKER} (${validation.failures.length} check(s) failed)`);
-    writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, failures: validation.failures });
+    // Phase one of the trace: written BEFORE gzip and before the upload, so a job that dies on
+    // Storage still leaves one. `uploaded: null` = Storage has not answered yet; main() replaces
+    // this file with the verdict once it has.
+    writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, uploaded: null, failures: validation.failures });
 
     gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
     const kb = (gz.length / 1024).toFixed(1);
@@ -785,8 +800,11 @@ async function uploadSnapshot(rows, scope) {
       noteWriteLoss('storage_snapshot', `csv ${SNAPSHOT_INVALID_MARKER} (never validated)`);
       logSnapshotInvalid(scope, validation.failures);
     }
+    // Threw before phase one ran (the timestamp, the CSV, gzip). No request was made, so nothing
+    // was uploaded and we know it — `false`, not `null`. main() overwrites this with the same
+    // verdict plus the reason; this write only guarantees a trace exists from here on.
     if (!snapshotReportWritten) {
-      writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, failures: validation.failures });
+      writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, uploaded: false, failures: validation.failures });
     }
     return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: why, valid: validation.valid, failures: validation.failures };
   }
@@ -1121,6 +1139,18 @@ async function main() {
   console.log(snapshot.ok
     ? `Snapshot upload: OK → ${SNAPSHOT_BUCKET}/${snapshot.key}  (${snapshot.rows} rows, ${snapshot.kb} KB gz)`
     : `Snapshot upload: FAILED — ${snapshot.error}  (${snapshot.rows} rows${snapshot.kb ? `, ${snapshot.kb} KB gz` : ''} NOT uploaded)`);
+  // Phase two of the trace, deliberately right here, off the SAME `snapshot.ok` the line above
+  // prints. That value came out of writeWithRetry as `r.ok`, so the log, the artifact and the
+  // watchdog all read one answer from one place; asking Storage a second time would be a second
+  // truth that could disagree with the first. The reason travels with it, so the watchdog prints
+  // "HTTP 400: Bucket not found" in DETAIL rather than a bare FAILED.
+  writeSnapshotReport({
+    scope: SCOPE,
+    rows: snapshot.rows,
+    valid: snapshot.valid,
+    uploaded: snapshot.ok,
+    failures: snapshot.ok ? snapshot.failures : [...snapshot.failures, `upload failed: ${snapshot.error}`],
+  });
   console.log(`Elapsed: ${elapsedMin} min`);
   // Last thing in the log, after everything else has had its say.
   logWriteLossSummary();
@@ -1133,7 +1163,7 @@ main().catch((e) => {
   // here so every job that got as far as starting node is accounted for. writeFileSync is
   // synchronous, so it completes before the process.exit below.
   if (!snapshotReportWritten) {
-    writeSnapshotReport({ scope: SCOPE, rows: 0, valid: false, failures: ['job died before the snapshot was built'] });
+    writeSnapshotReport({ scope: SCOPE, rows: 0, valid: false, uploaded: false, failures: ['job died before the snapshot was built'] });
   }
   // Printed on the way out too: a job that died mid-run has lost writes worth seeing, and
   // "always present" is what makes the marker greppable across every job in the sweep.
