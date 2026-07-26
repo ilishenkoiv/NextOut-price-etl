@@ -6,11 +6,8 @@
 // would run out, and quality would be unpredictable). Photos are picked once (step 2) and
 // live in our own Supabase Storage (steps 3–4).
 //
-// LEGAL / provenance: the Pexels License allows commercial use and attribution is a "please"
-// (not a hard "must") on normal API access. BUT Pexels gives $0 indemnification and does not
-// verify uploader rights — if someone uploaded a photo they didn't own, the claim lands on
-// US. So we keep the COMPLETE provenance of every candidate (photographer, source URLs, ids)
-// and show attribution in the app — a good-faith paper trail, not an optional nicety.
+// Provenance is recorded for EVERY candidate, not just the ones picked, and attribution is
+// shown in the app. Do not trim either — both are deliberate and must survive refactors.
 //
 //   PowerShell:  $env:PEXELS_API_KEY="..."; node scripts/fetch-photos.mjs
 //   bash:        PEXELS_API_KEY=... node scripts/fetch-photos.mjs

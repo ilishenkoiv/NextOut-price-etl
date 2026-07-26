@@ -1,22 +1,8 @@
 // scripts/fetch-prices.mjs — NextOut Price ETL (standalone collector).
 //
-// Collects real Travelpayouts cache flight data and writes it to Supabase. Runs daily in
-// GitHub Actions; can be run locally too. This is the ETL half of NextOut — it contains NO
-// product logic (no ranking, no scoring, no UI), only the collection pipeline.
-//
-// THREE tables are filled from the SAME API responses:
-//   • prices — one row per route-month = the cheapest price (the app reads this today).
-//   • offers — every individual offer WHOLE (departure_at/return_at/nights/price/transfers/
-//     airline). The v3 endpoint returns up to 30 dated offers per route-month; the old code
-//     kept only Math.min and threw the rest away — losing which DAYS are cheap and mixing a
-//     2-night fare into a 7-night Total. offers is a per-run SNAPSHOT: upsert on PK, then
-//     stale rows (older than the run) are pruned, so it reflects current state, not a log.
-//   • price_history — an APPEND-ONLY log of price CHANGES (never overwritten). prices upserts
-//     on (origin,dest,month) so each run clobbers the previous value; without a log we lose
-//     the time series needed for "cheaper than this month's average" and analytics. We insert
-//     a row ONLY when direct/any_stops differ from what prices currently holds (or a route is
-//     new) — a full snapshot each run would hit Supabase's storage cap in ~4 months; recording
-//     only the ~10-20% that change per run lasts ~2 years.
+// Collects flight price data from Travelpayouts and writes it to Supabase. Runs in GitHub
+// Actions; can be run locally too. Contains NO product logic (no ranking, no scoring, no
+// UI), only the collection pipeline.
 //
 //   PowerShell:  $env:TP_TOKEN="..."; $env:SUPABASE_SERVICE_KEY="..."; node scripts/fetch-prices.mjs
 //   bash:        TP_TOKEN=... SUPABASE_SERVICE_KEY=... node scripts/fetch-prices.mjs
@@ -26,14 +12,10 @@
 //   SUPABASE_SERVICE_KEY — Supabase service-role key, writes past RLS (required, SECRET).
 //   SUPABASE_URL         — project URL (public, NOT a secret; default below).
 //
-// One request per route-month, chosen by distance:
-//   stops === 0 (near)      → query direct=true  → prices.direct
-//   stops === 1 (long-haul) → query direct=false → prices.any_stops
-//
-// Hotel price segments (`hotels_segments`) are NOT collected here: they are maintained
-// as static curated data in Supabase and refreshed manually. The former Hotellook API
-// integration (`hotels`/`hotels_segments` collection) was removed — the upstream
-// endpoints (engine.hotellook.com) were discontinued and return 404 on everything.
+// Hotel price segments (`hotels_segments`) are NOT collected here and must not be added
+// back: they are static curated data maintained directly in Supabase, and the former
+// Hotellook integration was removed because the upstream endpoints (engine.hotellook.com)
+// were discontinued and return 404 on everything.
 
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
@@ -147,33 +129,28 @@ function selectCombo(offers, origin, dest) {
   return [...chosen.values()];
 }
 
-// Fixed INTERVAL, not a fixed pause. We used to sleep 1100 ms AFTER each response, which
-// makes the real spacing HTTP + 1100 — so the run's length was set by Travelpayouts' latency,
-// not by us. Measured: 1196 ms average spacing (50.1 req/min, not the 54.5 the pause implied),
-// and when TP slowed from 96 ms to 200–390 ms the same sweep grew from 315 to 355+ min and
-// two runs were cancelled on timeout. Now we time the request and sleep only the remainder of
-// TARGET_INTERVAL_MS, so a slower API costs nothing until it exceeds the interval outright.
-// 1091 ms = 55 req/min against the 60/min ceiling. Overridable via TP_TARGET_INTERVAL_MS for
-// CI/re-runs; do NOT drop below ~1091 against the live API.
+// Fixed INTERVAL, not a fixed pause. Sleeping a fixed time AFTER each response makes the real
+// spacing HTTP + pause, so the run's length is set by the upstream API's latency rather than
+// by us — when upstream slowed, sweeps overran and runs were cancelled on timeout. We time the
+// request and sleep only the remainder of TARGET_INTERVAL_MS, so a slower API costs nothing
+// until it exceeds the interval outright. The default sits deliberately under the upstream
+// rate ceiling: do NOT lower it against the live API. TP_TARGET_INTERVAL_MS exists for CI and
+// small re-runs only.
 const TARGET_INTERVAL_MS = Number(process.env.TP_TARGET_INTERVAL_MS) || 1091;
-// 8s, down from 15s. Nothing useful ever arrived that late — TP answers in 96–390 ms, and the
-// observed failures are 502/503 bursts, so a long ceiling only bought dead waiting time.
+// Deliberately short. Nothing useful ever arrives late — upstream answers well inside a second
+// and the observed failures are 502/503 bursts, so a long ceiling only buys dead waiting time.
 const TIMEOUT_MS = 8000;
 const BATCH = 500; // rows per Supabase upsert — batched, not row-by-row
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
 
 // Month window, parameterized so a long horizon can be split across sequential CI jobs
-// without either exceeding the 6-hour job limit or the 60 req/min API limit.
+// without exceeding either the hosted-runner job limit or the upstream rate limit.
 //   MONTH_START — 1-based offset from the current month (default 1). START=1 → the NEXT
 //                 full month; the current, partially-elapsed month is never collected
 //                 (matches the app's horizon — lib/prices.ts horizonMonths).
 //   MONTH_COUNT — how many consecutive months to collect (default 6).
-// CI splits the 12-month horizon into FOUR sequential 3-month jobs (see the workflow):
-//   MONTH_START=1  MONTH_COUNT=3 → months 1–3
-//   MONTH_START=4  MONTH_COUNT=3 → months 4–6
-//   MONTH_START=7  MONTH_COUNT=3 → months 7–9
-//   MONTH_START=10 MONTH_COUNT=3 → months 10–12
+// The workflow sets both per job; see it for the split actually used in CI.
 const MONTH_START = Number(process.env.MONTH_START) || 1;
 const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
 // Snapshot scope label = which month-slice THIS job collected. Uniform `mA-B` since the
@@ -812,11 +789,10 @@ async function uploadSnapshot(rows, scope) {
 
 // Build the day's route list from the catalog and what the database already knows.
 //
-// SKIPPING THE DEAD. Half the network is not a network: 1313 of the 2637 pairs have no price
-// in ANY month of the horizon — they are airport combinations nobody flies, and asking about
-// them costs half the run for nothing. They are not dropped, though: routes DO open, and a
-// pair that is never asked can never be seen to open. Each run re-checks 1/7 of the dead list,
-// so the whole list is covered every week.
+// SKIPPING THE DEAD. A large share of the pairs have no price in ANY month of the horizon —
+// airport combinations nobody flies — and asking about them spends the run for nothing. They
+// are not dropped, though: routes DO open, and a pair that is never asked can never be seen to
+// open. Each run re-checks 1/7 of the dead list, so the whole list is covered every week.
 //
 // WHICH seventh is decided by the run's day number, not at random and not by "what we checked
 // last time" — the dead pairs are sorted into a stable order and sliced by index % 7, and the
