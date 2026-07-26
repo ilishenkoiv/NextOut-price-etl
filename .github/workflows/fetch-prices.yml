@@ -106,6 +106,29 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
 
+      # The job's snapshot verdict, read by the `watchdog` job at the end of the sweep.
+      #
+      # THIS STEP MUST NOT BE ABLE TO FAIL THE COLLECTOR. A collector that goes red drags nothing
+      # else down (every `needs:` below is guarded by `always()`), but it does turn a run that
+      # collected and wrote 4400 prices into a failure over a 200-byte JSON. Hence all three:
+      #   if: always()          — a collector that died mid-run still ships the verdict it reached
+      #   continue-on-error     — an upload-artifact outage cannot mark the collector failed
+      #   if-no-files-found: warn — no file (job died before writing one) is a warning, not an error
+      # The consequence is that a missing artifact is SILENT here, on purpose. Reporting it is the
+      # watchdog's job, and it treats an absent artifact as a failure — see that job below.
+      #
+      # overwrite: true so re-running this job replaces its own earlier artifact instead of
+      # colliding with it; the artifact name is per-scope and unique within a run either way.
+      - name: Upload snapshot report (m1-3)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m1-3
+          path: snapshot-report-m1-3.json
+          if-no-files-found: warn
+          overwrite: true
+
   months_4_6:
     name: months 4–6
     # Second half of the near window — same schedule rule as months 1–3. `always()` lets it
@@ -141,6 +164,17 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
+
+      # Same three guards as months 1–3 — see the comment there for why each one is needed.
+      - name: Upload snapshot report (m4-6)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m4-6
+          path: snapshot-report-m4-6.json
+          if-no-files-found: warn
+          overwrite: true
 
   months_7_9:
     name: months 7–9
@@ -178,6 +212,17 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
 
+      # Same three guards as months 1–3 — see the comment there for why each one is needed.
+      - name: Upload snapshot report (m7-9)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m7-9
+          path: snapshot-report-m7-9.json
+          if-no-files-found: warn
+          overwrite: true
+
   months_10_12:
     name: months 10–12
     # Tail of the horizon — same schedule rule as months 7–9.
@@ -212,3 +257,145 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-prices.mjs
+
+      # Same three guards as months 1–3 — see the comment there for why each one is needed.
+      - name: Upload snapshot report (m10-12)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m10-12
+          path: snapshot-report-m10-12.json
+          if-no-files-found: warn
+          overwrite: true
+
+  # ── The watchdog ────────────────────────────────────────────────────────────────────────────
+  # WHY IT EXISTS. Everything the collector does to a snapshot is non-fatal by design: an upload
+  # that 400s, a CSV that comes out malformed, a write that exhausts its retries — all of them
+  # log and continue, because none of them should cost us a six-hour collection. The price of
+  # that design is that the RUN goes green regardless, GitHub sends no mail, and the failure is
+  # a line in a 7000-line log that nobody reads. For four days in July that is exactly what
+  # happened: every snapshot was rejected with `Bucket not found` and every run reported success.
+  # This job is the one place allowed to go red, so the run's colour finally means something.
+  #
+  # It is a LEAF. No collector has it in `needs:`, so its verdict cannot skip or cancel any of
+  # them — a snapshot that fails validation in months 1–3 must not stop months 4–12 collecting.
+  watchdog:
+    name: watchdog
+    needs: [months_1_3, months_4_6, months_7_9, months_10_12]
+    # always() — the whole point is to report on runs that went wrong, including ones where every
+    # collector failed, was cancelled, or never started.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # CONCURRENCY: nothing to add here. The `concurrency` block at the top of this file is
+    # WORKFLOW-level, so the group holds one RUN at a time; every job of a run is inside the same
+    # group membership and a job cannot queue behind its own run. Giving this job its own
+    # `concurrency:` is what WOULD deadlock it — it would then compete with the group it already
+    # belongs to. So: no job-level concurrency, no self-block.
+    #
+    # PERMISSIONS: the workflow-level `contents: read` is enough and is not overridden here.
+    # download-artifact authenticates to the artifact service with the runner's own
+    # ACTIONS_RUNTIME_TOKEN when it reads artifacts from THIS run, not with GITHUB_TOKEN — the
+    # `actions: read` scope and a `github-token:` input are only needed to reach another run or
+    # another repository, which this job never does. It also does not check out the repo.
+    steps:
+      # continue-on-error: download-artifact fails the step outright when the pattern matches
+      # nothing (all four collectors dead, say). That is a case the watchdog must REPORT, not
+      # die on, so the download is allowed to fail and the gate below reads the empty directory.
+      - name: Download snapshot reports
+        id: reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: snapshot-report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Summarise the sweep and gate the run
+        env:
+          # Which jobs were SUPPOSED to run, mirroring the `if:` conditions of the collectors
+          # above. Kept as two expressions rather than reading `result == 'skipped'`, because a
+          # skip is ambiguous on its own: months 7–12 are skipped BY DESIGN on the noon cron and
+          # on a manual near-only run, and failing on that would paint every noon run red once a
+          # day. Expected-and-skipped is a fault; not-expected-and-skipped is the schedule
+          # working. THESE TWO LINES MUST TRACK THE `if:` BLOCKS ABOVE — if a schedule changes
+          # there and not here, the watchdog starts lying in one direction or the other.
+          NEAR_EXPECTED: ${{ github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' }}
+          FAR_EXPECTED: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' }}
+          R_M1_3: ${{ needs.months_1_3.result }}
+          R_M4_6: ${{ needs.months_4_6.result }}
+          R_M7_9: ${{ needs.months_7_9.result }}
+          R_M10_12: ${{ needs.months_10_12.result }}
+        run: |
+          set -uo pipefail
+          fail=0
+          reasons=()
+
+          printf '%-13s  %-8s  %-9s  %8s  %-8s  %s\n' JOB EXPECTED RESULT ROWS SNAPSHOT DETAIL
+          printf '%s\n' '---------------------------------------------------------------------------------'
+
+          check() {
+            job="$1"; scope="$2"; expected="$3"; result="$4"
+            file="reports/snapshot-report-${scope}.json"
+            # ASCII placeholders on purpose: printf pads by BYTES, so a multibyte dash here would
+            # knock the column alignment out for exactly the rows a reader is scanning.
+            rows='-'; snap='-'; detail=''
+
+            # A skipped job produced no artifact and cannot be asked for one; anything else ran.
+            ran=true
+            [ "$result" = 'skipped' ] && ran=false
+
+            if [ "$ran" = true ]; then
+              if [ -f "$file" ]; then
+                rows=$(jq -r 'if (.rows|type) == "number" then .rows else "?" end' "$file" 2>/dev/null) || rows='?'
+                snap=$(jq -r 'if .valid == true then "valid" elif .valid == false then "INVALID" else "?" end' "$file" 2>/dev/null) || snap='?'
+                detail=$(jq -r '(.failures // []) | join(" ; ")' "$file" 2>/dev/null) || detail='unreadable JSON'
+                in_scope=$(jq -r '.scope // ""' "$file" 2>/dev/null) || in_scope=''
+                if [ -n "$in_scope" ] && [ "$in_scope" != "$scope" ]; then
+                  detail="artifact says scope=\"$in_scope\", expected \"$scope\"${detail:+ ; $detail}"
+                fi
+                if [ "$snap" != 'valid' ]; then
+                  fail=1; reasons+=("$job: snapshot not valid ($snap)")
+                fi
+              else
+                snap='MISSING'
+                detail='no snapshot-report artifact for this job'
+                fail=1; reasons+=("$job: artifact missing")
+              fi
+            fi
+
+            # A job that was supposed to run must have succeeded — skipped and cancelled included.
+            if [ "$expected" = 'true' ] && [ "$result" != 'success' ]; then
+              fail=1; reasons+=("$job: expected to run, result=$result")
+            fi
+            # A job that was NOT supposed to run is fine skipped, but if it ran and broke, that
+            # is still a broken collector and the run must say so.
+            if [ "$expected" != 'true' ] && { [ "$result" = 'failure' ] || [ "$result" = 'cancelled' ]; }; then
+              fail=1; reasons+=("$job: not scheduled yet result=$result")
+            fi
+            # Ran while the schedule said it should not have. Reported, deliberately NOT fatal:
+            # the data is collected and written, and the cost is API budget, not correctness.
+            if [ "$expected" != 'true' ] && [ "$result" = 'success' ]; then
+              detail="ran though not scheduled${detail:+ ; $detail}"
+            fi
+
+            printf '%-13s  %-8s  %-9s  %8s  %-8s  %s\n' "$job" "$expected" "$result" "$rows" "$snap" "$detail"
+          }
+
+          check 'months 1-3'   'm1-3'   "$NEAR_EXPECTED" "$R_M1_3"
+          check 'months 4-6'   'm4-6'   "$NEAR_EXPECTED" "$R_M4_6"
+          check 'months 7-9'   'm7-9'   "$FAR_EXPECTED"  "$R_M7_9"
+          check 'months 10-12' 'm10-12' "$FAR_EXPECTED"  "$R_M10_12"
+
+          echo
+          if [ "$fail" -eq 0 ]; then
+            echo 'WATCHDOG OK — every scheduled job succeeded and every snapshot validated.'
+            exit 0
+          fi
+          echo "WATCHDOG FAILED — ${#reasons[@]} problem(s):"
+          for r in "${reasons[@]}"; do echo "  - $r"; done
+          echo
+          echo 'The collectors themselves are unaffected: this job only reports. Prices already'
+          echo 'written stay written. Grep the collector logs for SNAPSHOT-INVALID and WRITE-LOSS.'
+          exit 1
