@@ -1,0 +1,136 @@
+name: Schedule keepalive
+
+# Keeps the cron schedules in this repository from being switched off.
+#
+# GitHub disables scheduled workflows in a PUBLIC repository after 60 days of inactivity, and
+# a scheduled RUN does not count as activity — only a new commit on the default branch does.
+# That counter used to be reset for free: the collector committed a price snapshot after every
+# run. Snapshots now go to the Supabase Storage bucket instead, `fetch-prices.yml` runs with
+# `contents: read`, and nothing pushes commits any more — so the 60-day clock is running for
+# the first time, and the price sweep would silently stop two months after the last commit.
+#
+# This workflow writes as little as it can: one line in `.github/keepalive-stamp.txt`, and only
+# when the default branch has actually been quiet for 40 days. Any week with real work in it
+# ends with the job printing how much slack is left and exiting without a commit — a repository
+# that is being worked on never accumulates keepalive commits.
+#
+# WHY 40 AND NOT 55. The check runs weekly, so a crossing is noticed up to 7 days late: the
+# stamp lands somewhere between day 40 and day 47. That still leaves ~13 days of margin under
+# GitHub's 60 — enough to absorb a failed run or two. Nobody watches this workflow, so a red
+# run has to be survivable rather than noticed.
+#
+# WHAT THE 40 DAYS ARE COUNTED FROM — read this before "fixing" it. From the tip of the default
+# branch, whatever that commit is, INCLUDING a stamp this workflow pushed itself. So the clock
+# restarts from each stamp, and a repository nobody touches settles into one keepalive commit
+# every 40–47 days, each measured from the last. That is the intended steady state, not a
+# runaway loop: the counter GitHub resets is the same one this job reads, so anything that
+# resets GitHub's counter has to reset ours too, our own commit included. Measuring from the
+# last HUMAN commit instead would be strictly worse — once the branch went quiet the job would
+# stamp every single week, forever, because that human commit would only keep getting older.
+
+on:
+  schedule:
+    # Sunday 18:00 UTC — 20:00 Berlin in summer (CEST), 19:00 in winter (CET).
+    #
+    # Deliberately nowhere near `fetch-prices.yml`. The nightly sweep starts 23:00 UTC and runs
+    # ~5h30, worst case ~9h35 (until ~08:35 UTC); the noon sweep starts 10:00 UTC and runs
+    # ~2h45, worst case ~4h50 (until ~14:50 UTC). 18:00 UTC sits ~3h after the worst-case end
+    # of the noon sweep and ~5h before the nightly one starts. Nothing would actually break on
+    # an overlap — this job touches one text file and the collector no longer commits — but the
+    # separation costs nothing and keeps the two readable side by side in the Actions list.
+    - cron: '0 18 * * 0'
+  # Manual runs are for verifying the job itself. Below the threshold a manual run is a
+  # harmless dry run: it prints the day count and exits without touching the repository.
+  workflow_dispatch:
+
+# One keepalive run at a time. The only realistic overlap is a manual run fired while the
+# weekly one is in flight; two pushes racing would fail the loser on a non-fast-forward.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+# The one place in this repository allowed to write to it. `fetch-prices.yml` stays on
+# `contents: read`. Nothing else is needed: no actions, packages or issues scopes.
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    name: Stamp the default branch if it has gone quiet
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        # Pinned to the major version, same as `fetch-prices.yml`. The default shallow clone
+        # (fetch-depth: 1) is enough — we only read the timestamp of the tip commit, and a push
+        # from a shallow checkout is fine because its parent is already on the remote. Checkout
+        # persists credentials by default, and that is what lets the push below authenticate
+        # with GITHUB_TOKEN.
+        uses: actions/checkout@v7
+
+      - name: Stamp if the default branch has been quiet for 40 days
+        run: |
+          set -euo pipefail
+
+          THRESHOLD_DAYS=40
+          STAMP_FILE=.github/keepalive-stamp.txt
+
+          # Only the DEFAULT branch resets GitHub's inactivity counter. A scheduled run is
+          # always on it; a manual run from a side branch would stamp the wrong branch and
+          # report success while the schedule kept ticking towards 60, so refuse instead.
+          if [ "${GITHUB_REF_NAME}" != "${DEFAULT_BRANCH}" ]; then
+            echo "Refusing to run on '${GITHUB_REF_NAME}': only commits on the default branch"
+            echo "('${DEFAULT_BRANCH}') reset GitHub's 60-day inactivity counter."
+            exit 1
+          fi
+
+          last_commit=$(git log -1 --format=%ct)
+          now=$(date -u +%s)
+          days=$(( (now - last_commit) / 86400 ))
+
+          echo "Tip of ${DEFAULT_BRANCH}: $(git log -1 --format='%h %ci %s')"
+          echo "Days since that commit: ${days}"
+          echo "Stamp threshold: ${THRESHOLD_DAYS} days (GitHub disables schedules at 60)"
+
+          if [ "${days}" -lt "${THRESHOLD_DAYS}" ]; then
+            echo "Nothing to do: ${days} day(s) of inactivity, $(( THRESHOLD_DAYS - days )) to go before a stamp is due."
+            exit 0
+          fi
+
+          echo "Threshold reached — writing ${STAMP_FILE} and pushing."
+
+          # Rewritten in full every time; the file has exactly one moving part, the last line.
+          cat > "${STAMP_FILE}" <<EOF
+          This file exists only to keep GitHub's scheduled workflows enabled.
+
+          GitHub disables cron schedules in a public repository after 60 days without a commit
+          on the default branch, and scheduled runs themselves do not count. When this branch
+          has been quiet for ${THRESHOLD_DAYS} days, .github/workflows/keepalive.yml rewrites
+          the line below and commits it. Nothing reads this file.
+
+          Last stamp (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')
+          EOF
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "${STAMP_FILE}"
+
+          # `[skip ci]` is belt-and-braces. A push made with GITHUB_TOKEN does not trigger
+          # workflows at all, so today the marker changes nothing. It is there for the day this
+          # commit stops coming from the bot — a PAT or a deploy key WOULD trigger runs, and a
+          # stamp nobody reads has no business starting a five-hour price sweep.
+          git commit -m 'Keep the scheduled workflows enabled [skip ci]'
+
+          # Rebase onto anything that landed while this job was running, then push. The window
+          # is seconds wide and will be hit about once in a blue moon, but the cost of losing
+          # that race is out of proportion to its odds: this job only runs when the branch has
+          # been quiet for 40 days, so a rejected push means no stamp, and nobody is watching
+          # this workflow to notice. --rebase, and never --force under any outcome: the stamp is
+          # the least important commit in the repository and must not overwrite someone's work.
+          # If the rebase cannot be resolved the step fails loudly and next Sunday tries again,
+          # with ~13 days of margin still in hand.
+          git pull --rebase origin "${DEFAULT_BRANCH}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
