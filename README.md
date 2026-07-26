@@ -53,6 +53,14 @@ cap, and two runs were cancelled on timeout before it was split.
 Manual runs go through `workflow_dispatch` with a `scope` input: `both` (default), `near`
 or `far`.
 
+### Keeping the schedule alive
+
+GitHub disables scheduled workflows in a **public** repository after 60 days of inactivity, and
+the runs above do not count as activity — only a new commit on the default branch does. Nothing
+here commits any more (snapshots go to Storage), so `.github/workflows/keepalive.yml` checks
+weekly and, only if the branch has been quiet for 40 days, commits a one-line stamp to
+`.github/keepalive-stamp.txt`. In any busier week it prints the remaining slack and exits.
+
 ## How it works
 
 1. **Plan** — for each of the **20 departure airports** in `src/data/origins.js`
