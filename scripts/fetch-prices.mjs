@@ -38,6 +38,7 @@
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
+import { writeFileSync } from 'node:fs';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
@@ -350,6 +351,17 @@ function recordWriteLoss(target, kind, rows) {
 const formatWriteLoss = (k) =>
   `${k.calls} calls, ${k.rows} rows${k.unsized ? ` (+${k.unsized} of unknown size)` : ''}`;
 
+// A qualifier appended to ONE target's summary line. It exists because calls/rows can only say
+// "this write never landed", and the snapshot has a second failure mode they cannot express: the
+// upload succeeds and the object is malformed. That is not a lost row — the prices themselves
+// went into `prices` regardless — so counting it under permanent/exhausted would overstate the
+// damage and corrupt the rows-never-written total. It rides on the SAME line as
+// `storage_snapshot` rather than in a summary of its own: one marker, one verdict, one grep.
+const writeLossNotes = new Map();
+function noteWriteLoss(target, note) {
+  writeLossNotes.set(target, note);
+}
+
 // One line per target plus a TOTAL, every line starting with WRITE_LOSS_MARKER so the whole
 // verdict is `grep WRITE-LOSS` on the job log.
 function logWriteLossSummary() {
@@ -361,8 +373,13 @@ function logWriteLossSummary() {
     calls += e.permanent.calls + e.exhausted.calls;
     rows += e.permanent.rows + e.exhausted.rows;
     unsized += e.permanent.unsized + e.exhausted.unsized;
-    console.log(`${WRITE_LOSS_MARKER} ${target.padEnd(pad)}  permanent ${formatWriteLoss(e.permanent)}  ·  exhausted ${formatWriteLoss(e.exhausted)}`);
+    // No note means the step never got far enough to have a verdict — for the snapshot that is
+    // itself information, and it reads differently from an explicit "valid".
+    const note = writeLossNotes.get(target);
+    console.log(`${WRITE_LOSS_MARKER} ${target.padEnd(pad)}  permanent ${formatWriteLoss(e.permanent)}  ·  exhausted ${formatWriteLoss(e.exhausted)}${note ? `  ·  ${note}` : ''}`);
   }
+  // TOTAL stays rows-never-written and nothing else. A malformed-but-uploaded snapshot is
+  // deliberately absent from it — see writeLossNotes — and is read off its own target line.
   console.log(`${WRITE_LOSS_MARKER} ${'TOTAL'.padEnd(pad)}  ${calls} failed writes, ${rows} rows never written${unsized ? `, ${unsized} calls of unknown row count` : ''}`);
 }
 
@@ -576,8 +593,133 @@ function berlinStampParts(d = new Date()) {
   const g = (t) => p.find((x) => x.type === t).value;
   return { y: g('year'), mo: g('month'), da: g('day'), hh: g('hour'), mi: g('minute') };
 }
+
+// ── Validating the CSV before it is uploaded ──────────────────────────────────
+// The bucket accepting an object proves only that bytes arrived. It says nothing about whether
+// those bytes are the snapshot we meant to keep, and a snapshot is read months later, by which
+// time the run that produced it is unreproducible. So the CSV is checked while we still have
+// the run that made it.
+//
+// The expected header is written out AGAIN here instead of being shared with the builder above.
+// A shared constant would make this check tautological — it would compare the builder's header
+// to itself and pass on any typo. Duplicated, it is a real assertion: change one and the other
+// objects. The two literals must be edited together, and that is the point.
+const SNAPSHOT_CSV_HEADER_EXPECTED = 'origin,dest,depart_month,price_direct,price_any,currency,fetched_at,scope';
+const SNAPSHOT_CSV_FIELDS = SNAPSHOT_CSV_HEADER_EXPECTED.split(',').length; // 8
+const SNAPSHOT_MONTH_COL = 2; // depart_month
+const SNAPSHOT_SCOPE_COL = 7; // scope
+// Marker for the log line, deliberately distinct from WRITE_LOSS_MARKER: this is a malformed
+// artifact, not a lost write, and conflating the two greps would blur the difference.
+const SNAPSHOT_INVALID_MARKER = 'SNAPSHOT-INVALID';
+// How many offending rows/values a failure line names before it stops. A malformed snapshot can
+// be malformed in all 4400 rows, and a log line that long is unreadable — the count is the
+// number that matters, the samples only say where to look.
+const SNAPSHOT_INVALID_SAMPLES = 5;
+
+// `"value" ×n, "other" ×m` for a tally Map, capped at SNAPSHOT_INVALID_SAMPLES distinct values.
+function formatValueTally(tally) {
+  const parts = [...tally.entries()]
+    .slice(0, SNAPSHOT_INVALID_SAMPLES)
+    .map(([v, n]) => `"${v}" ×${n}`);
+  if (tally.size > SNAPSHOT_INVALID_SAMPLES) parts.push(`… ${tally.size - SNAPSHOT_INVALID_SAMPLES} more distinct value(s)`);
+  return parts.join(', ');
+}
+
+// Returns { valid, failures } — `failures` is one human-readable string per FAILED check, each
+// carrying expected and actual numbers, and it doubles as the machine-readable list in the job's
+// JSON artifact. Never throws for bad input: every check is written to survive a garbled CSV,
+// because the whole reason we are here is that the CSV might be garbage. (The caller wraps the
+// call anyway — a validator that threw would abort an upload that must happen regardless.)
+function validateSnapshotCsv(csv, expectedRows, scope, months) {
+  const failures = [];
+  const lines = csv.split('\n');
+  // Every row the builder emits ends in '\n', so the split leaves one trailing empty element.
+  // Dropping exactly that one keeps the count honest; a MISSING trailing newline shows up as a
+  // line-count mismatch rather than being silently forgiven.
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+  // 1. Line count: header + one row per collected route-month.
+  const expectedLines = expectedRows + 1;
+  if (lines.length !== expectedLines) {
+    failures.push(`line count: expected ${expectedLines} (1 header + ${expectedRows} data rows), got ${lines.length}`);
+  }
+
+  // 2. Header, verbatim.
+  const header = lines.length > 0 ? lines[0] : '';
+  if (header !== SNAPSHOT_CSV_HEADER_EXPECTED) {
+    failures.push(`header: expected "${SNAPSHOT_CSV_HEADER_EXPECTED}", got "${header}"`);
+  }
+
+  // 3-5. Per-row checks. Counted in full, sampled in the message. Note that a row with the
+  // wrong field count is ALSO checked for scope/month: its columns have shifted, so it will
+  // usually trip those too, and seeing all three symptoms is more useful than suppressing two.
+  const body = lines.slice(1);
+  const allowedMonths = new Set(months);
+  const badFields = [];
+  let badFieldsTotal = 0;
+  const wrongScope = new Map();
+  const foreignMonths = new Map();
+  const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
+
+  body.forEach((line, i) => {
+    const f = line.split(',');
+    if (f.length !== SNAPSHOT_CSV_FIELDS) {
+      badFieldsTotal += 1;
+      // i is 0-based over the body, so the line number in the file is i + 2.
+      if (badFields.length < SNAPSHOT_INVALID_SAMPLES) badFields.push(`line ${i + 2} has ${f.length}`);
+    }
+    const rowScope = f[SNAPSHOT_SCOPE_COL];
+    if (rowScope !== scope) bump(wrongScope, rowScope ?? '');
+    const rowMonth = f[SNAPSHOT_MONTH_COL];
+    if (!allowedMonths.has(rowMonth)) bump(foreignMonths, rowMonth ?? '');
+  });
+
+  if (badFieldsTotal > 0) {
+    const more = badFieldsTotal > badFields.length ? `, … ${badFieldsTotal - badFields.length} more` : '';
+    failures.push(`field count: expected ${SNAPSHOT_CSV_FIELDS} in every one of ${body.length} data rows, got ${badFieldsTotal} row(s) with another count (${badFields.join(', ')}${more})`);
+  }
+  if (wrongScope.size > 0) {
+    const rows = [...wrongScope.values()].reduce((a, b) => a + b, 0);
+    failures.push(`scope column: expected "${scope}" in all ${body.length} data rows, got ${rows} row(s) with another value (${formatValueTally(wrongScope)})`);
+  }
+  if (foreignMonths.size > 0) {
+    const rows = [...foreignMonths.values()].reduce((a, b) => a + b, 0);
+    failures.push(`depart_month: expected only the ${months.length} month(s) this job collected [${months.join(', ')}], got ${rows} row(s) with a foreign month (${formatValueTally(foreignMonths)})`);
+  }
+
+  return { valid: failures.length === 0, failures };
+}
+
+// The marker leads EVERY line, including the enumeration, so `grep SNAPSHOT-INVALID` returns the
+// whole verdict and not just its first line.
+function logSnapshotInvalid(scope, failures) {
+  console.warn(`${SNAPSHOT_INVALID_MARKER} scope ${scope}: ${failures.length} check(s) failed — the object is uploaded anyway, under its normal key, for post-mortem.`);
+  failures.forEach((f, i) => console.warn(`${SNAPSHOT_INVALID_MARKER}   [${i + 1}/${failures.length}] ${f}`));
+}
+
+// ── The job's machine-readable trace ─────────────────────────────────────────
+// One small JSON per job, picked up by actions/upload-artifact and read by the watchdog job at
+// the end of the sweep. The scope is in the FILENAME as well as the body: the four jobs run on
+// four separate runners but the watchdog merges their artifacts into one directory, where a
+// fixed name would have three of the four overwrite each other.
+const SNAPSHOT_REPORT_PATH = `snapshot-report-${SCOPE}.json`;
+let snapshotReportWritten = false;
+function writeSnapshotReport(report) {
+  try {
+    writeFileSync(SNAPSHOT_REPORT_PATH, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+    snapshotReportWritten = true;
+  } catch (e) {
+    // Same contract as everything else in this block: the trace is diagnostics, and diagnostics
+    // never fail the ETL. A missing artifact is what the watchdog reports on.
+    console.warn(`⚠ could not write ${SNAPSHOT_REPORT_PATH} (non-fatal, ETL unaffected): ${e?.message ?? e}`);
+  }
+}
+
 async function uploadSnapshot(rows, scope) {
   let gz = null;
+  // Declared out here so the catch below can still report a verdict for a run that threw before
+  // the CSV was even validated.
+  let validation = null;
   try {
     const { y, mo, da, hh, mi } = berlinStampParts(new Date());
     // Storage object keys are ALWAYS '/'-separated — built as a plain string, never
@@ -589,6 +731,25 @@ async function uploadSnapshot(rows, scope) {
     for (const r of rows) {
       csv += [r.origin, r.dest, r.month, esc(r.direct), esc(r.any), 'EUR', r.fetched_at, scope].join(',') + '\n';
     }
+    // Validate, then upload NO MATTER WHAT the verdict is, under the unchanged key. A snapshot
+    // that fails a check is the one you most want to look at, and refusing to store it — or
+    // filing it under some `-invalid` name — destroys the evidence and breaks the naming the
+    // reader relies on. The verdict travels in the log, the WRITE-LOSS line and the artifact.
+    // Wrapped: a bug in the validator must not take the upload down with it, so a throw here
+    // becomes an invalid verdict rather than an exception.
+    try {
+      validation = validateSnapshotCsv(csv, rows.length, scope, MONTHS);
+    } catch (e) {
+      validation = { valid: false, failures: [`validator itself threw: ${e?.message ?? e}`] };
+    }
+    if (!validation.valid) logSnapshotInvalid(scope, validation.failures);
+    // Rides on the storage_snapshot line of the existing WRITE-LOSS summary. Set in BOTH
+    // directions on purpose: an explicit "valid" is evidence, a missing note is only silence.
+    noteWriteLoss('storage_snapshot', validation.valid
+      ? 'csv valid'
+      : `csv ${SNAPSHOT_INVALID_MARKER} (${validation.failures.length} check(s) failed)`);
+    writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, failures: validation.failures });
+
     gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
     const kb = (gz.length / 1024).toFixed(1);
     // A full 12-month sweep gzips to ~60 KB, so 50 MB is a tripwire rather than a real
@@ -607,16 +768,27 @@ async function uploadSnapshot(rows, scope) {
     { target: 'storage_snapshot', rows: rows.length });
     if (!r.ok) {
       console.warn(`⚠ snapshot upload failed after ${r.attempts} attempt(s) (non-fatal, ETL unaffected): ${r.why}`);
-      return { ok: false, key, kb, rows: rows.length, error: r.why, attempts: r.attempts };
+      return { ok: false, key, kb, rows: rows.length, error: r.why, attempts: r.attempts, valid: validation.valid, failures: validation.failures };
     }
-    return { ok: true, key, kb, rows: rows.length, error: null, attempts: r.attempts };
+    return { ok: true, key, kb, rows: rows.length, error: null, attempts: r.attempts, valid: validation.valid, failures: validation.failures };
   } catch (e) {
     const why = describeError(httpStatusOf(null, e), e);
     // Threw OUTSIDE writeWithRetry (building the CSV, gzipping, the timestamp) — so nothing
     // recorded it. Permanent: no request was made, and repeating it would throw again.
     recordWriteLoss('storage_snapshot', 'permanent', rows.length);
     console.warn(`⚠ snapshot upload failed (non-fatal, ETL unaffected): ${why}`);
-    return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: why };
+    // A throw before/at gzip means no verdict was reached. Report that as invalid rather than
+    // leaving the artifact absent: "we do not know" and "the watchdog saw nothing" look the
+    // same from the outside, and only one of them is true here.
+    if (!validation) {
+      validation = { valid: false, failures: [`snapshot never validated — threw before the check: ${why}`] };
+      noteWriteLoss('storage_snapshot', `csv ${SNAPSHOT_INVALID_MARKER} (never validated)`);
+      logSnapshotInvalid(scope, validation.failures);
+    }
+    if (!snapshotReportWritten) {
+      writeSnapshotReport({ scope, rows: rows.length, valid: validation.valid, failures: validation.failures });
+    }
+    return { ok: false, key: null, kb: gz ? (gz.length / 1024).toFixed(1) : null, rows: rows.length, error: why, valid: validation.valid, failures: validation.failures };
   }
 }
 
@@ -956,6 +1128,13 @@ async function main() {
 
 main().catch((e) => {
   console.error('Fatal error:', e);
+  // A job that died before uploadSnapshot ran has no artifact at all, and the watchdog cannot
+  // tell that apart from an upload-artifact step that silently did nothing. Leave the trace
+  // here so every job that got as far as starting node is accounted for. writeFileSync is
+  // synchronous, so it completes before the process.exit below.
+  if (!snapshotReportWritten) {
+    writeSnapshotReport({ scope: SCOPE, rows: 0, valid: false, failures: ['job died before the snapshot was built'] });
+  }
   // Printed on the way out too: a job that died mid-run has lost writes worth seeing, and
   // "always present" is what makes the marker greppable across every job in the sweep.
   // Exit code is untouched — this handler still fails the job exactly as before.
