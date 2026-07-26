@@ -1,0 +1,65 @@
+NextOut Price ETL — Proprietary License
+Copyright (c) 2026 Ilia Ilishenko. All rights reserved.
+
+This repository is published publicly so that it can be READ. Publication is not
+a grant of rights. No open-source license applies to this software, and none is
+implied by its presence on a public code-hosting service.
+
+1. WHAT YOU MAY DO
+
+   You may view, read and study the contents of this repository, including its
+   source code, configuration, documentation and commit history, for the purpose
+   of understanding, evaluating or reviewing it.
+
+2. WHAT YOU MAY NOT DO WITHOUT PRIOR WRITTEN PERMISSION
+
+   Except as stated in section 1, and except where the law grants a right that
+   cannot be waived by agreement, you may NOT:
+
+   a. use this software or any part of it, for any purpose, whether commercial
+      or non-commercial, including running, executing or deploying it;
+   b. copy, download for reuse, store or otherwise reproduce it, in whole or in
+      part, beyond the temporary copies your browser or client makes in order to
+      display it to you;
+   c. modify, adapt, translate or create derivative works from it;
+   d. distribute, publish, sublicense, sell, rent, lease or otherwise make it
+      available to any third party;
+   e. incorporate it, in whole or in part, into any other work, product or
+      service, including as training data for machine-learning systems.
+
+   Permission must be given in writing and signed by the copyright holder.
+   Silence, inaction or continued publication is not permission.
+
+3. FORKING
+
+   The "Fork" feature of GitHub, and any equivalent feature of another hosting
+   service, is a mechanism of that service. Using it does NOT grant you any
+   licence to use, copy, modify or distribute this software. A fork remains
+   subject to every restriction in section 2, and this LICENSE file travels with
+   it. Where the hosting service's own Terms of Service require the copyright
+   holder to permit such a copy to exist, that permission extends no further
+   than the Terms themselves require, and confers no right of use.
+
+4. DATA AND THIRD-PARTY MATERIAL
+
+   Data files in this repository that were derived from third-party sources
+   remain subject to the licences of those sources, which are noted where the
+   data appears. Nothing in this LICENSE enlarges or diminishes those licences.
+   This LICENSE governs the software and everything else in the repository.
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+   IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. TERMINATION
+
+   Any use outside section 1 terminates the permission granted by section 1
+   automatically and without notice.
+
+For permission enquiries, contact the copyright holder through the repository's
+GitHub account: https://github.com/ilishenkoiv
