@@ -23,5 +23,10 @@ snapshot-report-*.json
 # Includes candidates, optimized WebP, manifest.json, selected.json, review.html.
 photos/
 
+# ad-hoc local analytics over the collected tables — read-only throwaway tooling, run by hand
+# against a live database. Not part of the pipeline and not meant for a public repository.
+scripts/report-prices.mjs
+scripts/report-print.cjs
+
 # local tooling
 .claude/
