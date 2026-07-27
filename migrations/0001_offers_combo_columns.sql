@@ -9,3 +9,5 @@
 
 alter table public.offers add column if not exists in_cheap_pool boolean not null default false;
 alter table public.offers add column if not exists target_nights smallint;
+
+notify pgrst, 'reload schema';
