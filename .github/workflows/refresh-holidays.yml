@@ -1,0 +1,47 @@
+name: Yearly holiday-calendar refresh
+
+# Refreshes the public_holidays table (DE/AT/CH, two years ahead) once a year. The price
+# collector reads it to decide which date windows to search.
+#
+# SCHEDULE — deliberately clear of every other job in this repo:
+#   • price fetch, night sweep : '0 23 * * *' (23:00 UTC)
+#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
+#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
+# This job runs 20 Nov at 03:00 UTC — a different time of day AND a once-a-year date, so it can
+# never overlap the daily price runs or the weekly keepalive.
+on:
+  schedule:
+    - cron: '0 3 20 11 *' # 20 Nov, 03:00 UTC (04:00 Europe/Berlin, CET) — next year's calendar in good time
+  workflow_dispatch: # manual runs are always possible
+
+# Its OWN concurrency group — not the price-fetch group — so it neither queues behind nor blocks
+# the collector.
+concurrency:
+  group: holidays-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Fetch DE/AT/CH holidays → Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch holidays → Supabase
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/fetch-holidays.mjs
