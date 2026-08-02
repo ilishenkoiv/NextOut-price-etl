@@ -143,6 +143,14 @@ const TIMEOUT_MS = 8000;
 const BATCH = 500; // rows per Supabase upsert — batched, not row-by-row
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad = (n) => String(n).padStart(2, '0');
+// The calendar month AFTER a 'YYYY-MM'. Used as the SECOND return window (§edge-months): a trip
+// that departs late in `ym` and returns early next month is a real, bookable trip that a single
+// return_at=ym request never returns, so we also ask return_at=nextMonthYM(ym) for the same
+// departure month. String math, no Date round-trip (no timezone shift on the month boundary).
+function nextMonthYM(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${pad(m + 1)}`;
+}
 
 // Month window, parameterized so a long horizon can be split across sequential CI jobs
 // without exceeding either the hosted-runner job limit or the upstream rate limit.
@@ -444,10 +452,15 @@ function nightsBetween(dep, ret) {
 // `ok` is true whenever the API responded successfully (even with 0 offers) — the caller
 // uses it to decide whether it may prune stale offers for this route-month.
 // direct=true → non-stop only (flight_type 'direct'); direct=false → any stops ('any').
-async function fetchFlightMonth(origin, dest, ym, direct) {
+// `retYm` is the RETURN month window, default the same month. §edge-months requests the SAME
+// departure month `ym` twice — return_at=ym and return_at=nextMonthYM(ym) — so a late-month
+// departure returning early next month is collected too. The CELL is always the DEPARTURE month:
+// offers are clamped to departure-in-`ym` (§dedup), so the boundary window never files a trip
+// under a neighbouring month, and the same trip from two windows collapses on the offers PK.
+async function fetchFlightMonth(origin, dest, ym, direct, retYm = ym) {
   const url =
     `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=${origin}` +
-    `&destination=${dest}&departure_at=${ym}&return_at=${ym}&direct=${direct}` +
+    `&destination=${dest}&departure_at=${ym}&return_at=${retYm}&direct=${direct}` +
     // limit RAISED 30→500: the cheapest 30 were all short trips (1–4n) → the long durations
     // (10/14n) drowned. 500 returns EVERY duration for combo selection. Still ONE request
     // (TP rate-limits per REQUEST, not per row) — no extra API calls.
@@ -467,13 +480,9 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
     return { ok: false, min: null, offers: [], reason: 'body' };
   }
 
-  // `prices` table: min over any price>0 — IDENTICAL to the previous implementation, so
-  // the app-facing `prices` table is byte-for-byte unchanged (validated separately below).
-  const prices = r.data.map((x) => x.price).filter((p) => typeof p === 'number' && p > 0);
-  const min = prices.length ? Math.round(Math.min(...prices)) : null;
-
-  // `offers` table: parse & validate each item. month is the REQUESTED ym (1d) — not the
-  // offer's departure month, which can differ by a day at a month boundary.
+  // `offers` table: parse & validate each item. The CELL is the DEPARTURE month: an item whose
+  // departure falls outside `ym` (a boundary-day spill, or the return window bleeding a stray
+  // departure across the month line) is dropped, so every row filed here belongs to cell `ym`.
   const flightType = direct ? 'direct' : 'any';
   const nowIso = new Date().toISOString();
   const offers = [];
@@ -481,6 +490,7 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
     const departure_at = toDateOnly(x.departure_at);
     const price = typeof x.price === 'number' ? Math.round(x.price) : NaN;
     if (!departure_at || !(price > 0)) continue; // validation (1e): needs a dep date & price>0
+    if (departure_at.slice(0, 7) !== ym) continue; // §dedup: keep the cell strictly = departure month
     const return_at = toDateOnly(x.return_at); // null for one-way
     offers.push({
       origin,
@@ -496,7 +506,77 @@ async function fetchFlightMonth(origin, dest, ym, direct) {
       updated_at: nowIso,
     });
   }
+  // `prices` min over the SAME departure-in-`ym` offers, so the cell price and its offers agree
+  // (and a cross-month trip from the boundary window can set it).
+  const min = offers.length ? Math.min(...offers.map((o) => o.price)) : null;
   return { ok: true, min, offers };
+}
+
+// Probe ONE cell for ONE flight type over BOTH return windows (§edge-months): return_at=ym and
+// return_at=nextMonthYM(ym), same departure month. `paced` wraps each TP request with the run's
+// pacing + metrics. Returns the merged result for the cell:
+//   • a price from either window → ok:true with that min (a window that FAILED does not veto a
+//     price the other window really returned);
+//   • both windows answered and neither had a price → ok:true, min:null (a genuine "no flights");
+//   • no price AND a window failed → ok:false (INCONCLUSIVE — §first-edit: an empty/failed attempt
+//     must not clobber a known price, so nothing is written and the previous value is kept).
+async function probeType(origin, dest, ym, retNext, direct, paced) {
+  const w1 = await paced(() => fetchFlightMonth(origin, dest, ym, direct, ym));
+  const w2 = await paced(() => fetchFlightMonth(origin, dest, ym, direct, retNext));
+  // Merge offers; the offers PK collapses a trip that both windows somehow returned (§dedup).
+  const seen = new Set();
+  const offers = [];
+  for (const o of [...w1.offers, ...w2.offers]) {
+    const k = `${o.flight_type}|${o.departure_at}|${o.return_at}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    offers.push(o);
+  }
+  const mins = [w1.min, w2.min].filter((v) => v != null);
+  const min = mins.length ? Math.min(...mins) : null;
+  const anyFail = !w1.ok || !w2.ok;
+  if (min != null) return { ok: true, min, offers };
+  if (!anyFail) return { ok: true, min: null, offers: [] };
+  return { ok: false, min: null, offers: [] };
+}
+
+// CALENDAR source (§calendar): Travelpayouts v2 month-matrix — the cheapest ticket per departure
+// day of a month, a SEPARATE data-access endpoint from the pointwise prices_for_dates above. Used
+// ONLY as the last attempt on an empty cell (§attempt-order). RUNTIME-GUARDED: a transport failure,
+// a non-success body, or a response with no usable price>0 all return ok:false, so an empty or
+// unavailable calendar is ignored and never clobbers a known price. When it DOES carry content, the
+// cell's type is the cheapest record's (0 changes → direct, else any) and only offers consistent
+// with that type are kept, so selection and pruning stay single-typed like a normal probe.
+async function fetchCalendarMonth(origin, dest, ym, paced) {
+  const url =
+    'https://api.travelpayouts.com/v2/prices/month-matrix' +
+    `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&show_to_affiliates=true&token=${TP_TOKEN}`;
+  const r = await paced(() => getJson(url));
+  if (!r || r.success !== true || !Array.isArray(r.data)) return { ok: false, min: null, offers: [], type: null };
+  const nowIso = new Date().toISOString();
+  const parsed = [];
+  for (const x of r.data) {
+    const departure_at = toDateOnly(x.depart_date);
+    const price = typeof x.value === 'number' ? Math.round(x.value) : NaN;
+    if (!departure_at || !(price > 0)) continue;
+    if (departure_at.slice(0, 7) !== ym) continue; // cell = departure month (§dedup)
+    const transfers = Number.isFinite(x.number_of_changes) ? Math.trunc(x.number_of_changes) : 0;
+    parsed.push({ departure_at, return_at: toDateOnly(x.return_date), price, transfers });
+  }
+  if (!parsed.length) return { ok: false, min: null, offers: [], type: null }; // no content → ignore (§calendar)
+  const cheapest = parsed.reduce((a, b) => (b.price < a.price ? b : a));
+  const type = cheapest.transfers === 0 ? 'direct' : 'any';
+  // Keep only offers that fit the chosen column: 'direct' means non-stop only; 'any' takes all.
+  const offers = parsed
+    .filter((o) => (type === 'direct' ? o.transfers === 0 : true))
+    .map((o) => ({
+      origin, dest, month: ym, flight_type: type,
+      departure_at: o.departure_at, return_at: o.return_at,
+      nights: nightsBetween(o.departure_at, o.return_at),
+      price: o.price, transfers: o.transfers, airline: null, updated_at: nowIso,
+    }));
+  const min = Math.min(...offers.map((o) => o.price));
+  return { ok: true, min, offers, type };
 }
 
 // ONE paginated scan of `prices` that answers two questions at once:
@@ -847,11 +927,15 @@ async function main() {
   const routes = shuffledBySeed([...live, ...probed], PLAN_DAY);
   const routeTotal = routes.length;
   const catalogTotal = live.length + dead.length;
-  const totalRequests = routeTotal * MONTHS.length; // ONE request per route-month
+  // Baseline requests = TWO per cell (the two return windows, §edge-months). Empty cells add up to
+  // three more (alt-type ×2 + calendar ×1); those are NOT in this estimate — they show up as
+  // `extraRequests` in the summary. ETA uses the baseline, so it reads a little short on a run with
+  // many empty cells. §load: shrink the run by MONTH_COUNT, never by dropping attempts.
+  const totalRequests = routeTotal * MONTHS.length * 2; // two return windows per route-month
 
   console.log(`Route plan: ${live.length} live + ${probed.length} of ${dead.length} dead (slice ${slice + 1}/${DEAD_SLICES}, whole list every ${DEAD_SLICES} days) = ${routeTotal} of ${catalogTotal} pairs`);
-  console.log(`Flight requests: ${totalRequests} (1 per route-month)`);
-  console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min\n`);
+  console.log(`Flight requests: ${totalRequests} baseline (2 return windows × ${routeTotal} pairs × ${MONTHS.length} months); empty cells add up to 3 more each`);
+  console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min baseline\n`);
 
   // Batches that exhausted every retry and are gone for good. Row counts live in the
   // per-table *WriteErrors counters; this counts the LOSSES, so the summary can state the
@@ -958,10 +1042,16 @@ async function main() {
   let withPrice = 0;  // routes that got at least one price
   let noData = 0;     // routes with no price at all
   let reqDone = 0;
-  let reqFailed = 0;  // requests the API never answered → nothing written, old value kept
-  let reqBadBody = 0; // subset of the above: HTTP 200, but success:false or a non-array `data`
+  let reqFailed = 0;  // cells where every attempt failed → nothing written, old value kept
   let deadRevived = 0; // dead pairs re-checked this run that came back with a price
   let route = 0;
+  // Fallback bookkeeping (§attempt-order/§load), reported at the end. `extraRequests` counts ONLY
+  // the additional TP calls spent on empty cells (the alt-type probe and the calendar); the two
+  // natural-window calls every cell makes are NOT counted here. `cellsClosedByAlt` / `…Calendar`
+  // are empty cells that a fallback filled with a real price.
+  let extraRequests = 0;
+  let cellsClosedByAlt = 0;
+  let cellsClosedByCalendar = 0;
   // Pacing metrics for the summary: how fast we ACTUALLY went, and how often the API itself
   // was slower than the interval (those requests set the pace, we can't sleep negative time).
   let reqOverInterval = 0;
@@ -970,37 +1060,76 @@ async function main() {
   const paceT0 = Date.now(); // start of the collection window, for the achieved req/min
   const etaMin = () => Math.round((totalRequests - reqDone) * TARGET_INTERVAL_MS / 60000);
 
+  // Run ONE TP request under the shared pace: time it, count it, then sleep the REMAINDER of
+  // TARGET_INTERVAL_MS so the spacing between request STARTS is constant no matter how many
+  // requests a cell makes (two windows, plus any fallbacks). Same rule the old single-request
+  // loop used, hoisted so every probe helper obeys it. `fn` returns the request's own result.
+  const pacedCall = async (fn) => {
+    const reqT0 = Date.now();
+    const out = await fn();
+    const reqMs = Date.now() - reqT0;
+    reqDone += 1;
+    reqMsTotal += reqMs;
+    const remaining = TARGET_INTERVAL_MS - reqMs;
+    if (remaining > 0) await sleep(remaining);
+    else reqOverInterval += 1;
+    return out;
+  };
+
   for (const { origin, dest } of routes) {
     route += 1;
     const stops = STOPS[dest];
-    const flightHasStop = stops === 1; // long-haul default: cheapest 1+ stop
-    const flightType = flightHasStop ? 'any' : 'direct';
+    const flightHasStop = stops === 1;    // long-haul default: cheapest 1+ stop
+    const naturalDirect = !flightHasStop; // near = direct, far = any
     const byMonth = {};
-    const okMonths = []; // months the API answered → the only ones we may prune
+    let okCells = 0; // cells with an ok response this run (priced or genuine-empty)
+    // Months for which we got an ok response PER TYPE — pruning covers exactly the (type, month)
+    // cells this run actually confirmed: a fallback of the OTHER type is pruned under its own type,
+    // and a fully-empty cell (both types answered empty) prunes BOTH, so no stale row of either type
+    // lingers behind a now-empty cell.
+    const prunable = { direct: [], any: [] };
     for (const ym of MONTHS) {
-      // ONE request per route-month, chosen by distance: near = direct, far = any.
-      const reqT0 = Date.now();
-      const { ok, min, offers, reason } = await fetchFlightMonth(origin, dest, ym, !flightHasStop);
-      const reqMs = Date.now() - reqT0;
-      reqDone += 1;
-      reqMsTotal += reqMs;
+      const retNext = nextMonthYM(ym);
+      const naturalType = naturalDirect ? 'direct' : 'any';
+      const answered = new Set(); // flight types that returned an ok response for THIS cell
+      // Attempt 1 (§attempt-order): the cell's NATURAL type over BOTH return windows (§edge-months).
+      let res = await probeType(origin, dest, ym, retNext, naturalDirect, pacedCall);
+      if (res.ok) answered.add(naturalType);
+      let usedType = naturalType;
+      // §load: extra attempts fire ONLY on a genuinely EMPTY cell (ok:true, no price) — never on a
+      // failed one (ok:false keeps its previous value, §first-edit). Order: alt stop-type, then the
+      // calendar; we stop at the first that returns a price.
+      if (res.ok && res.min == null) {
+        const altType = naturalDirect ? 'any' : 'direct';
+        const alt = await probeType(origin, dest, ym, retNext, !naturalDirect, pacedCall);
+        extraRequests += 2;
+        if (alt.ok) answered.add(altType);
+        if (alt.ok && alt.min != null) {
+          res = alt;
+          usedType = altType;
+          cellsClosedByAlt += 1;
+        } else if (res.ok && res.min == null) {
+          const cal = await fetchCalendarMonth(origin, dest, ym, pacedCall);
+          extraRequests += 1;
+          if (cal.ok && cal.min != null) {
+            answered.add(cal.type);
+            res = { ok: true, min: cal.min, offers: cal.offers };
+            usedType = cal.type;
+            cellsClosedByCalendar += 1;
+          }
+        }
+      }
 
-      // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see the regression test
-      // in fetch-prices.test.cjs. A FAILED request is not an observation: fetchFlightMonth
-      // returns ok:false with min:null for a timeout, a non-2xx (429 included) or a malformed
-      // body. Upserting that null would overwrite a REAL price with nothing, and price_history
-      // would not even log the loss (hasPrice is false), so the destruction left no trace
-      // anywhere. A failed route-month now writes nothing at all and keeps whatever the
-      // previous run collected, until the next run re-asks.
-      //
-      // The asymmetry is deliberate: ok:true with min:null IS written. That is a genuine
-      // observation — "this route-month really has no flights" — and about half of all
-      // route-months legitimately look like that. Skipping it would freeze a price that has
-      // since disappeared: the same silent-staleness bug, pointing the other way.
+      // EVERY buffer write below sits inside `if (ok)` ON PURPOSE — see fetch-prices.test.cjs. A
+      // cell is written only when an attempt SUCCEEDED (ok:true), whether it found a price or a
+      // genuine "no flights" (min:null — a real observation, written to unfreeze a disappeared
+      // price). An INCONCLUSIVE cell (every attempt failed) is ok:false: it writes nothing and
+      // keeps the previous value, so an empty/failed attempt never clobbers a known price (§first-edit).
+      const ok = res.ok;
       if (ok) {
         okRouteMonths += 1;
-        okMonths.push(ym);
-        const pair = flightHasStop ? { direct: null, any: min } : { direct: min, any: null };
+        okCells += 1;
+        const pair = usedType === 'direct' ? { direct: res.min, any: null } : { direct: null, any: res.min };
         byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month).
         priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
@@ -1008,10 +1137,6 @@ async function main() {
         snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
         // price_history: log ONLY when this price differs from the baseline (or the route is new).
-        // Compare each column against the loaded snapshot (null-normalized so null===null matches).
-        // We DON'T log a change that has no price at all (both null) — a route that returned no
-        // data is noise, not a real observation. Genuine prices (including a price appearing
-        // where there was none) are logged.
         const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
         const hasPrice = pair.direct != null || pair.any != null;
         const changed = !prev
@@ -1024,55 +1149,48 @@ async function main() {
           pricesUnchanged += 1;
         }
 
-        // COMBO selection → the offers buffer. From the full ≤500 response we keep the cheap
-        // pool + one offer per distance-matrix target, tagged (in_cheap_pool / target_nights).
-        // offersCollected counts what we STORE.
-        const combo = selectCombo(offers, origin, dest);
+        // COMBO selection → the offers buffer (cheap pool + one per distance target).
+        const combo = selectCombo(res.offers, origin, dest);
         for (const o of combo) offerBuf.push(o);
         offersCollected += combo.length;
       } else {
-        // Counted and reported, per route and in the summary. A failed request used to be
-        // indistinguishable from "no flights" — which is exactly how the null-clobbering
-        // stayed invisible for as long as it did.
+        // Every attempt for this cell failed → nothing written, previous value kept.
         reqFailed += 1;
-        if (reason === 'body') reqBadBody += 1;
       }
-
-      // Sleep only the REMAINDER of the interval. The request we just made already consumed
-      // part of it, so the spacing between two starts stays TARGET_INTERVAL_MS regardless of
-      // how slow the API was — the whole point of the change. When the request alone outran
-      // the interval there is nothing to sleep off; count it, because that is the only case
-      // where TP's latency still lengthens the run.
-      const remaining = TARGET_INTERVAL_MS - reqMs;
-      if (remaining > 0) await sleep(remaining);
-      else reqOverInterval += 1;
+      // Prune-eligibility: every type that answered this cell (empty or priced). Outside the write
+      // guard on purpose — it drives DELETE scoping, not a Supabase write buffer.
+      for (const tp of answered) prunable[tp].push(ym);
     }
     await flushPrices(false);
     await flushHistory(false);
 
-    // Force-flush THIS route's offers so they are persisted BEFORE we prune stale ones.
-    // Only prune when the write raised no error (else we'd delete old data without a
-    // replacement) and only for months that actually responded.
+    // Force-flush THIS route's offers before pruning stale ones, and prune PER flight_type over the
+    // months that answered for that type — a cell filled by a fallback of the other type is pruned
+    // under its own type, a fully-empty cell prunes both, and a fresh row (updated_at ≥ run start)
+    // is never deleted.
     const offerErrBefore = offerWriteErrors;
     await flushOffers(true);
-    if (okMonths.length && offerWriteErrors === offerErrBefore) {
-      await pruneStaleOffers(origin, dest, flightType, okMonths);
+    if (offerWriteErrors === offerErrBefore) {
+      for (const ftype of ['direct', 'any']) {
+        if (prunable[ftype].length) await pruneStaleOffers(origin, dest, ftype, prunable[ftype]);
+      }
     }
 
+    const okMonthsCount = okCells;
     const got = Object.values(byMonth).some((p) => p.direct != null || p.any != null);
     if (got) withPrice += 1; else noData += 1;
-    // A pair from the dead slice that answered with a price is back in service — it rejoins
-    // the live list on the next run automatically, since the list is derived from `prices`.
+    // A pair from the dead slice that answered with a price is back in service — it rejoins the
+    // live list on the next run automatically, since the list is derived from `prices`.
     const wasDead = deadProbed.has(`${origin}|${dest}`);
     if (wasDead && got) deadRevived += 1;
-    const vals = Object.values(byMonth).map((p) => (flightHasStop ? p.any : p.direct)).filter((p) => p != null);
+    const vals = Object.values(byMonth).map((p) => (p.direct != null ? p.direct : p.any)).filter((p) => p != null);
     const min = vals.length ? `€${Math.min(...vals)}` : '—';
-    // byMonth only holds ANSWERED months now, so a gap here means the API never replied for
-    // those — surfaced per route so a bad patch is visible while the run is still going.
-    const failedHere = MONTHS.length - okMonths.length;
-    const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} req failed, kept previous` : '';
+    // byMonth only holds ANSWERED cells, so a gap here means every attempt failed for those —
+    // surfaced per route so a bad patch is visible while the run is still going.
+    const failedHere = MONTHS.length - okMonthsCount;
+    const failMark = failedHere ? `  ⚠ ${failedHere}/${MONTHS.length} cell(s) failed, kept previous` : '';
     const deadMark = wasDead ? (got ? '  ⟲ dead pair REVIVED' : '  (dead re-check)') : '';
-    console.log(`[route ${route}/${routeTotal}] ${origin}→${dest} (${flightType}): ${min}${failMark}${deadMark}   ~${etaMin()}m left`);
+    console.log(`[route ${route}/${routeTotal}] ${origin}→${dest}: ${min}${failMark}${deadMark}   ~${etaMin()}m left`);
   }
   // End of the collection window — everything after this is flushing and reporting, so the
   // achieved rate is measured over exactly the part of the run that made requests.
@@ -1091,14 +1209,14 @@ async function main() {
   const achievedRpm = paceMin > 0 ? (reqDone / paceMin).toFixed(1) : '—';
   const avgReqMs = reqDone ? Math.round(reqMsTotal / reqDone) : 0;
   console.log('\n──────── summary ────────');
-  console.log(`TP requests: ${totalRequests}`);
+  console.log(`TP requests: ${reqDone} made (${totalRequests} baseline two-window + ${extraRequests} extra on empty cells)`);
   console.log(`Origins: ${ORIGINS_ALL.length} (${HUB_AIRPORTS.length} hubs + ${LOWCOST_AIRPORTS.length} low-cost)`);
-  console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  requests: ${totalRequests}`);
+  console.log(`Destinations: ${DEST_IATAS.length}  ·  Route-pairs: ${routeTotal}  ·  Months: ${MONTHS.length}  ·  cells: ${routeTotal * MONTHS.length}`);
   console.log(`Route plan: ${live.length} live  ·  ${dead.length} dead, of which ${probed.length} re-checked (slice ${slice + 1}/${DEAD_SLICES})  ·  ${catalogTotal - routeTotal} pairs skipped this run`);
   console.log(`Dead pairs revived this run: ${deadRevived} of ${probed.length} re-checked`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
-  console.log(`Failed requests: ${reqFailed} of ${totalRequests} — nothing written for those, previous values kept`);
-  console.log(`  of those, unusable 200s (success:false or non-array data): ${reqBadBody}  ·  transport/HTTP failures: ${reqFailed - reqBadBody}`);
+  console.log(`Failed cells: ${reqFailed} of ${routeTotal * MONTHS.length} — every attempt failed, nothing written, previous values kept`);
+  console.log(`Fallback on empty cells: ${extraRequests} extra requests  ·  closed ${cellsClosedByAlt} by alt stop-type + ${cellsClosedByCalendar} by calendar = ${cellsClosedByAlt + cellsClosedByCalendar}`);
   console.log(`Pace: target ${TARGET_INTERVAL_MS}ms (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min)  ·  achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
   console.log(`  requests slower than the interval: ${reqOverInterval} (those set the pace themselves — nothing left to sleep off)`);
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
