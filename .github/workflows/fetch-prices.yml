@@ -29,6 +29,18 @@ on:
         type: choice
         options: [both, near, far]
         default: both
+      # Manual measurement only. Both blank on a normal manual run (and always blank on the
+      # cron schedules, which carry no inputs), which the collector reads as "no cap / keep
+      # all" — so a scheduled sweep is unchanged. Strings, not numbers: workflow_dispatch
+      # inputs have no number type, and the collector parses them itself.
+      max_routes:
+        description: 'Measurement: cap route-pairs per job (blank = no cap)'
+        type: string
+        default: ''
+      sample:
+        description: 'Measurement: keep this fraction of pairs, 0–1 (blank = all)'
+        type: string
+        default: ''
 
 env:
   # Public project URL (not a secret) — the script also defaults to this.
@@ -87,6 +99,9 @@ jobs:
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
 
       # The job's snapshot verdict, read by the `watchdog` job at the end of the sweep.
@@ -146,6 +161,9 @@ jobs:
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
 
       # Same three guards as months 1–3 — see the comment there for why each one is needed.
@@ -193,6 +211,9 @@ jobs:
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
 
       # Same three guards as months 1–3 — see the comment there for why each one is needed.
@@ -239,6 +260,9 @@ jobs:
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
 
       # Same three guards as months 1–3 — see the comment there for why each one is needed.
