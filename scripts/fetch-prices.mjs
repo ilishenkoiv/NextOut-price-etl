@@ -161,6 +161,21 @@ function nextMonthYM(ym) {
 // The workflow sets both per job; see it for the split actually used in CI.
 const MONTH_START = Number(process.env.MONTH_START) || 1;
 const MONTH_COUNT = Number(process.env.MONTH_COUNT) || 6;
+
+// ── Manual-measurement knobs (workflow_dispatch inputs only) ──────────────────
+// They shrink the route plan so the fallback yield can be measured on a short run WITHOUT
+// touching the nightly. On a scheduled run BOTH env vars are absent (the workflow passes the
+// empty string), which decodes to "no cap / keep all" — so the nightly plan is bit-for-bit
+// what it was. They are applied to the SHUFFLED plan in main(), never to catalog order, so a
+// capped run samples the same spread of the network the nightly would, not one edge of it.
+//   MAX_ROUTES      — hard cap on route-pairs this job walks (0 = no cap).
+//   SAMPLE_FRACTION — keep this fraction (0 < f < 1) of the planned pairs (1 = all).
+const MAX_ROUTES = Math.max(0, Math.trunc(Number(process.env.MAX_ROUTES) || 0));
+const SAMPLE_FRACTION = (() => {
+  const f = Number(process.env.SAMPLE_FRACTION);
+  return Number.isFinite(f) && f > 0 && f < 1 ? f : 1;
+})();
+
 // Snapshot scope label = which month-slice THIS job collected. Uniform `mA-B` since the
 // split went from 2 jobs to 4: the old `near`/`far` labels meant 1–6 and 7–12 and would now
 // name a 3-month slice after a 6-month one. Older objects in the bucket keep their names.
@@ -924,7 +939,22 @@ async function main() {
   // concentrating it, while the seed keeps the run replayable: same date, same order.
   const { live, dead, probed, slice } = planRoutes(seen, alive);
   const deadProbed = new Set(probed.map((r) => r.key));
-  const routes = shuffledBySeed([...live, ...probed], PLAN_DAY);
+  // Full deterministic plan (same seed as always). Manual sampling is applied to THIS shuffled
+  // order — a prefix of a uniform shuffle is itself a uniform random subset — so a capped or
+  // fractional run measures the same spread the nightly would, never the head of the catalog.
+  const plannedRoutes = shuffledBySeed([...live, ...probed], PLAN_DAY);
+  let routes = plannedRoutes;
+  if (SAMPLE_FRACTION < 1) {
+    routes = routes.slice(0, Math.max(1, Math.ceil(routes.length * SAMPLE_FRACTION)));
+  }
+  if (MAX_ROUTES > 0 && routes.length > MAX_ROUTES) {
+    routes = routes.slice(0, MAX_ROUTES);
+  }
+  if (routes.length !== plannedRoutes.length) {
+    console.log(`Manual sampling ACTIVE: ${routes.length} of ${plannedRoutes.length} planned pairs`
+      + `${SAMPLE_FRACTION < 1 ? ` · sample=${SAMPLE_FRACTION}` : ''}`
+      + `${MAX_ROUTES > 0 ? ` · max_routes=${MAX_ROUTES}` : ''} — this is a manual run, the nightly is unaffected`);
+  }
   const routeTotal = routes.length;
   const catalogTotal = live.length + dead.length;
   // Baseline requests = TWO per cell (the two return windows, §edge-months). Empty cells add up to
