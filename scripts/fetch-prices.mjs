@@ -1189,13 +1189,15 @@ async function main() {
     let last = null;
     for (let attempt = 1; attempt <= REFUSAL_MAX_ATTEMPTS; attempt += 1) {
       const out = await pacedCall(() => classifiedFetch(url));
+      // Count the refusal BEFORE the breaker: recordRequest can throw BreakerTripError on this very
+      // attempt, and if it does the summary must still include this last refusal, not undercount it.
+      if (out.kind === 'refused') refusals[out.refusal] += 1;
       recordRequest(out.kind === 'refused' ? out.refusal : null); // breaker samples every attempt
       if (out.kind === 'ok') {
         if (attempt > 1) retriesHelped += 1; // a retry rescued this request
         return out;
       }
       if (out.kind === 'error') { otherErrors += 1; return out; } // client error → no retry
-      refusals[out.refusal] += 1;
       last = out;
       if (attempt < REFUSAL_MAX_ATTEMPTS) {
         console.warn(`    ↻ ${out.refusal} — retry ${attempt + 1}/${REFUSAL_MAX_ATTEMPTS} in ${REFUSAL_BACKOFF_MS[attempt - 1] / 1000}s`);
