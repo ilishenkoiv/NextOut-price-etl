@@ -415,22 +415,65 @@ async function writeWithRetry(label, run, where = {}) {
   }
 }
 
-// Fetch JSON with a timeout. Never throws — logs and returns null on any failure.
-async function getJson(url) {
+// ── Refused-request retry + mass-refusal breaker (§refusal / §breaker) ─────────
+// A REFUSAL is the partner declining to answer — 429 (too many requests), any 5xx, or the
+// connection never delivering a response (timeout/abort/socket drop). It is NOT an empty answer:
+// an empty 200 is a real "no flights" and is written as such, while a refusal must never be
+// written as emptiness (see fetchFlightMonth / the cell loop). A refusal is retried a few times
+// with a GROWING pause; that pause is separate from and ON TOP OF the request interval, which is
+// NOT touched here (TARGET_INTERVAL_MS is unchanged — retries are extra sleeps, not a new rate).
+// Three attempts total → two pauses between them, then the cell is left unverified and the run
+// goes on.
+const REFUSAL_MAX_ATTEMPTS = 3;
+const REFUSAL_BACKOFF_MS = [2000, 6000]; // pause before retry 2, before retry 3 — growing
+
+// Mass-refusal breaker: if the partner refuses more than this SHARE of the last BREAKER_WINDOW
+// requests, the run aborts with a non-zero exit instead of silently continuing. The threshold is
+// high on purpose — a healthy run refuses ~0% (a month of runs recorded zero 429s and only rare,
+// isolated 5xx), so half of 200 consecutive requests refusing is unambiguous breakage: well above
+// any transient burst, yet it trips long before a whole sweep is wasted collecting nothing. The
+// window must be FULL before it can fire, so a short run never aborts on a couple of early errors.
+const BREAKER_WINDOW = 200;
+const BREAKER_MAX_REFUSAL_RATE = 0.5;
+class BreakerTripError extends Error {}
+
+// One HTTP GET, classified into exactly one of three outcomes (never throws):
+//   • { kind: 'ok', json }        — HTTP 200 with a parseable body (content decides price/empty).
+//   • { kind: 'refused', refusal } — 429 → 'tooMany', 5xx → 'server', dropped connection →
+//                                    'network'. Retriable; counts toward the breaker.
+//   • { kind: 'error', status }   — a non-429 4xx or an unparseable 200: our request/rights or a
+//                                    broken body, NOT partner overload. Not retried, not a refusal,
+//                                    but still unverified — it never writes emptiness either.
+async function classifiedFetch(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const at = url.split('?')[0];
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
-    if (!res.ok) {
-      console.warn(`    HTTP ${res.status} on ${url.split('?')[0]}`);
-      return null;
+    if (res.ok) {
+      try {
+        return { kind: 'ok', json: await res.json() };
+      } catch (e) {
+        // A 200 whose body is HTML/garbage (a Cloudflare interstitial, say). Not a refusal:
+        // retrying the same URL will not make it parse. Capped like every upstream string.
+        console.warn(`    unparseable 200 on ${at}: ${previewBody(e.message)}`);
+        return { kind: 'error', status: res.status };
+      }
     }
-    return await res.json();
+    if (res.status === 429) {
+      console.warn(`    HTTP 429 (too many requests) on ${at}`);
+      return { kind: 'refused', refusal: 'tooMany', status: 429 };
+    }
+    if (res.status >= 500) {
+      console.warn(`    HTTP ${res.status} (server) on ${at}`);
+      return { kind: 'refused', refusal: 'server', status: res.status };
+    }
+    console.warn(`    HTTP ${res.status} on ${at}`);
+    return { kind: 'error', status: res.status };
   } catch (e) {
-    // Also capped: a 200 whose body is HTML fails in res.json(), and Node's parse error
-    // quotes the start of that body back at us.
-    console.warn(`    request failed: ${previewBody(e.message)}`);
-    return null;
+    // AbortController timeout, socket drop, DNS failure — no response was delivered at all.
+    console.warn(`    connection failed on ${at}: ${previewBody(e.message)}`);
+    return { kind: 'refused', refusal: 'network' };
   } finally {
     clearTimeout(timer);
   }
@@ -472,7 +515,7 @@ function nightsBetween(dep, ret) {
 // departure returning early next month is collected too. The CELL is always the DEPARTURE month:
 // offers are clamped to departure-in-`ym` (§dedup), so the boundary window never files a trip
 // under a neighbouring month, and the same trip from two windows collapses on the offers PK.
-async function fetchFlightMonth(origin, dest, ym, direct, retYm = ym) {
+async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
   const url =
     `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=${origin}` +
     `&destination=${dest}&departure_at=${ym}&return_at=${retYm}&direct=${direct}` +
@@ -480,9 +523,12 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm = ym) {
     // (10/14n) drowned. 500 returns EVERY duration for combo selection. Still ONE request
     // (TP rate-limits per REQUEST, not per row) — no extra API calls.
     `&currency=eur&limit=500&token=${TP_TOKEN}`;
-  const r = await getJson(url);
-  // Transport failure — getJson already logged the status or the exception.
-  if (!r) return { ok: false, min: null, offers: [], reason: 'request' };
+  const res = await request(url);
+  // Not an answer: a refusal that survived every retry, or a client-side error (§refusal). Either
+  // way the cell stays UNVERIFIED — nothing is written, the previous value is kept. `reason`
+  // carries 'refused'|'error'; `refusal` names the kind (tooMany/server/network) for a refusal.
+  if (res.kind !== 'ok') return { ok: false, min: null, offers: [], reason: res.kind, refusal: res.refusal ?? null };
+  const r = res.json;
   // An HONEST 200 that still carries nothing usable: success:false, or `data` that is not an
   // array. This branch used to return ok:false SILENTLY, which made it indistinguishable from
   // "no flights on this route" in both the log and the database — the same class of invisible
@@ -535,9 +581,9 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm = ym) {
 //   • both windows answered and neither had a price → ok:true, min:null (a genuine "no flights");
 //   • no price AND a window failed → ok:false (INCONCLUSIVE — §first-edit: an empty/failed attempt
 //     must not clobber a known price, so nothing is written and the previous value is kept).
-async function probeType(origin, dest, ym, retNext, direct, paced) {
-  const w1 = await paced(() => fetchFlightMonth(origin, dest, ym, direct, ym));
-  const w2 = await paced(() => fetchFlightMonth(origin, dest, ym, direct, retNext));
+async function probeType(origin, dest, ym, retNext, direct, request) {
+  const w1 = await fetchFlightMonth(origin, dest, ym, direct, ym, request);
+  const w2 = await fetchFlightMonth(origin, dest, ym, direct, retNext, request);
   // Merge offers; the offers PK collapses a trip that both windows somehow returned (§dedup).
   const seen = new Set();
   const offers = [];
@@ -562,12 +608,15 @@ async function probeType(origin, dest, ym, retNext, direct, paced) {
 // unavailable calendar is ignored and never clobbers a known price. When it DOES carry content, the
 // cell's type is the cheapest record's (0 changes → direct, else any) and only offers consistent
 // with that type are kept, so selection and pruning stay single-typed like a normal probe.
-async function fetchCalendarMonth(origin, dest, ym, paced) {
+async function fetchCalendarMonth(origin, dest, ym, request) {
   const url =
     'https://api.travelpayouts.com/v2/prices/month-matrix' +
     `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&show_to_affiliates=true&token=${TP_TOKEN}`;
-  const r = await paced(() => getJson(url));
-  if (!r || r.success !== true || !Array.isArray(r.data)) return { ok: false, min: null, offers: [], type: null };
+  const res = await request(url);
+  // Same contract as everywhere: a refusal or a client error is NOT an empty calendar — it just
+  // means we could not read one, so the fallback is ignored and no known price is clobbered.
+  if (res.kind !== 'ok' || res.json.success !== true || !Array.isArray(res.json.data)) return { ok: false, min: null, offers: [], type: null };
+  const r = res.json;
   const nowIso = new Date().toISOString();
   const parsed = [];
   for (const x of r.data) {
@@ -1086,6 +1135,31 @@ async function main() {
   // was slower than the interval (those requests set the pace, we can't sleep negative time).
   let reqOverInterval = 0;
   let reqMsTotal = 0;
+  // §refusal / §breaker metrics for the summary and the mass-refusal abort.
+  const refusals = { tooMany: 0, server: 0, network: 0 }; // refused HTTP attempts, by kind
+  let otherErrors = 0;   // non-429 4xx / unparseable 200 — unverified, but not a partner refusal
+  let retriesHelped = 0; // logical requests a retry rescued (a later attempt finally answered)
+  // Circuit breaker: a ring buffer over the last BREAKER_WINDOW HTTP attempts (1 = refused). It
+  // samples EVERY attempt, retries included, so a partner that is broadly down fills the window
+  // with refusals and trips fast. recordRequest throws BreakerTripError when the share is exceeded.
+  const breakerRing = new Array(BREAKER_WINDOW).fill(0);
+  let breakerPos = 0;
+  let breakerFilled = 0;
+  let breakerRefused = 0;
+  let breakerTripped = false;
+  const recordRequest = (refusalKind) => {
+    const bit = refusalKind ? 1 : 0;
+    if (breakerFilled === BREAKER_WINDOW) breakerRefused -= breakerRing[breakerPos];
+    else breakerFilled += 1;
+    breakerRing[breakerPos] = bit;
+    breakerRefused += bit;
+    breakerPos = (breakerPos + 1) % BREAKER_WINDOW;
+    if (breakerFilled === BREAKER_WINDOW && breakerRefused / BREAKER_WINDOW > BREAKER_MAX_REFUSAL_RATE) {
+      throw new BreakerTripError(
+        `partner refused ${breakerRefused} of the last ${BREAKER_WINDOW} requests `
+        + `(> ${(BREAKER_MAX_REFUSAL_RATE * 100).toFixed(0)}%) — aborting the run`);
+    }
+  };
   const t0 = Date.now();
   const paceT0 = Date.now(); // start of the collection window, for the achieved req/min
   const etaMin = () => Math.round((totalRequests - reqDone) * TARGET_INTERVAL_MS / 60000);
@@ -1106,6 +1180,32 @@ async function main() {
     return out;
   };
 
+  // ONE logical TP request: each attempt is paced (above), classified (classifiedFetch), and on a
+  // REFUSAL retried with a growing pause (§refusal). Returns a classifiedFetch result — {kind:'ok'}
+  // on success, otherwise the last {kind:'refused'|'error'} after the retries are spent. The ONLY
+  // thing it throws is the circuit breaker (§breaker), which aborts the whole run. The pacing
+  // interval is untouched: the retry backoff is extra sleep, not a changed rate.
+  const request = async (url) => {
+    let last = null;
+    for (let attempt = 1; attempt <= REFUSAL_MAX_ATTEMPTS; attempt += 1) {
+      const out = await pacedCall(() => classifiedFetch(url));
+      recordRequest(out.kind === 'refused' ? out.refusal : null); // breaker samples every attempt
+      if (out.kind === 'ok') {
+        if (attempt > 1) retriesHelped += 1; // a retry rescued this request
+        return out;
+      }
+      if (out.kind === 'error') { otherErrors += 1; return out; } // client error → no retry
+      refusals[out.refusal] += 1;
+      last = out;
+      if (attempt < REFUSAL_MAX_ATTEMPTS) {
+        console.warn(`    ↻ ${out.refusal} — retry ${attempt + 1}/${REFUSAL_MAX_ATTEMPTS} in ${REFUSAL_BACKOFF_MS[attempt - 1] / 1000}s`);
+        await sleep(REFUSAL_BACKOFF_MS[attempt - 1]);
+      }
+    }
+    return last; // every attempt refused → the cell will be left unverified
+  };
+
+  try {
   for (const { origin, dest } of routes) {
     route += 1;
     const stops = STOPS[dest];
@@ -1123,7 +1223,7 @@ async function main() {
       const naturalType = naturalDirect ? 'direct' : 'any';
       const answered = new Set(); // flight types that returned an ok response for THIS cell
       // Attempt 1 (§attempt-order): the cell's NATURAL type over BOTH return windows (§edge-months).
-      let res = await probeType(origin, dest, ym, retNext, naturalDirect, pacedCall);
+      let res = await probeType(origin, dest, ym, retNext, naturalDirect, request);
       if (res.ok) answered.add(naturalType);
       let usedType = naturalType;
       // §load: extra attempts fire ONLY on a genuinely EMPTY cell (ok:true, no price) — never on a
@@ -1131,7 +1231,7 @@ async function main() {
       // calendar; we stop at the first that returns a price.
       if (res.ok && res.min == null) {
         const altType = naturalDirect ? 'any' : 'direct';
-        const alt = await probeType(origin, dest, ym, retNext, !naturalDirect, pacedCall);
+        const alt = await probeType(origin, dest, ym, retNext, !naturalDirect, request);
         extraRequests += 2;
         if (alt.ok) answered.add(altType);
         if (alt.ok && alt.min != null) {
@@ -1139,7 +1239,7 @@ async function main() {
           usedType = altType;
           cellsClosedByAlt += 1;
         } else if (res.ok && res.min == null) {
-          const cal = await fetchCalendarMonth(origin, dest, ym, pacedCall);
+          const cal = await fetchCalendarMonth(origin, dest, ym, request);
           extraRequests += 1;
           if (cal.ok && cal.min != null) {
             answered.add(cal.type);
@@ -1184,7 +1284,8 @@ async function main() {
         for (const o of combo) offerBuf.push(o);
         offersCollected += combo.length;
       } else {
-        // Every attempt for this cell failed → nothing written, previous value kept.
+        // Every attempt for this cell was a refusal or a client error (never an honest empty) →
+        // the cell is UNVERIFIED: nothing written, the previous value kept (§refusal).
         reqFailed += 1;
       }
       // Prune-eligibility: every type that answered this cell (empty or priced). Outside the write
@@ -1222,6 +1323,15 @@ async function main() {
     const deadMark = wasDead ? (got ? '  ⟲ dead pair REVIVED' : '  (dead re-check)') : '';
     console.log(`[route ${route}/${routeTotal}] ${origin}→${dest}: ${min}${failMark}${deadMark}   ~${etaMin()}m left`);
   }
+  } catch (e) {
+    // The circuit breaker is the ONLY thing allowed to break out of the collection loop early;
+    // any other throw is a real bug and must not be swallowed. On a trip we fall through to the
+    // flush + summary below, so whatever was collected is written and the counters are printed,
+    // and the run exits non-zero at the very end (§breaker).
+    if (!(e instanceof BreakerTripError)) throw e;
+    breakerTripped = true;
+    console.error(`\n🛑 CIRCUIT BREAKER: ${e.message}`);
+  }
   // End of the collection window — everything after this is flushing and reporting, so the
   // achieved rate is measured over exactly the part of the run that made requests.
   const paceMin = (Date.now() - paceT0) / 60000;
@@ -1231,8 +1341,13 @@ async function main() {
   await flushOffers(true); // safety net; per-route force-flushes normally drain it already
 
   // Additive history step — AFTER every Supabase TABLE write, so a Storage problem can never
-  // affect what was collected. Its outcome is reported in the summary below.
-  const snapshot = await uploadSnapshot(snapshotRows, SCOPE);
+  // affect what was collected. Its outcome is reported in the summary below. On a breaker trip the
+  // run is aborting mid-sweep: what was collected is already flushed above, but a PARTIAL snapshot
+  // must not land in the history bucket, so we skip the upload and synthesize a not-uploaded
+  // verdict — the summary and the watchdog artifact then read consistently and the run goes red.
+  const snapshot = breakerTripped
+    ? { ok: false, valid: false, rows: snapshotRows.length, kb: 0, key: null, error: 'run aborted by circuit breaker — snapshot skipped', failures: ['run aborted by circuit breaker (§breaker)'] }
+    : await uploadSnapshot(snapshotRows, SCOPE);
 
   const elapsedMin = ((Date.now() - t0) / 60000).toFixed(1);
   const avgOffers = okRouteMonths ? (offersCollected / okRouteMonths).toFixed(1) : '0';
@@ -1245,7 +1360,10 @@ async function main() {
   console.log(`Route plan: ${live.length} live  ·  ${dead.length} dead, of which ${probed.length} re-checked (slice ${slice + 1}/${DEAD_SLICES})  ·  ${catalogTotal - routeTotal} pairs skipped this run`);
   console.log(`Dead pairs revived this run: ${deadRevived} of ${probed.length} re-checked`);
   console.log(`Routes with a price: ${withPrice}  ·  no data: ${noData}`);
-  console.log(`Failed cells: ${reqFailed} of ${routeTotal * MONTHS.length} — every attempt failed, nothing written, previous values kept`);
+  const refusalTotal = refusals.tooMany + refusals.server + refusals.network;
+  console.log(`Unverified cells: ${reqFailed} of ${routeTotal * MONTHS.length} — every attempt refused or errored, nothing written, previous values kept`);
+  console.log(`Partner refusals: ${refusalTotal} attempts (429 too-many ${refusals.tooMany} · 5xx server ${refusals.server} · connection drop ${refusals.network})  ·  retries that recovered a request: ${retriesHelped}  ·  other errors (non-429 4xx / bad body): ${otherErrors}`);
+  console.log(`Circuit breaker: ${breakerTripped ? 'TRIPPED — run aborted' : 'not tripped'}  (threshold > ${(BREAKER_MAX_REFUSAL_RATE * 100).toFixed(0)}% refused over last ${BREAKER_WINDOW} requests)`);
   console.log(`Fallback on empty cells: ${extraRequests} extra requests  ·  closed ${cellsClosedByAlt} by alt stop-type + ${cellsClosedByCalendar} by calendar = ${cellsClosedByAlt + cellsClosedByCalendar}`);
   console.log(`Pace: target ${TARGET_INTERVAL_MS}ms (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min)  ·  achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
   console.log(`  requests slower than the interval: ${reqOverInterval} (those set the pace themselves — nothing left to sleep off)`);
@@ -1278,6 +1396,12 @@ async function main() {
   console.log(`Elapsed: ${elapsedMin} min`);
   // Last thing in the log, after everything else has had its say.
   logWriteLossSummary();
+  // §breaker: the run collected and flushed what it could, printed the counters, and now exits
+  // non-zero so the failure is loud — the watchdog goes red instead of a green run with a hole.
+  if (breakerTripped) {
+    console.error('\n🛑 Run ABORTED by the circuit breaker — collected data was flushed; the snapshot was skipped and the run exits non-zero.');
+    process.exit(1);
+  }
 }
 
 main().catch((e) => {
