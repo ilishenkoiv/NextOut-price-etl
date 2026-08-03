@@ -3,12 +3,15 @@ name: Twice-daily price fetch
 # Collects Travelpayouts prices and writes them to Supabase. Secrets come from
 # GitHub → Settings → Secrets and variables → Actions.
 #
-# WHY THE MONTH RANGE IS SPLIT, AND WHY THE JOBS NEVER RUN IN PARALLEL. A single job covering
-# the whole horizon ran up against the GitHub hosted-runner hard cap and runs were CANCELLED on
-# timeout; a smaller slice per job leaves real headroom under the `timeout-minutes` ceiling
-# below. Running the jobs in parallel is NOT an option: both would spend the same token and two
-# streams collide with the upstream rate limit, so every job waits for its predecessor via
-# `needs:`.
+# WHY THE HORIZON IS SPLIT ONE MONTH PER JOB, AND WHY THE JOBS NEVER RUN IN PARALLEL. Each job
+# collects a SINGLE month. This is not for speed — the whole chain takes as long as before, on
+# purpose — it is so that every part FINISHES well under its `timeout-minutes` ceiling and gets
+# to write its end-of-run summary and upload its snapshot. Three months per job no longer fit
+# under the ceiling since the second return window landed (§edge-months): a three-month job is
+# cancelled ON the cap before it reaches the summary, so its counters and its snapshot are lost
+# and the watchdog sees a hole. One month per job restores that headroom. Running the jobs in
+# parallel is NOT an option: they share one token and two streams collide with the upstream rate
+# limit, so every job waits for its predecessor via `needs:`, strictly in order.
 #
 # The horizon length is deliberate. Changing it needs a matching change to `horizonMonths` in
 # the app (lib/prices.ts) — without it the user can pick a month nothing is collected for.
@@ -20,8 +23,8 @@ name: Twice-daily price fetch
 
 on:
   schedule:
-    - cron: '0 23 * * *'   # 01:00 Berlin (CEST) — full 12-month sweep, all four jobs
-    - cron: '0 10 * * *'   # 12:00 Berlin (CEST) — near months 1–6 only (first two jobs)
+    - cron: '0 23 * * *'   # 01:00 Berlin (CEST) — full 12-month sweep, all twelve jobs
+    - cron: '0 10 * * *'   # 12:00 Berlin (CEST) — near months 1–6 only (first six jobs)
   workflow_dispatch:
     inputs:
       scope:
@@ -65,25 +68,26 @@ permissions:
   contents: read
 
 jobs:
-  months_1_3:
-    name: months 1–3
-    # Runs on BOTH cron schedules (near is refreshed twice daily) and on a manual
-    # near/both run. Skipped only for a manual far-only run.
+  # ── NEAR window: months 1–6 ───────────────────────────────────────────────────────────────
+  # These six run on BOTH cron schedules (near is refreshed twice daily) and on a manual
+  # near/both run. Skipped only for a manual far-only run.
+  month_1:
+    name: month 1
+    # First link in the chain: no predecessor, so no always() needed.
     if: >-
       github.event_name == 'schedule' ||
       github.event.inputs.scope == 'near' ||
       github.event.inputs.scope == 'both'
     runs-on: ubuntu-latest
-    # Sized for the worst case — every pair alive, nothing skipped — with headroom, and still
-    # well under GitHub's hosted-runner hard cap.
+    # A SINGLE month has ample headroom under this ceiling; it is kept unchanged so the cap
+    # still catches a genuinely stuck run.
     timeout-minutes: 180
     env:
       MONTH_START: '1'
-      MONTH_COUNT: '3'
+      MONTH_COUNT: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
@@ -91,11 +95,9 @@ jobs:
           # as a belt-and-suspenders fallback, so it works on older Node too.
           node-version: '22'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Fetch months 1–3 → Supabase
+      - name: Fetch month 1 → Supabase
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -103,12 +105,11 @@ jobs:
           MAX_ROUTES: ${{ inputs.max_routes }}
           SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
-
       # The job's snapshot verdict, read by the `watchdog` job at the end of the sweep.
       #
       # THIS STEP MUST NOT BE ABLE TO FAIL THE COLLECTOR. A collector that goes red drags nothing
       # else down (every `needs:` below is guarded by `always()`), but it does turn a run that
-      # collected and wrote 4400 prices into a failure over a 200-byte JSON. Hence all three:
+      # collected and wrote prices into a failure over a 200-byte JSON. Hence all three:
       #   if: always()          — a collector that died mid-run still ships the verdict it reached
       #   continue-on-error     — an upload-artifact outage cannot mark the collector failed
       #   if-no-files-found: warn — no file (job died before writing one) is a warning, not an error
@@ -117,21 +118,105 @@ jobs:
       #
       # overwrite: true so re-running this job replaces its own earlier artifact instead of
       # colliding with it; the artifact name is per-scope and unique within a run either way.
-      - name: Upload snapshot report (m1-3)
+      # The scope tag is the collector's SCOPE = m<START>-<END>; with COUNT=1 that is m1-1.
+      - name: Upload snapshot report (m1-1)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: snapshot-report-m1-3
-          path: snapshot-report-m1-3.json
+          name: snapshot-report-m1-1
+          path: snapshot-report-m1-1.json
           if-no-files-found: warn
           overwrite: true
 
-  months_4_6:
-    name: months 4–6
-    # Second half of the near window — same schedule rule as months 1–3. `always()` lets it
-    # run even when its predecessor failed or was skipped; `needs:` only orders the two.
-    needs: months_1_3
+  month_2:
+    name: month 2
+    # always() lets it run even when its predecessor failed or was skipped; `needs:` only orders.
+    needs: month_1
+    if: >-
+      always() &&
+      (
+        github.event_name == 'schedule' ||
+        github.event.inputs.scope == 'near' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '2'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 2 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m2-2)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m2-2
+          path: snapshot-report-m2-2.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_3:
+    name: month 3
+    needs: month_2
+    if: >-
+      always() &&
+      (
+        github.event_name == 'schedule' ||
+        github.event.inputs.scope == 'near' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '3'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 3 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m3-3)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m3-3
+          path: snapshot-report-m3-3.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_4:
+    name: month 4
+    needs: month_3
     if: >-
       always() &&
       (
@@ -143,45 +228,124 @@ jobs:
     timeout-minutes: 180
     env:
       MONTH_START: '4'
-      MONTH_COUNT: '3'
+      MONTH_COUNT: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Fetch months 4–6 → Supabase
+      - name: Fetch month 4 → Supabase
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
           MAX_ROUTES: ${{ inputs.max_routes }}
           SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
-
-      # Same three guards as months 1–3 — see the comment there for why each one is needed.
-      - name: Upload snapshot report (m4-6)
+      - name: Upload snapshot report (m4-4)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: snapshot-report-m4-6
-          path: snapshot-report-m4-6.json
+          name: snapshot-report-m4-4
+          path: snapshot-report-m4-4.json
           if-no-files-found: warn
           overwrite: true
 
-  months_7_9:
-    name: months 7–9
-    # Far months only on the nightly full sweep (cron '0 23'), or a manual far/both run —
-    # never on the noon near-only run ('0 10').
-    needs: months_4_6
+  month_5:
+    name: month 5
+    needs: month_4
+    if: >-
+      always() &&
+      (
+        github.event_name == 'schedule' ||
+        github.event.inputs.scope == 'near' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '5'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 5 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m5-5)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m5-5
+          path: snapshot-report-m5-5.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_6:
+    name: month 6
+    needs: month_5
+    if: >-
+      always() &&
+      (
+        github.event_name == 'schedule' ||
+        github.event.inputs.scope == 'near' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '6'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 6 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m6-6)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m6-6
+          path: snapshot-report-m6-6.json
+          if-no-files-found: warn
+          overwrite: true
+
+  # ── FAR window: months 7–12 ───────────────────────────────────────────────────────────────
+  # These six run ONLY on the nightly full sweep (cron '0 23') or a manual far/both run —
+  # never on the noon near-only run ('0 10').
+  month_7:
+    name: month 7
+    needs: month_6
     if: >-
       always() &&
       (
@@ -193,44 +357,121 @@ jobs:
     timeout-minutes: 180
     env:
       MONTH_START: '7'
-      MONTH_COUNT: '3'
+      MONTH_COUNT: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Fetch months 7–9 → Supabase
+      - name: Fetch month 7 → Supabase
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
           MAX_ROUTES: ${{ inputs.max_routes }}
           SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
-
-      # Same three guards as months 1–3 — see the comment there for why each one is needed.
-      - name: Upload snapshot report (m7-9)
+      - name: Upload snapshot report (m7-7)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: snapshot-report-m7-9
-          path: snapshot-report-m7-9.json
+          name: snapshot-report-m7-7
+          path: snapshot-report-m7-7.json
           if-no-files-found: warn
           overwrite: true
 
-  months_10_12:
-    name: months 10–12
-    # Tail of the horizon — same schedule rule as months 7–9.
-    needs: months_7_9
+  month_8:
+    name: month 8
+    needs: month_7
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+        github.event.inputs.scope == 'far' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '8'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 8 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m8-8)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m8-8
+          path: snapshot-report-m8-8.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_9:
+    name: month 9
+    needs: month_8
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+        github.event.inputs.scope == 'far' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '9'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 9 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m9-9)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m9-9
+          path: snapshot-report-m9-9.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_10:
+    name: month 10
+    needs: month_9
     if: >-
       always() &&
       (
@@ -242,54 +483,144 @@ jobs:
     timeout-minutes: 180
     env:
       MONTH_START: '10'
-      MONTH_COUNT: '3'
+      MONTH_COUNT: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Fetch months 10–12 → Supabase
+      - name: Fetch month 10 → Supabase
         env:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          # Empty on schedule and on an unset manual run → collector reads "no cap / keep all".
           MAX_ROUTES: ${{ inputs.max_routes }}
           SAMPLE_FRACTION: ${{ inputs.sample }}
         run: node scripts/fetch-prices.mjs
-
-      # Same three guards as months 1–3 — see the comment there for why each one is needed.
-      - name: Upload snapshot report (m10-12)
+      - name: Upload snapshot report (m10-10)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: snapshot-report-m10-12
-          path: snapshot-report-m10-12.json
+          name: snapshot-report-m10-10
+          path: snapshot-report-m10-10.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_11:
+    name: month 11
+    needs: month_10
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+        github.event.inputs.scope == 'far' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '11'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 11 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m11-11)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m11-11
+          path: snapshot-report-m11-11.json
+          if-no-files-found: warn
+          overwrite: true
+
+  month_12:
+    name: month 12
+    needs: month_11
+    if: >-
+      always() &&
+      (
+        (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+        github.event.inputs.scope == 'far' ||
+        github.event.inputs.scope == 'both'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MONTH_START: '12'
+      MONTH_COUNT: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Fetch month 12 → Supabase
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MAX_ROUTES: ${{ inputs.max_routes }}
+          SAMPLE_FRACTION: ${{ inputs.sample }}
+        run: node scripts/fetch-prices.mjs
+      - name: Upload snapshot report (m12-12)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-report-m12-12
+          path: snapshot-report-m12-12.json
           if-no-files-found: warn
           overwrite: true
 
   # ── The watchdog ────────────────────────────────────────────────────────────────────────────
   # WHY IT EXISTS. Everything the collector does to a snapshot is non-fatal by design: an upload
   # that 400s, a CSV that comes out malformed, a write that exhausts its retries — all of them
-  # log and continue, because none of them should cost us a six-hour collection. The price of
-  # that design is that the RUN goes green regardless, GitHub sends no mail, and the failure is
-  # a line in a 7000-line log that nobody reads. For four days in July that is exactly what
-  # happened: every snapshot was rejected with `Bucket not found` and every run reported success.
-  # This job is the one place allowed to go red, so the run's colour finally means something.
+  # log and continue, because none of them should cost us a collection. The price of that design
+  # is that the RUN goes green regardless, GitHub sends no mail, and the failure is a line in a
+  # long log that nobody reads. For four days in July that is exactly what happened: every
+  # snapshot was rejected with `Bucket not found` and every run reported success. This job is the
+  # one place allowed to go red, so the run's colour finally means something.
   #
   # It is a LEAF. No collector has it in `needs:`, so its verdict cannot skip or cancel any of
-  # them — a snapshot that fails validation in months 1–3 must not stop months 4–12 collecting.
+  # them — a snapshot that fails validation in one month must not stop the other months collecting.
   watchdog:
     name: watchdog
-    needs: [months_1_3, months_4_6, months_7_9, months_10_12]
+    needs:
+      - month_1
+      - month_2
+      - month_3
+      - month_4
+      - month_5
+      - month_6
+      - month_7
+      - month_8
+      - month_9
+      - month_10
+      - month_11
+      - month_12
     # always() — the whole point is to report on runs that went wrong, including ones where every
     # collector failed, was cancelled, or never started.
     if: always()
@@ -308,7 +639,7 @@ jobs:
     # another repository, which this job never does. It also does not check out the repo.
     steps:
       # continue-on-error: download-artifact fails the step outright when the pattern matches
-      # nothing (all four collectors dead, say). That is a case the watchdog must REPORT, not
+      # nothing (all twelve collectors dead, say). That is a case the watchdog must REPORT, not
       # die on, so the download is allowed to fail and the gate below reads the empty directory.
       - name: Download snapshot reports
         id: reports
@@ -330,10 +661,18 @@ jobs:
           # there and not here, the watchdog starts lying in one direction or the other.
           NEAR_EXPECTED: ${{ github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' }}
           FAR_EXPECTED: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' }}
-          R_M1_3: ${{ needs.months_1_3.result }}
-          R_M4_6: ${{ needs.months_4_6.result }}
-          R_M7_9: ${{ needs.months_7_9.result }}
-          R_M10_12: ${{ needs.months_10_12.result }}
+          R_M1: ${{ needs.month_1.result }}
+          R_M2: ${{ needs.month_2.result }}
+          R_M3: ${{ needs.month_3.result }}
+          R_M4: ${{ needs.month_4.result }}
+          R_M5: ${{ needs.month_5.result }}
+          R_M6: ${{ needs.month_6.result }}
+          R_M7: ${{ needs.month_7.result }}
+          R_M8: ${{ needs.month_8.result }}
+          R_M9: ${{ needs.month_9.result }}
+          R_M10: ${{ needs.month_10.result }}
+          R_M11: ${{ needs.month_11.result }}
+          R_M12: ${{ needs.month_12.result }}
         run: |
           set -uo pipefail
           fail=0
@@ -408,10 +747,18 @@ jobs:
             printf '%-13s  %-8s  %-9s  %8s  %-8s  %-8s  %s\n' "$job" "$expected" "$result" "$rows" "$snap" "$up" "$detail"
           }
 
-          check 'months 1-3'   'm1-3'   "$NEAR_EXPECTED" "$R_M1_3"
-          check 'months 4-6'   'm4-6'   "$NEAR_EXPECTED" "$R_M4_6"
-          check 'months 7-9'   'm7-9'   "$FAR_EXPECTED"  "$R_M7_9"
-          check 'months 10-12' 'm10-12' "$FAR_EXPECTED"  "$R_M10_12"
+          check 'month 1'  'm1-1'   "$NEAR_EXPECTED" "$R_M1"
+          check 'month 2'  'm2-2'   "$NEAR_EXPECTED" "$R_M2"
+          check 'month 3'  'm3-3'   "$NEAR_EXPECTED" "$R_M3"
+          check 'month 4'  'm4-4'   "$NEAR_EXPECTED" "$R_M4"
+          check 'month 5'  'm5-5'   "$NEAR_EXPECTED" "$R_M5"
+          check 'month 6'  'm6-6'   "$NEAR_EXPECTED" "$R_M6"
+          check 'month 7'  'm7-7'   "$FAR_EXPECTED"  "$R_M7"
+          check 'month 8'  'm8-8'   "$FAR_EXPECTED"  "$R_M8"
+          check 'month 9'  'm9-9'   "$FAR_EXPECTED"  "$R_M9"
+          check 'month 10' 'm10-10' "$FAR_EXPECTED"  "$R_M10"
+          check 'month 11' 'm11-11' "$FAR_EXPECTED"  "$R_M11"
+          check 'month 12' 'm12-12' "$FAR_EXPECTED"  "$R_M12"
 
           echo
           if [ "$fail" -eq 0 ]; then
