@@ -129,14 +129,68 @@ function selectCombo(offers, origin, dest) {
   return [...chosen.values()];
 }
 
-// Fixed INTERVAL, not a fixed pause. Sleeping a fixed time AFTER each response makes the real
-// spacing HTTP + pause, so the run's length is set by the upstream API's latency rather than
-// by us — when upstream slowed, sweeps overran and runs were cancelled on timeout. We time the
-// request and sleep only the remainder of TARGET_INTERVAL_MS, so a slower API costs nothing
-// until it exceeds the interval outright. The default sits deliberately under the upstream
-// rate ceiling: do NOT lower it against the live API. TP_TARGET_INTERVAL_MS exists for CI and
-// small re-runs only.
-const TARGET_INTERVAL_MS = Number(process.env.TP_TARGET_INTERVAL_MS) || 1091;
+// ── Per-method request pacing (§per-method-pace) ─────────────────────────────
+// A pause is timed as an INTERVAL, not a sleep-after: we measure the request and sleep only the
+// REMAINDER of the method's interval, so a slower upstream costs nothing until it exceeds the
+// interval outright (a fixed sleep-after would let upstream latency set the run's length and
+// overrun the job timeout). Each method gets its OWN interval, derived from THAT method's rate
+// ceiling in the partner table (14.06.2024) with a 20% safety margin — not one blanket rate:
+//   v3/prices_for_dates    — limit 600/min → target 480/min → 125 ms
+//   v2/prices/month-matrix — limit 300/min → target 240/min → 250 ms
+// The former single 1091 ms (~55/min) matched the /v1/prices/monthly row (60/min), an endpoint
+// this collector never calls — its own two methods allow 5–11× that rate. The real ceiling is
+// read live from the response headers (X-Rate-Limit…); if the partner ever declares a lower limit
+// than we planned, that method's interval is recomputed from it at the same 20% margin (pacedCall).
+// TP_INTERVAL_PRICES_MS / TP_INTERVAL_CALENDAR_MS override the two defaults for probes.
+const RATE_METHODS = {
+  prices_for_dates: { label: 'v3/prices_for_dates', limitPerMin: 600, targetPerMin: 480, defaultMs: 125, env: 'TP_INTERVAL_PRICES_MS' },
+  'month-matrix': { label: 'v2/prices/month-matrix', limitPerMin: 300, targetPerMin: 240, defaultMs: 250, env: 'TP_INTERVAL_CALENDAR_MS' },
+};
+// Which method a TP url belongs to — the pacer and the header store are keyed by this.
+function methodKeyOf(url) {
+  if (url.includes('prices_for_dates')) return 'prices_for_dates';
+  if (url.includes('month-matrix')) return 'month-matrix';
+  return null;
+}
+// This method's interval, from its env override (a probe pins it on purpose) or its default.
+function intervalFor(cfg) {
+  const raw = Number(process.env[cfg.env]);
+  const envOverride = Number.isFinite(raw) && raw > 0;
+  return { intervalMs: envOverride ? raw : cfg.defaultMs, envOverride };
+}
+// X-Rate-Limit / -Remaining / -Reset off a fetch Response, each a number or null. An ABSENT header
+// is null, NOT an error. Header lookup is case-insensitive per the fetch spec.
+function readRateHeaders(headers) {
+  const num = (v) => { if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+  return {
+    limit: num(headers.get('x-rate-limit')),
+    remaining: num(headers.get('x-rate-limit-remaining')),
+    reset: num(headers.get('x-rate-limit-reset')),
+  };
+}
+// Seconds until the limit window resets. X-Rate-Limit-Reset is not documented here as epoch vs.
+// delta, so both are handled: a value large enough to be a Unix timestamp is read as absolute, a
+// small one as seconds-from-now. Never negative; null in → null out.
+function secondsUntilReset(reset, nowMs = Date.now()) {
+  if (reset == null) return null;
+  if (reset > 1e6) { const d = reset - Math.floor(nowMs / 1000); return d > 0 ? d : 0; }
+  return reset >= 0 ? reset : 0;
+}
+// Live per-method pacing + header observability, built fresh each run.
+function initMethodRuntime() {
+  const m = new Map();
+  for (const [key, cfg] of Object.entries(RATE_METHODS)) {
+    const { intervalMs, envOverride } = intervalFor(cfg);
+    m.set(key, { cfg, intervalMs, envOverride, declaredLimit: null, lastRemaining: null, lastResetSec: null, minRemaining: null, count: 0 });
+  }
+  return m;
+}
+// One rate line: method, declared limit, remaining, seconds to reset. Printed on the FIRST response
+// of each method and every 500th (§log). Any field the headers did not carry prints as '—'.
+function logRateLine(st) {
+  const resetSec = secondsUntilReset(st.lastResetSec);
+  console.log(`    rate ${st.cfg.label}: limit ${st.declaredLimit ?? '—'}/min  remaining ${st.lastRemaining ?? '—'}  reset ${resetSec == null ? '—' : `${resetSec}s`}  (req #${st.count})`);
+}
 // Deliberately short. Nothing useful ever arrives late — upstream answers well inside a second
 // and the observed failures are 502/503 bursts, so a long ceiling only buys dead waiting time.
 const TIMEOUT_MS = 8000;
@@ -421,7 +475,7 @@ async function writeWithRetry(label, run, where = {}) {
 // an empty 200 is a real "no flights" and is written as such, while a refusal must never be
 // written as emptiness (see fetchFlightMonth / the cell loop). A refusal is retried a few times
 // with a GROWING pause; that pause is separate from and ON TOP OF the request interval, which is
-// NOT touched here (TARGET_INTERVAL_MS is unchanged — retries are extra sleeps, not a new rate).
+// NOT touched here (the method's interval is unchanged — retries are extra sleeps, not a new rate).
 // Three attempts total → two pauses between them, then the cell is left unverified and the run
 // goes on.
 const REFUSAL_MAX_ATTEMPTS = 3;
@@ -450,30 +504,33 @@ async function classifiedFetch(url) {
   const at = url.split('?')[0];
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
+    // Rate-limit headers travel out with EVERY response we got one for (§headers) — the caller's
+    // pacer stores the last-seen value per method and adapts. Absent headers → all-null, no error.
+    const rate = readRateHeaders(res.headers);
     if (res.ok) {
       try {
-        return { kind: 'ok', json: await res.json() };
+        return { kind: 'ok', json: await res.json(), rate };
       } catch (e) {
         // A 200 whose body is HTML/garbage (a Cloudflare interstitial, say). Not a refusal:
         // retrying the same URL will not make it parse. Capped like every upstream string.
         console.warn(`    unparseable 200 on ${at}: ${previewBody(e.message)}`);
-        return { kind: 'error', status: res.status };
+        return { kind: 'error', status: res.status, rate };
       }
     }
     if (res.status === 429) {
       console.warn(`    HTTP 429 (too many requests) on ${at}`);
-      return { kind: 'refused', refusal: 'tooMany', status: 429 };
+      return { kind: 'refused', refusal: 'tooMany', status: 429, rate };
     }
     if (res.status >= 500) {
       console.warn(`    HTTP ${res.status} (server) on ${at}`);
-      return { kind: 'refused', refusal: 'server', status: res.status };
+      return { kind: 'refused', refusal: 'server', status: res.status, rate };
     }
     console.warn(`    HTTP ${res.status} on ${at}`);
-    return { kind: 'error', status: res.status };
+    return { kind: 'error', status: res.status, rate };
   } catch (e) {
     // AbortController timeout, socket drop, DNS failure — no response was delivered at all.
     console.warn(`    connection failed on ${at}: ${previewBody(e.message)}`);
-    return { kind: 'refused', refusal: 'network' };
+    return { kind: 'refused', refusal: 'network', rate: null };
   } finally {
     clearTimeout(timer);
   }
@@ -974,6 +1031,9 @@ async function main() {
   // pruning deletes only rows OLDER than it, so a fresh row is never removed.
   const RUN_START_ISO = new Date().toISOString();
 
+  // Per-method pacing + rate-header store for this run (§per-method-pace). The pacer keys off it.
+  const methodRuntime = initMethodRuntime();
+
   // Baseline: the current price of every route-month, loaded ONCE (paginated) BEFORE the plan
   // is built — it feeds both change detection and the dead-pair list.
   const { map: existingPrices, seen, alive, rowsRead } = await loadPriceBaseline();
@@ -1014,7 +1074,9 @@ async function main() {
 
   console.log(`Route plan: ${live.length} live + ${probed.length} of ${dead.length} dead (slice ${slice + 1}/${DEAD_SLICES}, whole list every ${DEAD_SLICES} days) = ${routeTotal} of ${catalogTotal} pairs`);
   console.log(`Flight requests: ${totalRequests} baseline (2 return windows × ${routeTotal} pairs × ${MONTHS.length} months); empty cells add up to 3 more each`);
-  console.log(`At ${TARGET_INTERVAL_MS}ms/request (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min) ≈ ${Math.round(totalRequests * TARGET_INTERVAL_MS / 60000)} min baseline\n`);
+  // Baseline requests are all prices_for_dates, so the ETA reads off its interval.
+  const baseInterval = methodRuntime.get('prices_for_dates').intervalMs;
+  console.log(`At ${baseInterval}ms/request (${(60000 / baseInterval).toFixed(1)} req/min, prices_for_dates) ≈ ${Math.round(totalRequests * baseInterval / 60000)} min baseline\n`);
 
   // Batches that exhausted every retry and are gone for good. Row counts live in the
   // per-table *WriteErrors counters; this counts the LOSSES, so the summary can state the
@@ -1162,21 +1224,62 @@ async function main() {
   };
   const t0 = Date.now();
   const paceT0 = Date.now(); // start of the collection window, for the achieved req/min
-  const etaMin = () => Math.round((totalRequests - reqDone) * TARGET_INTERVAL_MS / 60000);
+  const etaMin = () => Math.round((totalRequests - reqDone) * methodRuntime.get('prices_for_dates').intervalMs / 60000);
 
-  // Run ONE TP request under the shared pace: time it, count it, then sleep the REMAINDER of
-  // TARGET_INTERVAL_MS so the spacing between request STARTS is constant no matter how many
-  // requests a cell makes (two windows, plus any fallbacks). Same rule the old single-request
-  // loop used, hoisted so every probe helper obeys it. `fn` returns the request's own result.
-  const pacedCall = async (fn) => {
+  // Run ONE TP request under its METHOD's pace: time it, count it, observe its rate headers, then
+  // sleep the REMAINDER of that method's interval so the spacing between request STARTS is constant
+  // no matter how many requests a cell makes (two windows, plus any fallbacks). Same rule the old
+  // single-interval loop used, now keyed per method. `fn` returns the request's own result.
+  const pacedCall = async (methodKey, fn) => {
+    const st = methodKey ? methodRuntime.get(methodKey) : null;
     const reqT0 = Date.now();
     const out = await fn();
     const reqMs = Date.now() - reqT0;
     reqDone += 1;
     reqMsTotal += reqMs;
-    const remaining = TARGET_INTERVAL_MS - reqMs;
-    if (remaining > 0) await sleep(remaining);
-    else reqOverInterval += 1;
+
+    let sleptToReset = false;
+    if (st) {
+      st.count += 1;
+      // Observe the rate headers this response carried (§headers); an absent header stays null.
+      const rate = out?.rate ?? null;
+      if (rate) {
+        if (rate.limit != null) st.declaredLimit = rate.limit;
+        if (rate.remaining != null) {
+          st.lastRemaining = rate.remaining;
+          st.minRemaining = st.minRemaining == null ? rate.remaining : Math.min(st.minRemaining, rate.remaining);
+        }
+        if (rate.reset != null) st.lastResetSec = rate.reset;
+        // §adapt: a declared limit BELOW our planned rate tightens this method's interval, at the
+        // same 20% margin. Never loosens (a generous limit does not license exceeding our target),
+        // and an env override is left alone — a probe pins the interval on purpose.
+        if (rate.limit != null && !st.envOverride) {
+          const fromLimit = Math.ceil(60000 / (rate.limit * 0.8));
+          if (fromLimit > st.intervalMs) {
+            console.log(`    ⏱ ${st.cfg.label}: declared limit ${rate.limit}/min below plan — interval ${st.intervalMs}→${fromLimit}ms`);
+            st.intervalMs = fromLimit;
+          }
+        }
+      }
+      // First response of the method, then every 500th (§log).
+      if (st.count === 1 || st.count % 500 === 0) logRateLine(st);
+      // §floor: under 10% of the window's limit left → wait out the reset, then carry on. Capped at
+      // 65s so a mis-read epoch reset header can never park the run indefinitely.
+      if (rate && rate.limit != null && rate.remaining != null && rate.remaining < rate.limit * 0.1) {
+        const waitMs = Math.min(65000, (secondsUntilReset(rate.reset) ?? 0) * 1000);
+        if (waitMs > 0) {
+          console.warn(`    ⏳ ${st.cfg.label}: ${rate.remaining}/${rate.limit} left — sleeping ${Math.round(waitMs / 1000)}s to window reset`);
+          await sleep(waitMs);
+          sleptToReset = true;
+        }
+      }
+    }
+
+    if (!sleptToReset) {
+      const remaining = (st ? st.intervalMs : 0) - reqMs;
+      if (remaining > 0) await sleep(remaining);
+      else reqOverInterval += 1;
+    }
     return out;
   };
 
@@ -1186,9 +1289,10 @@ async function main() {
   // thing it throws is the circuit breaker (§breaker), which aborts the whole run. The pacing
   // interval is untouched: the retry backoff is extra sleep, not a changed rate.
   const request = async (url) => {
+    const methodKey = methodKeyOf(url);
     let last = null;
     for (let attempt = 1; attempt <= REFUSAL_MAX_ATTEMPTS; attempt += 1) {
-      const out = await pacedCall(() => classifiedFetch(url));
+      const out = await pacedCall(methodKey, () => classifiedFetch(url));
       // Count the refusal BEFORE the breaker: recordRequest can throw BreakerTripError on this very
       // attempt, and if it does the summary must still include this last refusal, not undercount it.
       if (out.kind === 'refused') refusals[out.refusal] += 1;
@@ -1367,8 +1471,12 @@ async function main() {
   console.log(`Partner refusals: ${refusalTotal} attempts (429 too-many ${refusals.tooMany} · 5xx server ${refusals.server} · connection drop ${refusals.network})  ·  retries that recovered a request: ${retriesHelped}  ·  other errors (non-429 4xx / bad body): ${otherErrors}`);
   console.log(`Circuit breaker: ${breakerTripped ? 'TRIPPED — run aborted' : 'not tripped'}  (threshold > ${(BREAKER_MAX_REFUSAL_RATE * 100).toFixed(0)}% refused over last ${BREAKER_WINDOW} requests)`);
   console.log(`Fallback on empty cells: ${extraRequests} extra requests  ·  closed ${cellsClosedByAlt} by alt stop-type + ${cellsClosedByCalendar} by calendar = ${cellsClosedByAlt + cellsClosedByCalendar}`);
-  console.log(`Pace: target ${TARGET_INTERVAL_MS}ms (${(60000 / TARGET_INTERVAL_MS).toFixed(1)} req/min)  ·  achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
+  console.log(`Pace: achieved ${achievedRpm} req/min over ${paceMin.toFixed(1)} min  ·  avg request ${avgReqMs}ms`);
   console.log(`  requests slower than the interval: ${reqOverInterval} (those set the pace themselves — nothing left to sleep off)`);
+  console.log('Rate limits by method (interval, declared limit & lowest remaining seen from headers):');
+  for (const [, st] of methodRuntime) {
+    console.log(`  ${st.cfg.label}: ${st.count} req  ·  interval ${st.intervalMs}ms (${(60000 / st.intervalMs).toFixed(1)}/min, plan ${st.cfg.targetPerMin}/min of ${st.cfg.limitPerMin}/min)  ·  declared limit ${st.declaredLimit != null ? `${st.declaredLimit}/min` : 'unknown (no header)'}  ·  min remaining ${st.minRemaining ?? 'n/a'}`);
+  }
   console.log(`Supabase prices: ${pricesWritten} rows written, ${priceWriteErrors} errors`);
   console.log(`Price changes: ${pricesChanged} changed/new  ·  ${pricesUnchanged} unchanged (baseline ${existingPrices.size})`);
   console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
