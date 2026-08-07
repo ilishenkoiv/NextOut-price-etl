@@ -107,3 +107,30 @@ describe('fetch-prices.mjs — a failed Travelpayouts request must write nothing
     });
   }
 });
+
+// An honest empty answer (ok:true, no offers) must delete NOTHING — the offers prune parallels the
+// price rule: an un-reconfirmed row keeps its last-seen date and lives on. The only way the old
+// behaviour could return is by keying the offers DELETE off the run again, so we assert on the
+// prune's shape: no run-timestamp filter, deletion gated on the two absolute cutoffs only. Static
+// for the same reason as above — importing the collector means a token and a multi-hour live run.
+describe('fetch-prices.mjs — an honest empty answer must not delete offers', () => {
+  const START = SRC.indexOf('async function pruneStaleOffers');
+  it('pruneStaleOffers is still present (keeps this test honest)', () => {
+    assert.ok(START >= 0, 'pruneStaleOffers not found — was it renamed?');
+  });
+  // Function body: from its declaration to the first column-2 closing brace (inner blocks close
+  // deeper, at 4+ spaces, so `\n  }` lands on the function's own end).
+  const BODY = START >= 0 ? SRC.slice(START, SRC.indexOf('\n  }', START)) : '';
+
+  it('the prune does not key deletion off the run start timestamp', () => {
+    // `.lt('updated_at', RUN_START_ISO)` was the "not rewritten this run" binding — its presence is
+    // exactly what let an empty answer wipe a quiet cell. It must be gone.
+    assert.doesNotMatch(BODY, /\.lt\(\s*['"]updated_at['"]\s*,\s*RUN_START_ISO\s*\)/);
+  });
+
+  it('the prune deletes only on a passed departure OR a year-old observation', () => {
+    assert.match(BODY, /\.or\(/);                 // the two cutoffs are OR-combined
+    assert.match(BODY, /departure_at\.lt\./);     // departure already passed
+    assert.match(BODY, /updated_at\.lt\./);       // last observation over a year old
+  });
+});

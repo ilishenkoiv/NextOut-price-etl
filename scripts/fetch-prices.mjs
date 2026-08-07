@@ -1254,8 +1254,10 @@ async function main() {
   }
 
   // ── offers table: every individual offer (departure/return dates preserved) ──────
-  // Written in parallel with `prices` from the SAME API responses. offers is a SNAPSHOT
-  // (upsert on PK, then stale rows pruned), not an accumulating log — its size is stable.
+  // Written in parallel with `prices` from the SAME API responses. offers ACCUMULATES: an offer the
+  // partner stops returning is kept (with its last-seen date), not deleted — pruning removes a row
+  // only once its DEPARTURE has passed or its last observation is over a year old. So the table
+  // grows past a single run's worth and settles at whatever is still bookable, not at one snapshot.
   const offerBuf = [];
   let offersWritten = 0;
   let offerWriteErrors = 0;
@@ -1263,7 +1265,9 @@ async function main() {
   let offersInBreakWindow = 0; // offers tagged in_break_window (§break-windows)
   let offersBreakOnly = 0;     // …of which kept ONLY because of a window (not cheap/target)
   let okRouteMonths = 0;      // route-months where the API responded (for the avg metric)
-  let offersDeleted = 0;      // stale rows pruned
+  let offersDeleted = 0;      // rows pruned (past departure + over-age, summed)
+  let offersPrunedPastDeparture = 0; // …of which deleted because the departure date has passed
+  let offersPrunedByAge = 0;         // …of which deleted because the last observation is over a year old
   let offerDeleteErrors = 0;
 
   async function flushOffers(force = false) {
@@ -1282,10 +1286,18 @@ async function main() {
     }
   }
 
-  // Prune offers for one route (its successfully-fetched months only) that are OLDER than
-  // this run — i.e. offers the API no longer returns. Scoped to `months` (via .in) so a
-  // month whose request FAILED this run keeps its previous offers instead of being wiped.
-  // .select() returns the deleted rows so we can count them.
+  // Prune offers this route no longer needs — NOT the ones this run failed to reconfirm. An offer
+  // the partner did not return again keeps its earlier last-seen date and stays; it is deleted only
+  // once it is genuinely dead: its DEPARTURE date has passed, or its last observation (updated_at)
+  // is over a year old. Neither cutoff is tied to RUN_START_ISO, so an honest empty answer — and a
+  // refusal, which never reaches here — deletes nothing. Same as `prices`, which never deletes at all.
+  // Still scoped per route + flight_type + this run's answered months (the call site's gating is
+  // unchanged); the two cutoffs are absolute dates. .select() returns the deleted rows so the count
+  // can be split by reason (a passed departure is the stronger reason when both hold).
+  const PRUNE_TODAY = RUN_START_ISO.slice(0, 10);                 // 'YYYY-MM-DD' — offers departing before today
+  const _yearAgo = new Date(RUN_START_ISO);
+  _yearAgo.setUTCFullYear(_yearAgo.getUTCFullYear() - 1);
+  const PRUNE_MAX_AGE_DAY = _yearAgo.toISOString().slice(0, 10);  // one year before the run, date-only
   async function pruneStaleOffers(origin, dest, flightType, months) {
     const r = await writeWithRetry(`offers prune ${origin}→${dest}`, () => supabase
       .from('offers')
@@ -1294,13 +1306,17 @@ async function main() {
       .eq('dest', dest)
       .eq('flight_type', flightType)
       .in('month', months)
-      .lt('updated_at', RUN_START_ISO)
-      .select('origin'),
-    // rows: null — how many stale rows this DELETE would have removed is only known from
-    // its own .select(), which is exactly what we did not get back.
+      .or(`departure_at.lt.${PRUNE_TODAY},updated_at.lt.${PRUNE_MAX_AGE_DAY}`)
+      .select('departure_at,updated_at'),
+    // rows: null — how many rows this DELETE removed is only known from its own .select().
     { target: 'offers_prune', rows: null });
-    if (r.ok) offersDeleted += (r.data?.length ?? 0);
-    else {
+    if (r.ok) {
+      for (const row of r.data ?? []) {
+        if (row.departure_at < PRUNE_TODAY) offersPrunedPastDeparture += 1;
+        else offersPrunedByAge += 1;
+      }
+      offersDeleted += (r.data?.length ?? 0);
+    } else {
       console.warn(`    ⚠ offers prune FAILED ${origin}→${dest} after ${r.attempts} attempt(s) — ${r.why}`);
       offerDeleteErrors += 1;
     }
@@ -1533,10 +1549,10 @@ async function main() {
     await flushPrices(false);
     await flushHistory(false);
 
-    // Force-flush THIS route's offers before pruning stale ones, and prune PER flight_type over the
-    // months that answered for that type — a cell filled by a fallback of the other type is pruned
-    // under its own type, a fully-empty cell prunes both, and a fresh row (updated_at ≥ run start)
-    // is never deleted.
+    // Force-flush THIS route's offers before pruning, and run the prune PER flight_type over the
+    // months that answered for that type. The prune no longer wipes un-reconfirmed offers: an empty
+    // or fallback-only cell leaves its earlier offers in place, and only rows past departure or over
+    // a year old are removed — so this call cleans expired rows without punishing a quiet cell.
     const offerErrBefore = offerWriteErrors;
     await flushOffers(true);
     if (offerWriteErrors === offerErrBefore) {
@@ -1578,6 +1594,21 @@ async function main() {
   await flushHistory(true);
   await flushOffers(true); // safety net; per-route force-flushes normally drain it already
 
+  // Offers left UNCONFIRMED this run = rows in this run's months that kept their earlier last-seen
+  // date (not rewritten) and survived the prune. With the run-timestamp binding gone these simply
+  // live on; count them for the summary. HEAD count → returns a number, no rows, so the 1000-row
+  // .select() cap never applies and no paging is needed. A read failure only blanks the metric.
+  let offersUnconfirmed = null;
+  {
+    const res = await supabase
+      .from('offers')
+      .select('origin', { count: 'exact', head: true })
+      .in('month', MONTHS)
+      .lt('updated_at', RUN_START_ISO);
+    if (res.error) console.warn(`    ⚠ could not count unconfirmed offers — ${describeError(httpStatusOf(res, res.error), res.error)}`);
+    else offersUnconfirmed = res.count ?? 0;
+  }
+
   // Additive history step — AFTER every Supabase TABLE write, so a Storage problem can never
   // affect what was collected. Its outcome is reported in the summary below. On a breaker trip the
   // run is aborting mid-sweep: what was collected is already flushed above, but a PARTIAL snapshot
@@ -1615,7 +1646,8 @@ async function main() {
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
   console.log(`  break windows: ${breakWindowCount} this horizon  ·  offers in a window: ${offersInBreakWindow} (of which ${offersBreakOnly} kept ONLY by the window rule)`);
-  console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
+  console.log(`  offers pruned: ${offersDeleted} total  ·  prune errors: ${offerDeleteErrors}`);
+  console.log(`  offers lifecycle: ${offersWritten} confirmed  ·  ${offersUnconfirmed ?? 'n/a'} left unconfirmed (kept, last-seen date preserved)  ·  ${offersPrunedByAge} pruned over 1-year age  ·  ${offersPrunedPastDeparture} pruned past departure`);
   const lostTotal = lostBatches.prices + lostBatches.offers + lostBatches.history;
   const lostRows = priceWriteErrors + offerWriteErrors + historyWriteErrors;
   console.log(lostTotal
