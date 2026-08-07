@@ -25,6 +25,7 @@ import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
 import { ORIGIN_REGIONS } from '../src/data/origin-regions.js';
+import { isoDay, buildBreakWindows } from './break-windows.mjs';
 
 // ── Config / secrets (env only) ──────────────────────────────────────────────
 const TP_TOKEN = process.env.TP_TOKEN;
@@ -130,45 +131,10 @@ function holidayAppliesToOrigins(country, subdivision) {
   return false;
 }
 
-const pad2 = (n) => String(n).padStart(2, '0');
-const isoDay = (d) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-function addDaysIso(iso, n) {
-  const d = new Date(`${iso}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + n);
-  return isoDay(d);
-}
-function dowUtc(iso) { return new Date(`${iso}T00:00:00Z`).getUTCDay(); } // 0=Sun … 6=Sat
-
-// Build the run's break windows from applicable holiday dates plus every weekend in [fromIso,toIso].
-// Bridge scheme by the holiday's weekday (per spec):
-//   Mon/Fri → Fri–Mon (3n) · Tue → Fri–Tue (4n) · Thu → Thu–Mon (4n) · Wed → Sat–Wed (4n).
-// A holiday on Sat/Sun carries no bridge (it already sits in a weekend window). Windows dedup by
-// their (departure, return) pair. Returns { keySet: Set(`dep|nights`), count } — keySet drives the
-// O(1) selection check in selectCombo, count is for the run summary.
-function buildBreakWindows(holidayDates, fromIso, toIso) {
-  const wins = new Map(); // `dep|ret` → nights
-  const add = (dep, ret) => {
-    if (dep < fromIso || dep > toIso) return; // the DEPARTURE must sit in the collected horizon
-    const nights = Math.round((Date.parse(`${ret}T00:00:00Z`) - Date.parse(`${dep}T00:00:00Z`)) / 86400000);
-    if (nights >= 1) wins.set(`${dep}|${ret}`, nights);
-  };
-  for (const h of holidayDates) {
-    switch (dowUtc(h)) {
-      case 1: add(addDaysIso(h, -3), h); break;        // Mon: Fri→Mon (3n)
-      case 5: add(h, addDaysIso(h, 3)); break;         // Fri: Fri→Mon (3n)
-      case 2: add(addDaysIso(h, -4), h); break;        // Tue: Fri→Tue (4n)
-      case 4: add(h, addDaysIso(h, 4)); break;         // Thu: Thu→Mon (4n)
-      case 3: add(addDaysIso(h, -4), h); break;        // Wed: Sat→Wed (4n)
-      default: break;                                  // Sat/Sun: covered by the weekend window
-    }
-  }
-  for (let iso = fromIso; iso <= toIso; iso = addDaysIso(iso, 1)) {       // ordinary weekends Fri→Sun (2n)
-    if (dowUtc(iso) === 5) add(iso, addDaysIso(iso, 2));
-  }
-  const keySet = new Set();
-  for (const [pair, nights] of wins) keySet.add(`${pair.split('|')[0]}|${nights}`);
-  return { keySet, count: wins.size };
-}
+// Break-window construction and the date helpers moved to ./break-windows.mjs — a PURE module with
+// no import-time side effects, so the schemes are unit-tested directly (this file runs main() on
+// import and cannot be). `isoDay` is still used below for the horizon bounds; `buildBreakWindows`
+// is called once per run before the route walk. See break-windows.mjs for the full scheme spec.
 
 function selectCombo(offers, origin, dest, breakKeys) {
   const usable = offers.filter((o) => o.price > 0 && o.nights != null && o.nights >= 1);
@@ -1149,6 +1115,7 @@ async function main() {
   const horizonToIso = isoDay(new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1 + HORIZON_MONTH_COUNT, 0)));
   let breakWindowKeys = new Set();
   let breakWindowCount = 0;
+  let breakWindowShort = 0, breakWindowVacation = 0, breakWindowConnecting = 0, breakWindowWeekend = 0;
   {
     const { dates: holidayDates, error: hErr } = await loadHolidayDates(horizonFromIso, horizonToIso);
     if (hErr) {
@@ -1159,7 +1126,8 @@ async function main() {
       const w = buildBreakWindows(holidayDates, horizonFromIso, horizonToIso);
       breakWindowKeys = w.keySet;
       breakWindowCount = w.count;
-      console.log(`Break windows: ${breakWindowCount} distinct (from ${holidayDates.size} applicable holiday dates + weekends, horizon ${horizonFromIso}…${horizonToIso})`);
+      breakWindowShort = w.short; breakWindowVacation = w.vacation; breakWindowConnecting = w.connecting; breakWindowWeekend = w.weekend;
+      console.log(`Break windows: ${breakWindowCount} distinct (from ${holidayDates.size} applicable holiday dates, horizon ${horizonFromIso}…${horizonToIso}) — ${breakWindowShort} short · ${breakWindowVacation} vacation · ${breakWindowConnecting} connecting two blocks · ${breakWindowWeekend} weekend`);
     }
   }
 
@@ -1645,7 +1613,7 @@ async function main() {
   console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
-  console.log(`  break windows: ${breakWindowCount} this horizon  ·  offers in a window: ${offersInBreakWindow} (of which ${offersBreakOnly} kept ONLY by the window rule)`);
+  console.log(`  break windows: ${breakWindowCount} this horizon (${breakWindowShort} short · ${breakWindowVacation} vacation · ${breakWindowConnecting} connecting two blocks · ${breakWindowWeekend} weekend)  ·  offers in a window: ${offersInBreakWindow} (of which ${offersBreakOnly} kept ONLY by the window rule)`);
   console.log(`  offers pruned: ${offersDeleted} total  ·  prune errors: ${offerDeleteErrors}`);
   console.log(`  offers lifecycle: ${offersWritten} confirmed  ·  ${offersUnconfirmed ?? 'n/a'} left unconfirmed (kept, last-seen date preserved)  ·  ${offersPrunedByAge} pruned over 1-year age  ·  ${offersPrunedPastDeparture} pruned past departure`);
   const lostTotal = lostBatches.prices + lostBatches.offers + lostBatches.history;
