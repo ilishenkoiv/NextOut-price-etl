@@ -24,6 +24,7 @@ import { writeFileSync } from 'node:fs';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
+import { ORIGIN_REGIONS } from '../src/data/origin-regions.js';
 
 // ── Config / secrets (env only) ──────────────────────────────────────────────
 const TP_TOKEN = process.env.TP_TOKEN;
@@ -109,22 +110,91 @@ function targetSet(origin, dest) {
   if (km <= 4000) return [5, 7, 10, 14];
   return stops === 0 ? [5, 7, 10, 14] : [7, 10, 14];
 }
-function selectCombo(offers, origin, dest) {
+// ── Break-window offers (§break-windows) ─────────────────────────────────────
+// On TOP of the cheap pool + duration targets, we also keep any ALREADY-FETCHED offer that lands on
+// a public-holiday bridge or an ordinary weekend, so those calendar dates survive the price-only
+// selection (which otherwise keeps just the month's cheapest per band, rarely on the exact date a
+// traveller wants). This adds NO Travelpayouts requests — it re-tags offers already in the month
+// response. Windows are built once per run (buildBreakWindows) into a Set of `departure|nights`
+// keys; selectCombo keeps an offer when `${o.departure_at}|${o.nights}` is in that set.
+const DACH_COUNTRIES = new Set(['DE', 'AT', 'CH']);
+// The distinct calendar regions (state/canton) of the 20 collector origins.
+const BREAK_REGIONS = new Set(Object.values(ORIGIN_REGIONS).map((r) => r.subdivision));
+
+// A public_holidays row applies to our origins when it is nationwide (no subdivision) or its
+// subdivision is one of our regions — or a finer code UNDER one (e.g. DE-BY-AU under DE-BY).
+function holidayAppliesToOrigins(country, subdivision) {
+  if (!DACH_COUNTRIES.has(country)) return false;
+  if (subdivision == null || subdivision === '') return true; // nationwide
+  for (const reg of BREAK_REGIONS) if (subdivision === reg || subdivision.startsWith(`${reg}-`)) return true;
+  return false;
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const isoDay = (d) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+function addDaysIso(iso, n) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return isoDay(d);
+}
+function dowUtc(iso) { return new Date(`${iso}T00:00:00Z`).getUTCDay(); } // 0=Sun … 6=Sat
+
+// Build the run's break windows from applicable holiday dates plus every weekend in [fromIso,toIso].
+// Bridge scheme by the holiday's weekday (per spec):
+//   Mon/Fri → Fri–Mon (3n) · Tue → Fri–Tue (4n) · Thu → Thu–Mon (4n) · Wed → Sat–Wed (4n).
+// A holiday on Sat/Sun carries no bridge (it already sits in a weekend window). Windows dedup by
+// their (departure, return) pair. Returns { keySet: Set(`dep|nights`), count } — keySet drives the
+// O(1) selection check in selectCombo, count is for the run summary.
+function buildBreakWindows(holidayDates, fromIso, toIso) {
+  const wins = new Map(); // `dep|ret` → nights
+  const add = (dep, ret) => {
+    if (dep < fromIso || dep > toIso) return; // the DEPARTURE must sit in the collected horizon
+    const nights = Math.round((Date.parse(`${ret}T00:00:00Z`) - Date.parse(`${dep}T00:00:00Z`)) / 86400000);
+    if (nights >= 1) wins.set(`${dep}|${ret}`, nights);
+  };
+  for (const h of holidayDates) {
+    switch (dowUtc(h)) {
+      case 1: add(addDaysIso(h, -3), h); break;        // Mon: Fri→Mon (3n)
+      case 5: add(h, addDaysIso(h, 3)); break;         // Fri: Fri→Mon (3n)
+      case 2: add(addDaysIso(h, -4), h); break;        // Tue: Fri→Tue (4n)
+      case 4: add(h, addDaysIso(h, 4)); break;         // Thu: Thu→Mon (4n)
+      case 3: add(addDaysIso(h, -4), h); break;        // Wed: Sat→Wed (4n)
+      default: break;                                  // Sat/Sun: covered by the weekend window
+    }
+  }
+  for (let iso = fromIso; iso <= toIso; iso = addDaysIso(iso, 1)) {       // ordinary weekends Fri→Sun (2n)
+    if (dowUtc(iso) === 5) add(iso, addDaysIso(iso, 2));
+  }
+  const keySet = new Set();
+  for (const [pair, nights] of wins) keySet.add(`${pair.split('|')[0]}|${nights}`);
+  return { keySet, count: wins.size };
+}
+
+function selectCombo(offers, origin, dest, breakKeys) {
   const usable = offers.filter((o) => o.price > 0 && o.nights != null && o.nights >= 1);
   if (!usable.length) return [];
   const byPrice = [...usable].sort((a, b) => a.price - b.price); // ascending → first match = cheapest
   const chosen = new Map(); // `${departure_at}|${return_at}` → tagged offer
   const take = (o, patch) => {
     const k = `${o.departure_at}|${o.return_at}`;
-    const cur = chosen.get(k) || { ...o, in_cheap_pool: false, target_nights: null };
+    const cur = chosen.get(k) || { ...o, in_cheap_pool: false, target_nights: null, in_break_window: false };
     if (patch.cheap) cur.in_cheap_pool = true;
     if (patch.target != null && cur.target_nights == null) cur.target_nights = patch.target;
+    if (patch.break) cur.in_break_window = true;
     chosen.set(k, cur);
   };
   for (const o of byPrice.slice(0, CHEAP_N)) take(o, { cheap: true });            // (a) cheap pool
   for (const t of targetSet(origin, dest)) {                                      // (b) per target
     const best = byPrice.find((o) => Math.abs(o.nights - t) <= 1);
     if (best) take(best, { target: t });
+  }
+  // (c) §break-windows: keep EVERY offer whose (departure, nights) is a holiday/weekend window.
+  // Dedup is automatic — `chosen` is keyed by departure|return, so an offer already taken as cheap
+  // or a target only gains the in_break_window tag instead of being written twice.
+  if (breakKeys && breakKeys.size) {
+    for (const o of byPrice) {
+      if (breakKeys.has(`${o.departure_at}|${o.nights}`)) take(o, { break: true });
+    }
   }
   return [...chosen.values()];
 }
@@ -750,6 +820,38 @@ async function loadPriceBaseline() {
   return { map, seen, alive, rowsRead };
 }
 
+// Distinct public-holiday DATES in [fromIso,toIso] that apply to our 20 origins' regions
+// (§break-windows). Paginated with a STABLE .order() over the table's natural key
+// (country, subdivision_code, date, name_en) — public_holidays can approach/cross PostgREST's
+// 1000-row cap as the horizon widens or CH granularity grows, and an unordered page could repeat or
+// skip rows silently. Returns { dates: Set|null, error: string|null }; a read failure returns an
+// error (the caller then runs WITHOUT windows) rather than throwing — a missing calendar must never
+// fail the price collection.
+async function loadHolidayDates(fromIso, toIso) {
+  const dates = new Set();
+  const PAGE = 1000;
+  let from = 0;
+  for (;;) {
+    const res = await supabase
+      .from('public_holidays')
+      .select('country,subdivision_code,date,name_en')
+      .gte('date', fromIso)
+      .lte('date', toIso)
+      .order('country', { ascending: true })
+      .order('subdivision_code', { ascending: true, nullsFirst: true })
+      .order('date', { ascending: true })
+      .order('name_en', { ascending: true })
+      .range(from, from + PAGE - 1);
+    const { data, error } = res;
+    if (error) return { dates: null, error: describeError(httpStatusOf(res, error), error) };
+    if (!data || data.length === 0) break;
+    for (const r of data) if (holidayAppliesToOrigins(r.country, r.subdivision_code)) dates.add(r.date);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return { dates, error: null };
+}
+
 // ── Price snapshot: gzip-CSV history uploaded to Supabase Storage ─────────────
 // PURELY ADDITIVE. Runs AFTER all Supabase TABLE writes; never changes what/how we collect
 // or what we write to prices/offers/price_history. Any failure is logged and swallowed so a
@@ -1039,6 +1141,28 @@ async function main() {
   const { map: existingPrices, seen, alive, rowsRead } = await loadPriceBaseline();
   console.log(`Loaded ${rowsRead} existing price rows (baseline for change detection; ${existingPrices.size} route-months)`);
 
+  // ── Break windows (§break-windows): built ONCE, before the route walk, from public_holidays over
+  // the FULL 12-month collection horizon (a bridge's departure may sit in this job's month even if
+  // the holiday does not). No Travelpayouts requests — this only re-tags offers already fetched.
+  // If the table is EMPTY or UNAVAILABLE we collect exactly as before (no windows) and say so.
+  const horizonFromIso = isoDay(new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 1)));
+  const horizonToIso = isoDay(new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1 + HORIZON_MONTH_COUNT, 0)));
+  let breakWindowKeys = new Set();
+  let breakWindowCount = 0;
+  {
+    const { dates: holidayDates, error: hErr } = await loadHolidayDates(horizonFromIso, horizonToIso);
+    if (hErr) {
+      console.warn(`⚠ break windows OFF: public_holidays unavailable (${hErr}) — collecting as before, no holiday/weekend windows this run.`);
+    } else if (!holidayDates || holidayDates.size === 0) {
+      console.warn(`⚠ break windows OFF: public_holidays is EMPTY for ${horizonFromIso}…${horizonToIso} — collecting as before, no holiday/weekend windows this run.`);
+    } else {
+      const w = buildBreakWindows(holidayDates, horizonFromIso, horizonToIso);
+      breakWindowKeys = w.keySet;
+      breakWindowCount = w.count;
+      console.log(`Break windows: ${breakWindowCount} distinct (from ${holidayDates.size} applicable holiday dates + weekends, horizon ${horizonFromIso}…${horizonToIso})`);
+    }
+  }
+
   // Plan the run so we can print totals and a live ETA.
   //
   // ORDER IS SHUFFLED, deterministically, with the day number as the seed. The plan used to
@@ -1136,6 +1260,8 @@ async function main() {
   let offersWritten = 0;
   let offerWriteErrors = 0;
   let offersCollected = 0;    // valid offers parsed from the API (across all route-months)
+  let offersInBreakWindow = 0; // offers tagged in_break_window (§break-windows)
+  let offersBreakOnly = 0;     // …of which kept ONLY because of a window (not cheap/target)
   let okRouteMonths = 0;      // route-months where the API responded (for the avg metric)
   let offersDeleted = 0;      // stale rows pruned
   let offerDeleteErrors = 0;
@@ -1385,9 +1511,15 @@ async function main() {
           pricesUnchanged += 1;
         }
 
-        // COMBO selection → the offers buffer (cheap pool + one per distance target).
-        const combo = selectCombo(res.offers, origin, dest);
-        for (const o of combo) offerBuf.push(o);
+        // COMBO selection → the offers buffer (cheap pool + one per distance target + break windows).
+        const combo = selectCombo(res.offers, origin, dest, breakWindowKeys);
+        for (const o of combo) {
+          offerBuf.push(o);
+          if (o.in_break_window) {
+            offersInBreakWindow += 1;
+            if (!o.in_cheap_pool && o.target_nights == null) offersBreakOnly += 1;
+          }
+        }
         offersCollected += combo.length;
       } else {
         // Every attempt for this cell was a refusal or a client error (never an honest empty) →
@@ -1482,6 +1614,7 @@ async function main() {
   console.log(`Supabase price_history: ${historyWritten} rows written, ${historyWriteErrors} errors`);
   console.log(`Supabase offers: ${offersWritten} rows written, ${offerWriteErrors} errors`);
   console.log(`  offers collected: ${offersCollected}  ·  avg per route-month: ${avgOffers} (over ${okRouteMonths} answered route-months)`);
+  console.log(`  break windows: ${breakWindowCount} this horizon  ·  offers in a window: ${offersInBreakWindow} (of which ${offersBreakOnly} kept ONLY by the window rule)`);
   console.log(`  stale offers pruned: ${offersDeleted}  ·  prune errors: ${offerDeleteErrors}`);
   const lostTotal = lostBatches.prices + lostBatches.offers + lostBatches.history;
   const lostRows = priceWriteErrors + offerWriteErrors + historyWriteErrors;
