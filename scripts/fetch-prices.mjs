@@ -21,6 +21,7 @@ import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
 import { writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
@@ -32,7 +33,14 @@ const TP_TOKEN = process.env.TP_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-if (!TP_TOKEN || !SUPABASE_SERVICE_KEY) {
+// True only when this file is the process entry point (`node fetch-prices.mjs`), false when it is
+// imported by another module — a unit test importing selectCombo/targetSet, say. The secret check,
+// the Supabase client and the main() call below all gate on it, so an import runs NONE of the
+// collector's boot side effects (no env exit, no client, no live run) and can reach the pure
+// selection helpers directly.
+const IS_ENTRYPOINT = import.meta.url === pathToFileURL(process.argv[1] || '').href;
+
+if (IS_ENTRYPOINT && (!TP_TOKEN || !SUPABASE_SERVICE_KEY)) {
   console.error('ERROR: missing required env vars — nothing was requested.');
   if (!TP_TOKEN) console.error('  • TP_TOKEN (Travelpayouts API token) is not set.');
   if (!SUPABASE_SERVICE_KEY) console.error('  • SUPABASE_SERVICE_KEY (Supabase service-role key) is not set.');
@@ -60,11 +68,16 @@ const SERVICE_KEY_ROLE = keyRole(SUPABASE_SERVICE_KEY);
 // builds a RealtimeClient at createClient, which throws "native WebSocket not found" on
 // Node < 22; passing the `ws` package as the realtime transport satisfies that on ANY
 // Node version (the socket is never actually connected).
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-  realtime: { transport: WebSocket },
-});
-if (SERVICE_KEY_ROLE !== 'service_role') {
+// Only built with a key present (guaranteed when run as the entry point; skipped on a bare import
+// for tests, where createClient would otherwise throw "supabaseKey is required"). The selection
+// helpers never touch it, so null is fine off the collection path.
+const supabase = SUPABASE_SERVICE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { transport: WebSocket },
+  })
+  : null;
+if (SUPABASE_SERVICE_KEY && SERVICE_KEY_ROLE !== 'service_role') {
   console.warn(`WARNING: SUPABASE_SERVICE_KEY role = "${SERVICE_KEY_ROLE}" (expected "service_role") — writes will likely be denied.`);
 }
 
@@ -104,12 +117,12 @@ function haversineKm(a, b) {
 }
 function targetSet(origin, dest) {
   const oc = ORIGIN_COORDS[origin], dc = DEST_COORDS[dest];
-  if (!oc || !dc) return [5, 7, 10, 14]; // safe default if a coord is ever missing
+  if (!oc || !dc) return [5, 7, 10, 12, 14]; // safe default if a coord is ever missing
   const km = haversineKm(oc, dc);
   const stops = STOPS[dest] ?? 1;
-  if (km < 1500) return [3, 5, 7, 10, 14];
-  if (km <= 4000) return [5, 7, 10, 14];
-  return stops === 0 ? [5, 7, 10, 14] : [7, 10, 14];
+  if (km < 1500) return [3, 5, 7, 10, 12, 14];
+  if (km <= 4000) return [5, 7, 10, 12, 14];
+  return stops === 0 ? [5, 7, 10, 12, 14] : [7, 10, 12, 14];
 }
 // ── Break-window offers (§break-windows) ─────────────────────────────────────
 // On TOP of the cheap pool + duration targets, we also keep any ALREADY-FETCHED offer that lands on
@@ -143,16 +156,26 @@ function selectCombo(offers, origin, dest, breakKeys) {
   const chosen = new Map(); // `${departure_at}|${return_at}` → tagged offer
   const take = (o, patch) => {
     const k = `${o.departure_at}|${o.return_at}`;
-    const cur = chosen.get(k) || { ...o, in_cheap_pool: false, target_nights: null, in_break_window: false };
+    const cur = chosen.get(k)
+      || { ...o, in_cheap_pool: false, target_nights: null, target_exact: false, target_actual_nights: null, in_break_window: false };
     if (patch.cheap) cur.in_cheap_pool = true;
-    if (patch.target != null && cur.target_nights == null) cur.target_nights = patch.target;
+    // First target to claim an offer wins — set all three target fields together, once.
+    if (patch.target != null && cur.target_nights == null) {
+      cur.target_nights = patch.target;
+      cur.target_exact = patch.exact;
+      cur.target_actual_nights = patch.actual;
+    }
     if (patch.break) cur.in_break_window = true;
     chosen.set(k, cur);
   };
   for (const o of byPrice.slice(0, CHEAP_N)) take(o, { cheap: true });            // (a) cheap pool
   for (const t of targetSet(origin, dest)) {                                      // (b) per target
-    const best = byPrice.find((o) => Math.abs(o.nights - t) <= 1);
-    if (best) take(best, { target: t });
+    // Prefer an EXACT-length offer (cheapest, byPrice is ascending); fall back to the cheapest
+    // within ±1 night, tagged inexact with its real length; write nothing if neither exists.
+    const exact = byPrice.find((o) => o.nights === t);
+    if (exact) { take(exact, { target: t, exact: true, actual: null }); continue; }
+    const near = byPrice.find((o) => Math.abs(o.nights - t) <= 1);
+    if (near) take(near, { target: t, exact: false, actual: near.nights });
   }
   // (c) §break-windows: keep EVERY offer whose (departure, nights) is a holiday/weekend window.
   // Dedup is automatic — `chosen` is keyed by departure|return, so an offer already taken as cheap
@@ -1647,18 +1670,25 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error('Fatal error:', e);
-  // A job that died before uploadSnapshot ran has no artifact at all, and the watchdog cannot
-  // tell that apart from an upload-artifact step that silently did nothing. Leave the trace
-  // here so every job that got as far as starting node is accounted for. writeFileSync is
-  // synchronous, so it completes before the process.exit below.
-  if (!snapshotReportWritten) {
-    writeSnapshotReport({ scope: SCOPE, rows: 0, valid: false, uploaded: false, failures: ['job died before the snapshot was built'] });
-  }
-  // Printed on the way out too: a job that died mid-run has lost writes worth seeing, and
-  // "always present" is what makes the marker greppable across every job in the sweep.
-  // Exit code is untouched — this handler still fails the job exactly as before.
-  logWriteLossSummary();
-  process.exit(1);
-});
+// Pure selection helpers, exported for unit tests. Nothing here touches the network, the Supabase
+// client or any secret, so a test can import them without booting the collector (see IS_ENTRYPOINT).
+export { selectCombo, targetSet };
+
+// Run the collector ONLY when invoked directly (`node fetch-prices.mjs`), never on import.
+if (IS_ENTRYPOINT) {
+  main().catch((e) => {
+    console.error('Fatal error:', e);
+    // A job that died before uploadSnapshot ran has no artifact at all, and the watchdog cannot
+    // tell that apart from an upload-artifact step that silently did nothing. Leave the trace
+    // here so every job that got as far as starting node is accounted for. writeFileSync is
+    // synchronous, so it completes before the process.exit below.
+    if (!snapshotReportWritten) {
+      writeSnapshotReport({ scope: SCOPE, rows: 0, valid: false, uploaded: false, failures: ['job died before the snapshot was built'] });
+    }
+    // Printed on the way out too: a job that died mid-run has lost writes worth seeing, and
+    // "always present" is what makes the marker greppable across every job in the sweep.
+    // Exit code is untouched — this handler still fails the job exactly as before.
+    logWriteLossSummary();
+    process.exit(1);
+  });
+}
