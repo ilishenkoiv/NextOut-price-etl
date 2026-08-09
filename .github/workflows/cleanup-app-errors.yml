@@ -1,0 +1,56 @@
+name: Daily app_errors cleanup
+
+# Deletes crash / silent-failure reports from public.app_errors once they are older than
+# 90 days. This is its OWN workflow — deliberately NOT folded into the price collector
+# (fetch-prices.yml): the collector writes flight data under load, this only prunes one small
+# analytics table, and keeping them apart means neither can delay or break the other.
+#
+# The table may not exist yet (the migration is applied by hand, separately). The script below
+# treats a missing table as a clean no-op — it logs that the table is absent and exits 0, so a
+# run scheduled before the table lands does not turn the workflow red.
+#
+# SCHEDULE — deliberately clear of every other job in this repo:
+#   • price fetch, night sweep : '0 23 * * *' (23:00 UTC)
+#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
+#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
+#   • yearly holiday refresh     : '0 3 20 11 *' (20 Nov, 03:00 UTC)
+# This job runs daily at 07:00 UTC — a free hour, well away from both price sweeps.
+on:
+  schedule:
+    - cron: '0 7 * * *' # 07:00 UTC daily — free hour, clear of the 23:00 and 10:00 price sweeps
+  workflow_dispatch: # manual runs are always possible
+
+# Its OWN concurrency group — NOT the collector's 'price-fetch' group — so it neither queues
+# behind nor blocks a price run, and never shares a lock with the sweep.
+concurrency:
+  group: app-errors-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete app_errors older than 90 days
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Delete app_errors rows older than 90 days
+        # Same secret the collector uses — the service-role key writes/deletes past RLS.
+        # SUPABASE_URL passed alongside it (public, not a secret); default = the value used now.
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/cleanup-app-errors.mjs
