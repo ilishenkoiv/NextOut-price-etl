@@ -13,6 +13,11 @@ name: Carousel window prices
 # rows as it goes, so a crash loses only that part's in-flight batch, never what the others wrote.
 on:
   workflow_dispatch: # manual only; add a schedule later, after the supervised first run
+    inputs:
+      airport:
+        description: 'One home-airport IATA to collect, or "all" / blank for every airport'
+        required: false
+        default: 'MUC'
 
 # Its OWN concurrency group — NOT 'price-fetch' (main sweep) and NOT 'app-errors-cleanup' — so it
 # can never run at the same time as either and collide on the partner rate limit or the database.
@@ -31,7 +36,7 @@ jobs:
       fail-fast: false   # one airport failing must not cancel the rest
       max-parallel: 1    # strictly sequential — never two parts at once (shared partner rate limit)
       matrix:
-        airport: [BER, FRA, VIE, DUS, HAM, GVA, HHN, MUC, CGN, STR, ZRH, BTS, EIN, BSL, NRN, NUE, LEJ, FMM, DRS, SZG]
+        airport: ${{ (github.event.inputs.airport == '' || github.event.inputs.airport == 'all') && fromJSON('["BER","FRA","VIE","DUS","HAM","GVA","HHN","MUC","CGN","STR","ZRH","BTS","EIN","BSL","NRN","NUE","LEJ","FMM","DRS","SZG"]') || fromJSON(format('["{0}"]', github.event.inputs.airport)) }}
     name: Window prices — ${{ matrix.airport }}
     runs-on: ubuntu-latest
     timeout-minutes: 45  # headroom over the ~30-min target per part
