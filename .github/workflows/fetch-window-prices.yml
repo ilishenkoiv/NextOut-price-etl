@@ -1,0 +1,59 @@
+name: Carousel window prices
+
+# Separate price sweep for the carousel's break windows (holiday bridges across all regions +
+# ordinary Fri→Sun weekends, 6-month horizon), collecting BOTH flight variants (direct + any) on
+# each window's exact dates. Writes public.window_prices — NOT offers — so it never collides with
+# the main collector's data or its prune. Logic: scripts/fetch-window-prices.mjs.
+#
+# MANUAL ONLY — no schedule yet. The first run is done under supervision (workflow_dispatch).
+#
+# The sweep is split into 20 PARTS, one per home airport, ~30 min each. The parts run STRICTLY
+# SEQUENTIALLY (max-parallel: 1) so they never double the request rate against the partner, and
+# fail-fast: false means a part that fails does NOT cancel the others — each part upserts its own
+# rows as it goes, so a crash loses only that part's in-flight batch, never what the others wrote.
+on:
+  workflow_dispatch: # manual only; add a schedule later, after the supervised first run
+
+# Its OWN concurrency group — NOT 'price-fetch' (main sweep) and NOT 'app-errors-cleanup' — so it
+# can never run at the same time as either and collide on the partner rate limit or the database.
+concurrency:
+  group: window-prices
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    # One part per home airport. Airports mirror origin_regions.airport (20 codes); the script
+    # aborts if ORIGIN is not a known home airport, so a stale code fails loudly rather than silently.
+    strategy:
+      fail-fast: false   # one airport failing must not cancel the rest
+      max-parallel: 1    # strictly sequential — never two parts at once (shared partner rate limit)
+      matrix:
+        airport: [BER, FRA, VIE, DUS, HAM, GVA, HHN, MUC, CGN, STR, ZRH, BTS, EIN, BSL, NRN, NUE, LEJ, FMM, DRS, SZG]
+    name: Window prices — ${{ matrix.airport }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # headroom over the ~30-min target per part
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Collect window prices for ${{ matrix.airport }}
+        # TP_TOKEN + service-role key are the same secrets the main collector uses; SUPABASE_URL is
+        # public, passed alongside with the current default.
+        env:
+          ORIGIN: ${{ matrix.airport }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/fetch-window-prices.mjs
