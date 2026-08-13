@@ -21,8 +21,9 @@
 //     600/min → target 480/min → 125 ms. If a response header declares a lower limit, slow to 80%
 //     of THAT.
 //   • Log headers carrying the remaining quota (X-Rate-Limit-Remaining).
-//   • Partial result survives a crash: rows are upserted in batches as we go, and each airport part
-//     is an independent job — one part failing loses nothing already written by the others.
+//   • Partial result survives a crash: fares are flushed per destination (and whenever the buffer
+//     fills), and a window_price_progress row is written after each destination, so a crash loses at
+//     most the current destination's in-flight buffer. Each airport part is also an independent job.
 //
 // RUN (manual only — the workflow has no schedule):
 //   ORIGIN=FRA TP_TOKEN=... SUPABASE_SERVICE_KEY=... node scripts/fetch-window-prices.mjs
@@ -212,8 +213,9 @@ async function fetchWindowFare(dest, start, end, direct) {
   }
 }
 
-// ── batched upsert — partial result survives a crash (earlier batches are already committed) ──────
-const BATCH = 500;
+// ── batched upsert — flushed per destination (end of the dests loop) and whenever the buffer fills,
+// so a crash loses at most the current destination's in-flight buffer, not the whole airport ──────
+const BATCH = 25;
 let buffer = [];
 let written = 0;
 async function flush() {
@@ -230,6 +232,7 @@ async function flush() {
 
 // ── main ──────────────────────────────────────────────────────────────────────────────────────
 const today = berlinToday();
+const planDate = today; // planning date for THIS run — computed ONCE, used for every progress marker
 console.log(`Window price sweep — origin ${ORIGIN}, horizon ${HORIZON_MONTHS} months, today ${today}`);
 console.log(`Supabase: ${SUPABASE_URL}`);
 
@@ -271,6 +274,16 @@ for (let di = 0; di < dests.length; di += 1) {
       await sleep(intervalMs); // pace at 80% of allowed
     }
   }
+
+  // Destination fully swept: flush its fares FIRST, then record progress. flush() throws on a hard
+  // failure, which skips the marker below — so a re-run re-collects this destination rather than
+  // trusting a progress row with no prices behind it.
+  await flush();
+  const { error: progErr } = await supabase
+    .from('window_price_progress')
+    .upsert({ origin: ORIGIN, dest, plan_date: planDate, done_at: new Date().toISOString() },
+      { onConflict: 'origin,dest,plan_date' });
+  if (progErr) console.warn(`    progress upsert failed for ${ORIGIN}→${dest}: ${progErr.code || ''} ${progErr.message}`);
 }
 await flush();
 console.log(`Done. origin ${ORIGIN}: ${made} requests made, ${written} window fares written. Final quota remaining ${quota.remaining ?? '—'}/${quota.limit ?? '—'}.`);
