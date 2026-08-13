@@ -82,9 +82,9 @@ const nightsBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.
 const isWeekend = (iso) => { const w = dow(iso); return w === 0 || w === 6; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// "Today" in Europe/Berlin (the app anchors the horizon there), or PLAN_DATE if given.
+// "Today" in Europe/Berlin (the app anchors the horizon there). PLAN_DATE is resolved separately in
+// main() so the same value drives both the window set and the progress markers.
 function berlinToday() {
-  if (process.env.PLAN_DATE) return process.env.PLAN_DATE;
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' }); // 'YYYY-MM-DD'
 }
 
@@ -231,9 +231,15 @@ async function flush() {
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────────────────────
-const today = berlinToday();
-const planDate = today; // planning date for THIS run — computed ONCE, used for every progress marker
-console.log(`Window price sweep — origin ${ORIGIN}, horizon ${HORIZON_MONTHS} months, today ${today}`);
+// Planning date for THIS run: PLAN_DATE env if given (the workflow pins ONE date for the whole
+// matrix, so parts that cross midnight still plan the SAME window set), else today in Europe/Berlin.
+// Resolved ONCE and used for BOTH the window set and every progress marker.
+const planDate = (process.env.PLAN_DATE || '').trim() || berlinToday();
+if (!/^\d{4}-\d{2}-\d{2}$/.test(planDate)) {
+  console.error(`PLAN_DATE must be YYYY-MM-DD, got "${planDate}". Aborting.`);
+  process.exit(1);
+}
+console.log(`Window price sweep — origin ${ORIGIN}, horizon ${HORIZON_MONTHS} months, plan date ${planDate}`);
 console.log(`Supabase: ${SUPABASE_URL}`);
 
 const regionRows = await loadAll('origin_regions', 'airport,calendar_subdivision_code', ['airport']);
@@ -244,15 +250,29 @@ if (!regionRows.some((r) => r.airport === ORIGIN)) {
 }
 const holidays = await loadAll('public_holidays', 'country,subdivision_code,level,date',
   ['country', 'subdivision_code', 'date']);
-const windows = computeAllWindows(holidays, regions, today);
+const windows = computeAllWindows(holidays, regions, planDate);
 
 // This origin's catalogue destinations, from the prices table (distinct dest for this origin).
 const priceRows = await loadAll('prices', 'origin,dest,month', ['origin', 'dest', 'month'], (q) => q.eq('origin', ORIGIN));
-const dests = [...new Set(priceRows.map((r) => r.dest))].sort();
+const allDests = [...new Set(priceRows.map((r) => r.dest))].sort();
+
+// Resume: skip (origin, dest) pairs already marked done for THIS plan_date, so the workflow's
+// catch-up pass (and any part that hit the timeout) only collects the tail. Paginated read —
+// window_price_progress can exceed 1000 rows (20 origins × ~132 dests) and PostgREST caps at 1000.
+const doneRows = await loadAll('window_price_progress', 'origin,dest,plan_date',
+  ['origin', 'dest', 'plan_date'], (q) => q.eq('origin', ORIGIN).eq('plan_date', planDate));
+const doneDests = new Set(doneRows.map((r) => r.dest));
+const dests = allDests.filter((d) => !doneDests.has(d));
 
 const totalRequests = dests.length * windows.length * 2; // × two variants
-console.log(`Windows: ${windows.length} (holiday ${windows.filter((w) => w.kind === 'holiday').length}, weekend ${windows.filter((w) => w.kind === 'weekend').length}) · destinations: ${dests.length} · requests: ${totalRequests} (both variants) · pace ${intervalMs}ms ≈ ${Math.round(totalRequests * intervalMs / 60000)} min`);
-if (!dests.length || !windows.length) { console.log('Nothing to collect (no destinations or no windows). Done.'); process.exit(0); }
+console.log(`Destinations for ${ORIGIN}: ${allDests.length} total · ${doneDests.size} already collected (skipped) · ${dests.length} to do · plan ${planDate}`);
+console.log(`Windows: ${windows.length} (holiday ${windows.filter((w) => w.kind === 'holiday').length}, weekend ${windows.filter((w) => w.kind === 'weekend').length}) · requests: ${totalRequests} (both variants) · pace ${intervalMs}ms ≈ ${Math.round(totalRequests * intervalMs / 60000)} min`);
+if (!windows.length) { console.log('Nothing to collect — no windows in the horizon. Done.'); process.exit(0); }
+if (!dests.length) {
+  const why = allDests.length ? `all ${allDests.length} destinations already collected for plan ${planDate}` : 'no catalogue destinations for this origin';
+  console.log(`Nothing to do for ${ORIGIN} — ${why}. Done.`);
+  process.exit(0);
+}
 
 let made = 0;
 for (let di = 0; di < dests.length; di += 1) {

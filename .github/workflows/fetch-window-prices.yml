@@ -7,10 +7,16 @@ name: Carousel window prices
 #
 # MANUAL ONLY — no schedule yet. The first run is done under supervision (workflow_dispatch).
 #
-# The sweep is split into 20 PARTS, one per home airport, ~30 min each. The parts run STRICTLY
-# SEQUENTIALLY (max-parallel: 1) so they never double the request rate against the partner, and
-# fail-fast: false means a part that fails does NOT cancel the others — each part upserts its own
-# rows as it goes, so a crash loses only that part's in-flight batch, never what the others wrote.
+# The sweep is split into 20 PARTS, one per home airport. The parts run STRICTLY SEQUENTIALLY
+# (max-parallel: 1) so they never double the request rate against the partner, and fail-fast: false
+# means a part that fails does NOT cancel the others. Each part flushes fares per destination and
+# writes a window_price_progress marker, so a crash loses at most the current destination.
+#
+# ONE planning date (plan-date job) is pinned for the whole run and passed to every part as
+# PLAN_DATE — the run crosses midnight, so without this the parts would plan different window sets.
+# After the matrix, a single catch-up pass re-runs the same airports with the SAME PLAN_DATE:
+# already-collected destinations are skipped via window_price_progress, so only the tail (parts that
+# hit the timeout) is re-collected. One catch-up pass, not a loop.
 on:
   workflow_dispatch: # manual only; add a schedule later, after the supervised first run
     inputs:
@@ -29,9 +35,22 @@ permissions:
   contents: read
 
 jobs:
+  # Pin ONE planning date for the whole run. The 20 parts run sequentially and the run crosses
+  # midnight, so without a shared date each part would call berlinToday() at its own start and plan
+  # a different window set. Every part of BOTH passes receives this exact date via PLAN_DATE.
+  plan-date:
+    runs-on: ubuntu-latest
+    outputs:
+      date: ${{ steps.pick.outputs.date }}
+    steps:
+      - id: pick
+        name: Pick the Europe/Berlin calendar day
+        run: echo "date=$(TZ=Europe/Berlin date +%F)" >> "$GITHUB_OUTPUT"
+
   sweep:
-    # One part per home airport. Airports mirror origin_regions.airport (20 codes); the script
-    # aborts if ORIGIN is not a known home airport, so a stale code fails loudly rather than silently.
+    # First pass. One part per home airport. Airports mirror origin_regions.airport (20 codes); the
+    # script aborts if ORIGIN is not a known home airport, so a stale code fails loudly.
+    needs: plan-date
     strategy:
       fail-fast: false   # one airport failing must not cancel the rest
       max-parallel: 1    # strictly sequential — never two parts at once (shared partner rate limit)
@@ -39,7 +58,7 @@ jobs:
         airport: ${{ (github.event.inputs.airport == '' || github.event.inputs.airport == 'all') && fromJSON('["BER","FRA","VIE","DUS","HAM","GVA","HHN","MUC","CGN","STR","ZRH","BTS","EIN","BSL","NRN","NUE","LEJ","FMM","DRS","SZG"]') || fromJSON(format('["{0}"]', github.event.inputs.airport)) }}
     name: Window prices — ${{ matrix.airport }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # headroom over the ~30-min target per part
+    timeout-minutes: 90  # headroom for a full catalogue on a slow partner day
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -55,9 +74,47 @@ jobs:
 
       - name: Collect window prices for ${{ matrix.airport }}
         # TP_TOKEN + service-role key are the same secrets the main collector uses; SUPABASE_URL is
-        # public, passed alongside with the current default.
+        # public, passed alongside with the current default. PLAN_DATE pins the window set for the run.
         env:
           ORIGIN: ${{ matrix.airport }}
+          PLAN_DATE: ${{ needs.plan-date.outputs.date }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/fetch-window-prices.mjs
+
+  catch-up:
+    # Second and FINAL pass (not a loop). Same airports, SAME PLAN_DATE — destinations already
+    # collected in the first pass are skipped via window_price_progress, so only the tail (parts that
+    # hit the 90-min cap) is re-collected. Runs even if some first-pass parts failed (!cancelled()),
+    # as long as the planning date was pinned.
+    needs: [plan-date, sweep]
+    if: ${{ !cancelled() && needs['plan-date'].result == 'success' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        airport: ${{ (github.event.inputs.airport == '' || github.event.inputs.airport == 'all') && fromJSON('["BER","FRA","VIE","DUS","HAM","GVA","HHN","MUC","CGN","STR","ZRH","BTS","EIN","BSL","NRN","NUE","LEJ","FMM","DRS","SZG"]') || fromJSON(format('["{0}"]', github.event.inputs.airport)) }}
+    name: Window prices (catch-up) — ${{ matrix.airport }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Collect window prices for ${{ matrix.airport }}
+        env:
+          ORIGIN: ${{ matrix.airport }}
+          PLAN_DATE: ${{ needs.plan-date.outputs.date }}
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
