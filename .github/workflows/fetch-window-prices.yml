@@ -24,6 +24,16 @@ on:
         description: 'One home-airport IATA to collect, or "all" / blank for every airport'
         required: false
         default: 'MUC'
+      full_sweep:
+        description: 'Full catalogue pass? auto = monthly by date · on = force full · off = force narrow'
+        required: false
+        type: choice
+        default: 'auto'
+        options: [auto, 'on', 'off']
+      top_dests:
+        description: 'Destinations per airport in narrow mode (blank = default 50)'
+        required: false
+        default: ''
 
 # Its OWN concurrency group — NOT 'price-fetch' (main sweep) and NOT 'app-errors-cleanup' — so it
 # can never run at the same time as either and collide on the partner rate limit or the database.
@@ -81,6 +91,9 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+          # on/off force the sweep mode; auto (default) lets the script decide by plan-date.
+          FULL_SWEEP: ${{ github.event.inputs.full_sweep == 'on' && '1' || github.event.inputs.full_sweep == 'off' && '0' || '' }}
+          TOP_DESTS: ${{ github.event.inputs.top_dests }}
         run: node scripts/fetch-window-prices.mjs
 
   catch-up:
@@ -118,4 +131,7 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+          # on/off force the sweep mode; auto (default) lets the script decide by plan-date.
+          FULL_SWEEP: ${{ github.event.inputs.full_sweep == 'on' && '1' || github.event.inputs.full_sweep == 'off' && '0' || '' }}
+          TOP_DESTS: ${{ github.event.inputs.top_dests }}
         run: node scripts/fetch-window-prices.mjs
