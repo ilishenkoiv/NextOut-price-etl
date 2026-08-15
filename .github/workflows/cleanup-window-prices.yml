@@ -1,0 +1,64 @@
+name: Daily window_prices cleanup
+
+# Deletes carousel window fares from public.window_prices once their DEPARTURE has passed
+# (departure_at < today, Europe/Berlin) — a window that has already left can never be shown again.
+# Future and today's windows are never touched. This is its OWN workflow — deliberately NOT folded
+# into the window sweep (fetch-window-prices.yml) or the main collector (fetch-prices.yml): each
+# writes flight data under load, this only prunes past-dated rows, and keeping them apart means
+# neither can delay or break the other.
+#
+# The table may not exist yet (its migration is applied by hand, separately). The script treats a
+# missing table as a clean no-op — it logs that the table is absent and exits 0, so a run scheduled
+# before the table lands does not turn the workflow red.
+#
+# NO new migration is needed: 20260810120000_window_prices.sql already grants service_role DELETE
+# on the table (same key this job uses).
+#
+# SCHEDULE — deliberately clear of every other job in this repo:
+#   • price fetch, night sweep  : '0 23 * * *' (23:00 UTC)
+#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
+#   • app_errors cleanup        : '0 7 * * *'  (07:00 UTC)
+#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
+#   • yearly holiday refresh    : '0 3 20 11 *' (20 Nov, 03:00 UTC)
+#   • window sweep              : manual only (workflow_dispatch), no cron
+# This job runs daily at 06:00 UTC — a free hour, clear of both price sweeps and the 07:00 cleanup.
+on:
+  schedule:
+    - cron: '0 6 * * *' # 06:00 UTC daily — free hour, clear of the 23:00/10:00 sweeps and 07:00 cleanup
+  workflow_dispatch: # manual runs are always possible
+
+# Its OWN concurrency group — NOT the sweep's 'window-prices' and NOT 'price-fetch' — so it never
+# queues behind the long window sweep nor blocks it. Safe because the two act on disjoint date
+# ranges: this deletes only PAST departures, the sweep only writes FUTURE windows.
+concurrency:
+  group: window-prices-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete window_prices rows with a past departure date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Delete window_prices rows whose departure has passed
+        # Same secret the collectors use — the service-role key deletes past RLS.
+        # SUPABASE_URL passed alongside it (public, not a secret); default = the value used now.
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/cleanup-window-prices.mjs
