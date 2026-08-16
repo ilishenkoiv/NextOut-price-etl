@@ -101,6 +101,11 @@ function berlinToday() {
 const SHORT_SCHEMES = { 1: [[-3, 0]], 2: [[-4, 0]], 3: [[-1, 4], [-5, 0]], 4: [[-1, 3]], 5: [[-1, 2]], 0: [], 6: [] };
 const MIN_LEAD_DAYS = 10;
 const MAX_WINDOW_NIGHTS = 14;
+// §weekend-around — corridor windows AROUND ordinary weekends. Built ONLY for weekends whose Friday
+// sits within CORRIDOR_HORIZON_DAYS of the run date; farther weekends keep just their exact 'weekend'
+// window. A corridor trip is at most CORRIDOR_MAX_NIGHTS nights and MUST contain both weekend nights.
+const CORRIDOR_HORIZON_DAYS = 56; // eight weeks from the run date
+const CORRIDOR_MAX_NIGHTS = 7;    // a corridor trip is at most seven nights
 
 function buildBlocks(holidays) {
   const blocks = [];
@@ -122,8 +127,10 @@ function computeAllWindows(holidays, regions, today) {
   const minStart = addDays(today, MIN_LEAD_DAYS);
   const maxStart = addMonths(today, HORIZON_MONTHS);
   const chosen = new Map();
-  const add = (w) => {
-    if (w.start < minStart || w.start > maxStart) return;
+  // enforceLead=false lets a corridor departure sit up to four days before the (lead-valid) Friday
+  // without being trimmed by MIN_LEAD_DAYS; the ceiling + dedup still apply to every window.
+  const add = (w, { enforceLead = true } = {}) => {
+    if (enforceLead && (w.start < minStart || w.start > maxStart)) return;
     if (w.nights < 1 || w.nights > MAX_WINDOW_NIGHTS) return;
     const k = `${w.start}|${w.end}`;
     if (!chosen.has(k)) chosen.set(k, w);
@@ -149,6 +156,27 @@ function computeAllWindows(holidays, regions, today) {
   }
   for (let iso = minStart; iso <= maxStart; iso = addDays(iso, 1)) {
     if (dow(iso) === 5) add({ start: iso, end: addDays(iso, 2), nights: 2, kind: 'weekend' });
+  }
+  // §weekend-around — for each ordinary weekend within the corridor horizon, build every trip that
+  // CONTAINS both weekend nights (Fri & Sat): departure in [Fri-4 … Fri], return in [Sun … Sun+4],
+  // length ≤ CORRIDOR_MAX_NIGHTS. That is 19 date-pairs; the exact Fri→Sun (2n) is already the
+  // 'weekend' window and is skipped here, so each eligible weekend contributes 18 corridor windows.
+  // Capped at maxStart too, so a corridor weekend always has its exact window even under a short
+  // HORIZON_MONTHS override.
+  const corridorMax = addDays(today, CORRIDOR_HORIZON_DAYS);
+  const corridorEnd = corridorMax < maxStart ? corridorMax : maxStart;
+  for (let fri = minStart; fri <= corridorEnd; fri = addDays(fri, 1)) {
+    if (dow(fri) !== 5) continue;
+    for (let dep = -4; dep <= 0; dep += 1) {
+      for (let ret = 2; ret <= 6; ret += 1) {
+        if (dep === 0 && ret === 2) continue; // the exact Fri→Sun weekend — never duplicated here
+        const start = addDays(fri, dep);
+        const end = addDays(fri, ret);
+        const nights = nightsBetween(start, end);
+        if (nights > CORRIDOR_MAX_NIGHTS) continue; // both weekend nights sit inside by construction
+        add({ start, end, nights, kind: 'weekend_around' }, { enforceLead: false });
+      }
+    }
   }
   return [...chosen.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
 }
@@ -316,7 +344,7 @@ const dests = selectedDests.filter((d) => !doneDests.has(d));
 
 const totalRequests = dests.length * windows.length * 2; // × two variants
 console.log(`Destinations for ${ORIGIN}: ${selectedDests.length} selected · ${doneDests.size} already collected (skipped) · ${dests.length} to do · plan ${planDate}`);
-console.log(`Windows: ${windows.length} (holiday ${windows.filter((w) => w.kind === 'holiday').length}, weekend ${windows.filter((w) => w.kind === 'weekend').length}) · requests: ${totalRequests} (both variants) · pace ${intervalMs}ms ≈ ${Math.round(totalRequests * intervalMs / 60000)} min`);
+console.log(`Windows: ${windows.length} (holiday ${windows.filter((w) => w.kind === 'holiday').length}, weekend ${windows.filter((w) => w.kind === 'weekend').length}, weekend_around ${windows.filter((w) => w.kind === 'weekend_around').length}) · requests: ${totalRequests} (both variants) · pace ${intervalMs}ms ≈ ${Math.round(totalRequests * intervalMs / 60000)} min`);
 if (!windows.length) { console.log('Nothing to collect — no windows in the horizon. Done.'); process.exit(0); }
 if (!dests.length) {
   const why = selectedDests.length ? `all ${selectedDests.length} selected destinations already collected for plan ${planDate}` : 'no catalogue destinations for this origin';
