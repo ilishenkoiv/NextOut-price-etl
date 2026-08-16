@@ -364,6 +364,7 @@ for (let di = 0; di < dests.length; di += 1) {
         buffer.push({
           origin: ORIGIN, dest, flight_type: direct ? 'direct' : 'any',
           departure_at: w.start, return_at: w.end, nights: w.nights,
+          window_kind: w.kind, // 'weekend' | 'weekend_around' | 'holiday' — the window that produced this fare
           price: fare.price, transfers: fare.transfers, airline: fare.airline,
           updated_at: new Date().toISOString(),
         });
