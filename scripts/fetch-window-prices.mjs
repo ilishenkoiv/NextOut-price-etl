@@ -106,6 +106,11 @@ const MAX_WINDOW_NIGHTS = 14;
 // window. A corridor trip is at most CORRIDOR_MAX_NIGHTS nights and MUST contain both weekend nights.
 const CORRIDOR_HORIZON_DAYS = 56; // eight weeks from the run date
 const CORRIDOR_MAX_NIGHTS = 7;    // a corridor trip is at most seven nights
+// §weekend-around is DEFERRED — NOT in this release. The corridor-building block below is kept intact
+// for a future turn-on; this flag only gates whether computeAllWindows actually EMITS those windows.
+// Default OFF, so the ordinary sweep builds exactly the pre-corridor set (weekend ∪ holiday). Turn on
+// with WEEKEND_AROUND=1. (window_kind is still stamped on the weekend/holiday rows — see the upsert.)
+const WEEKEND_AROUND_ENABLED = (process.env.WEEKEND_AROUND || '').trim() === '1';
 
 function buildBlocks(holidays) {
   const blocks = [];
@@ -163,18 +168,22 @@ function computeAllWindows(holidays, regions, today) {
   // 'weekend' window and is skipped here, so each eligible weekend contributes 18 corridor windows.
   // Capped at maxStart too, so a corridor weekend always has its exact window even under a short
   // HORIZON_MONTHS override.
-  const corridorMax = addDays(today, CORRIDOR_HORIZON_DAYS);
-  const corridorEnd = corridorMax < maxStart ? corridorMax : maxStart;
-  for (let fri = minStart; fri <= corridorEnd; fri = addDays(fri, 1)) {
-    if (dow(fri) !== 5) continue;
-    for (let dep = -4; dep <= 0; dep += 1) {
-      for (let ret = 2; ret <= 6; ret += 1) {
-        if (dep === 0 && ret === 2) continue; // the exact Fri→Sun weekend — never duplicated here
-        const start = addDays(fri, dep);
-        const end = addDays(fri, ret);
-        const nights = nightsBetween(start, end);
-        if (nights > CORRIDOR_MAX_NIGHTS) continue; // both weekend nights sit inside by construction
-        add({ start, end, nights, kind: 'weekend_around' }, { enforceLead: false });
+  // DEFERRED: gated behind WEEKEND_AROUND_ENABLED (default OFF). The block stays for a future turn-on;
+  // with the flag off it never runs, so the emitted set is exactly weekend ∪ holiday.
+  if (WEEKEND_AROUND_ENABLED) {
+    const corridorMax = addDays(today, CORRIDOR_HORIZON_DAYS);
+    const corridorEnd = corridorMax < maxStart ? corridorMax : maxStart;
+    for (let fri = minStart; fri <= corridorEnd; fri = addDays(fri, 1)) {
+      if (dow(fri) !== 5) continue;
+      for (let dep = -4; dep <= 0; dep += 1) {
+        for (let ret = 2; ret <= 6; ret += 1) {
+          if (dep === 0 && ret === 2) continue; // the exact Fri→Sun weekend — never duplicated here
+          const start = addDays(fri, dep);
+          const end = addDays(fri, ret);
+          const nights = nightsBetween(start, end);
+          if (nights > CORRIDOR_MAX_NIGHTS) continue; // both weekend nights sit inside by construction
+          add({ start, end, nights, kind: 'weekend_around' }, { enforceLead: false });
+        }
       }
     }
   }
