@@ -17,6 +17,10 @@
 //   public.window_prices (migration 20260810120000_window_prices.sql) — its OWN table, so it never
 //   collides with the main collector's offers/prune. One row per (origin, dest, flight_type,
 //   departure_at, return_at): the cheapest real fare for those exact dates.
+//   public.window_price_misses (migration 20260818120000_window_price_misses.sql) — the mirror log of
+//   probes that stored NO fare ('empty' | 'http_error' | 'network_error'), on the SAME 5-part key.
+//   Upserted on a miss (last outcome wins, never piled up); DELETED for a key the instant a real fare
+//   lands, so a stale "no fare" mark never lingers. window_prices is still left untouched on a miss.
 //
 // RULES THAT MUST HOLD
 //   • NEVER overwrite a known price with an empty answer — a refusal / error / empty response writes
@@ -223,7 +227,12 @@ function quotaHeader(prefix) {
   console.log(`── ${prefix} · quota remaining ${quota.remaining ?? '—'}/${quota.limit ?? '—'} · reset ${quota.reset ?? '—'} · pace ${intervalMs}ms`);
 }
 
-// ── one exact-date query, one variant. Returns the cheapest matching fare or null (NEVER writes) ──
+// ── one exact-date query, one variant. Returns { fare, outcome, detail } and NEVER writes:
+//   • fare set, outcome null       — cheapest matching offer on the exact dates;
+//   • fare null, outcome 'empty'   — HTTP 200 + success, but no offer on the exact dates (detail '');
+//   • fare null, outcome 'http_error'   — non-2xx, unparseable body, or success=false (detail carries it);
+//   • fare null, outcome 'network_error'— the request never completed / timed out (detail carries it).
+// The caller decides what to persist; on any non-fare outcome window_prices is left untouched.
 const TIMEOUT_MS = 8000;
 async function fetchWindowFare(dest, start, end, direct) {
   const url =
@@ -235,9 +244,26 @@ async function fetchWindowFare(dest, start, end, direct) {
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
     noteRateHeaders(res.headers);
-    if (!res.ok) { console.warn(`    HTTP ${res.status} on ${ORIGIN}→${dest} ${start}→${end} (${direct ? 'direct' : 'any'})`); return null; }
-    let body; try { body = await res.json(); } catch { console.warn(`    unparseable 200 on ${ORIGIN}→${dest}`); return null; }
-    if (!body.success || !Array.isArray(body.data)) return null;
+    if (!res.ok) {
+      const detail = `HTTP ${res.status}`;
+      console.warn(`    ${detail} on ${ORIGIN}→${dest} ${start}→${end} (${direct ? 'direct' : 'any'})`);
+      return { fare: null, outcome: 'http_error', detail };
+    }
+    let body;
+    try { body = await res.json(); }
+    catch (e) {
+      const detail = `unparseable 200: ${e.message}`;
+      console.warn(`    ${detail} on ${ORIGIN}→${dest}`);
+      return { fare: null, outcome: 'http_error', detail };
+    }
+    if (!body.success) {
+      // 2xx but the API refused the request (bad param, throttle, …). Diagnostically an error, so we
+      // log it as http_error with the reason rather than a silent 'empty'.
+      const detail = `success=false${body.error ? `: ${body.error}` : ''}`;
+      console.warn(`    ${detail} on ${ORIGIN}→${dest}`);
+      return { fare: null, outcome: 'http_error', detail };
+    }
+    if (!Array.isArray(body.data)) return { fare: null, outcome: 'empty', detail: '' };
     // Keep ONLY offers on the EXACT window dates, price>0; take the cheapest.
     let best = null;
     for (const x of body.data) {
@@ -249,29 +275,76 @@ async function fetchWindowFare(dest, start, end, direct) {
         best = { price, transfers: Number.isFinite(x.transfers) ? Math.trunc(x.transfers) : 0, airline: typeof x.airline === 'string' ? x.airline : null };
       }
     }
-    return best; // null = no fare on these exact dates → nothing to write (keep any prior row)
+    if (best) return { fare: best, outcome: null, detail: '' };
+    return { fare: null, outcome: 'empty', detail: '' }; // 200 + success, nothing on these exact dates
   } catch (e) {
-    console.warn(`    connection failed on ${ORIGIN}→${dest}: ${e.message}`);
-    return null;
+    const detail = e.name === 'AbortError' ? `timeout after ${TIMEOUT_MS}ms` : e.message;
+    console.warn(`    connection failed on ${ORIGIN}→${dest}: ${detail}`);
+    return { fare: null, outcome: 'network_error', detail };
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ── batched upsert — flushed per destination (end of the dests loop) and whenever the buffer fills,
-// so a crash loses at most the current destination's in-flight buffer, not the whole airport ──────
+// ── shared batched-upsert retry — used by BOTH the price and the miss log so they persist by the SAME
+// logic (only the back-off list differs). Makes `delays.length + 1` attempts: try, and on failure wait
+// delays[i] before the next try, throwing only after the final attempt. Returns the row count on
+// success. Prices pass [1000, 2000] — 3 attempts, 1 s / 2 s — the pre-existing behaviour, UNCHANGED.
+const WP_CONFLICT = 'origin,dest,flight_type,departure_at,return_at';
+async function upsertWithRetry(table, rows, delays) {
+  const maxAttempts = delays.length + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { error } = await supabase.from(table).upsert(rows, { onConflict: WP_CONFLICT });
+    if (!error) return rows.length;
+    console.warn(`    ${table} upsert attempt ${attempt}/${maxAttempts} failed: ${error.code || ''} ${error.message}`);
+    if (attempt === maxAttempts) throw new Error(`${table} upsert failed after ${maxAttempts} attempts: ${error.message}`);
+    await sleep(delays[attempt - 1]);
+  }
+}
+
+// ── window_prices buffer — flushed per destination (end of the dests loop) and whenever the buffer
+// fills, so a crash loses at most the current destination's in-flight buffer, not the whole airport ─
 const BATCH = 25;
 let buffer = [];
 let written = 0;
 async function flush() {
   if (!buffer.length) return;
   const rows = buffer; buffer = [];
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const { error } = await supabase.from('window_prices').upsert(rows, { onConflict: 'origin,dest,flight_type,departure_at,return_at' });
-    if (!error) { written += rows.length; return; }
-    console.warn(`    upsert attempt ${attempt} failed: ${error.code || ''} ${error.message}`);
-    if (attempt === 3) throw new Error(`window_prices upsert failed after 3 attempts: ${error.message}`);
-    await sleep(1000 * attempt);
+  written += await upsertWithRetry('window_prices', rows, [1000, 2000]);
+}
+
+// ── window_price_misses buffer — probes that stored NO fare. Same key, same batching as prices. The
+// last outcome per key wins (upsert), so a re-probe overwrites rather than piling up. Longer back-off
+// (2 s / 5 s / 15 s) than prices: this log is diagnostic, not on the app's read path.
+const MISS_BATCH = 25;
+let missBuffer = [];
+let missWritten = 0;
+const missCounts = { empty: 0, http_error: 0, network_error: 0 };
+async function flushMisses() {
+  if (!missBuffer.length) return;
+  const rows = missBuffer; missBuffer = [];
+  missWritten += await upsertWithRetry('window_price_misses', rows, [2000, 5000, 15000]);
+}
+
+// ── stale-miss cleanup — when a real fare lands for a key, any miss row left by an EARLIER run must go
+// or it keeps claiming "no fare". Deletes are batched by the same key; origin is constant (ORIGIN),
+// each row pinned by dest+flight_type+dates via .or(). A delete failure only WARNS (never throws): the
+// price is already safely written, and the mark is corrected on the next successful run.
+let deleteBuffer = [];
+async function flushFoundDeletes() {
+  if (!deleteBuffer.length) return;
+  const rows = deleteBuffer; deleteBuffer = [];
+  const clauses = rows
+    .map((r) => `and(dest.eq.${r.dest},flight_type.eq.${r.flight_type},departure_at.eq.${r.departure_at},return_at.eq.${r.return_at})`)
+    .join(',');
+  const delays = [2000, 5000, 15000];
+  const maxAttempts = delays.length + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { error } = await supabase.from('window_price_misses').delete().eq('origin', ORIGIN).or(clauses);
+    if (!error) return;
+    console.warn(`    window_price_misses delete attempt ${attempt}/${maxAttempts} failed: ${error.code || ''} ${error.message}`);
+    if (attempt === maxAttempts) { console.warn(`    giving up on stale-miss cleanup for ${rows.length} keys (prices already written)`); return; }
+    await sleep(delays[attempt - 1]);
   }
 }
 
@@ -367,26 +440,43 @@ for (let di = 0; di < dests.length; di += 1) {
   quotaHeader(`${ORIGIN}→${dest} (${di + 1}/${dests.length})`); // §log header carrying remaining quota
   for (const w of windows) {
     for (const direct of [true, false]) {
-      const fare = await fetchWindowFare(dest, w.start, w.end, direct);
+      const flightType = direct ? 'direct' : 'any';
+      const { fare, outcome, detail } = await fetchWindowFare(dest, w.start, w.end, direct);
       made += 1;
       if (fare) {
         buffer.push({
-          origin: ORIGIN, dest, flight_type: direct ? 'direct' : 'any',
+          origin: ORIGIN, dest, flight_type: flightType,
           departure_at: w.start, return_at: w.end, nights: w.nights,
           window_kind: w.kind, // 'weekend' | 'weekend_around' | 'holiday' — the window that produced this fare
           price: fare.price, transfers: fare.transfers, airline: fare.airline,
           updated_at: new Date().toISOString(),
         });
+        // A real fare supersedes any earlier "no fare" mark for this EXACT key — drop it from the miss log.
+        deleteBuffer.push({ dest, flight_type: flightType, departure_at: w.start, return_at: w.end });
         if (buffer.length >= BATCH) await flush(); // commit early so a crash cannot lose it
+        if (deleteBuffer.length >= BATCH) await flushFoundDeletes();
+      } else {
+        // No storable price → record WHY, WITHOUT touching window_prices, so a previously collected
+        // fare is NEVER overwritten by an empty/error answer (the table's core rule).
+        missCounts[outcome] += 1;
+        missBuffer.push({
+          origin: ORIGIN, dest, flight_type: flightType,
+          departure_at: w.start, return_at: w.end,
+          window_kind: w.kind, outcome, detail: detail || '',
+          checked_at: new Date().toISOString(),
+        });
+        if (missBuffer.length >= MISS_BATCH) await flushMisses();
       }
       await sleep(intervalMs); // pace at 80% of allowed
     }
   }
 
-  // Destination fully swept: flush its fares FIRST, then record progress. flush() throws on a hard
-  // failure, which skips the marker below — so a re-run re-collects this destination rather than
-  // trusting a progress row with no prices behind it.
+  // Destination fully swept: flush fares, misses and stale-miss deletes FIRST, then record progress.
+  // flush()/flushMisses() throw on a hard failure, which skips the marker below — so a re-run
+  // re-collects this destination rather than trusting a progress row with no data behind it.
   await flush();
+  await flushMisses();
+  await flushFoundDeletes();
   const { error: progErr } = await supabase
     .from('window_price_progress')
     .upsert({ origin: ORIGIN, dest, plan_date: planDate, done_at: new Date().toISOString() },
@@ -394,4 +484,6 @@ for (let di = 0; di < dests.length; di += 1) {
   if (progErr) console.warn(`    progress upsert failed for ${ORIGIN}→${dest}: ${progErr.code || ''} ${progErr.message}`);
 }
 await flush();
-console.log(`Done. origin ${ORIGIN}: ${made} requests made, ${written} window fares written. Final quota remaining ${quota.remaining ?? '—'}/${quota.limit ?? '—'}.`);
+await flushMisses();
+await flushFoundDeletes();
+console.log(`Done. origin ${ORIGIN}: ${made} requests made, ${written} window fares written, ${missWritten} misses logged (empty ${missCounts.empty}, http_error ${missCounts.http_error}, network_error ${missCounts.network_error}). Final quota remaining ${quota.remaining ?? '—'}/${quota.limit ?? '—'}.`);
