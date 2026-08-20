@@ -20,7 +20,7 @@ name: Daily window_prices cleanup
 #   • app_errors cleanup        : '0 7 * * *'  (07:00 UTC)
 #   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
 #   • yearly holiday refresh    : '0 3 20 11 *' (20 Nov, 03:00 UTC)
-#   • window sweep              : manual only (workflow_dispatch), no cron
+#   • window sweep              : '0 1 * * *' and '0 13 * * *' (01:00 / 13:00 UTC) + manual (workflow_dispatch)
 # This job runs daily at 06:00 UTC — a free hour, clear of both price sweeps and the 07:00 cleanup.
 on:
   schedule:
