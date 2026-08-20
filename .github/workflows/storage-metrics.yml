@@ -1,0 +1,60 @@
+name: Daily storage metrics
+
+# Appends ONE storage-usage measurement per day to public.storage_metrics: every public table's row
+# count + bytes, the whole database size, and the price-snapshots Storage bucket (objects + bytes).
+# Old rows are never touched — the table is a history so growth stays visible. The counting is done by
+# the SECURITY DEFINER function collect_storage_metrics(); this job just calls it via
+# scripts/collect-storage-metrics.mjs. Nothing here is exposed to the app or the anon key.
+#
+# The table + function are applied by hand (migration 20260820120000_storage_metrics.sql). Until then
+# the script no-ops (logs "not applied yet", exits 0), so a run scheduled before the migration lands
+# does not turn the workflow red.
+#
+# SCHEDULE — after the nightly collection, and clear of every other job in this repo:
+#   • price fetch, night sweep  : '0 23 * * *' (23:00 UTC) — the main nightly write
+#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
+#   • window sweep              : '0 1 * * *' and '0 13 * * *' (01:00 / 13:00 UTC)
+#   • window_prices cleanup     : '0 6 * * *'  (06:00 UTC)
+#   • app_errors cleanup        : '0 7 * * *'  (07:00 UTC)
+#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
+# This job runs daily at 08:00 UTC — a free hour, AFTER the nightly sweep has written and AFTER both
+# cleanups have pruned, so the numbers reflect the day's settled, post-cleanup state.
+on:
+  schedule:
+    - cron: '0 8 * * *' # 08:00 UTC daily — after the nightly sweep and the 06:00/07:00 cleanups
+  workflow_dispatch: # manual runs are always possible
+
+# Its OWN concurrency group — read-only against the data, one tiny insert — so it neither queues
+# behind nor blocks any collector or cleanup.
+concurrency:
+  group: storage-metrics
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Append one storage-usage measurement
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Measure storage usage and append a row
+        # Same secret every other job uses — the service-role key. It is the ONLY way to execute the
+        # collector function and read/write the closed table. SUPABASE_URL is public (not a secret).
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/collect-storage-metrics.mjs
