@@ -9,7 +9,7 @@ no scoring, no UI.
 | Concern | Tool |
 | --- | --- |
 | Runtime | Node.js 22, ES modules |
-| Source API | Travelpayouts |
+| Source API | External flight-data provider |
 | Storage | Supabase (Postgres) via `@supabase/supabase-js` |
 | Scheduling | GitHub Actions |
 | Tests | `node --test` |
