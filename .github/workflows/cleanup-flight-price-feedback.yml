@@ -1,0 +1,36 @@
+name: Daily flight price feedback cleanup
+
+# Deletes raw booking/price-accuracy feedback after 365 days. Missing table = successful no-op,
+# so this workflow can land before the app migration is enabled in production.
+on:
+  schedule:
+    - cron: '0 9 * * *' # 09:00 UTC, clear of price sweeps and other maintenance jobs
+  workflow_dispatch:
+
+concurrency:
+  group: flight-price-feedback-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete flight feedback older than 365 days
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Delete old flight feedback
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/cleanup-flight-price-feedback.mjs

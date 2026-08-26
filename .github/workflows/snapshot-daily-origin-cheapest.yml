@@ -1,0 +1,30 @@
+name: Daily cheapest offers snapshot
+
+on:
+  schedule:
+    - cron: '30 20 * * *' # 22:30 Berlin summer; after the noon near-horizon sweep
+  workflow_dispatch:
+
+concurrency:
+  group: daily-origin-cheapest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Save daily cheapest real offer per origin
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/snapshot-daily-origin-cheapest.mjs
