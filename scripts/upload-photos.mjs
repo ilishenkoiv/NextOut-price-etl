@@ -85,7 +85,7 @@ if (SERVICE_KEY_ROLE !== 'service_role') {
 async function reportCoverage() {
   // PostgREST caps ONE response at 1000 rows and reports nothing when it truncates: `error`
   // is null and the array is simply short. This table is ~669 rows today and its ceiling is
-  // 132 destinations x 8 photos = 1056 — past the cap — so paging is required, not defensive.
+  // 139 destinations x 8 photos = 1112 — past the cap — so paging is required, not defensive.
   // .order() is what makes paging stable: without ORDER BY, Postgres gives no guarantee that
   // page 2 resumes where page 1 stopped, and a row can repeat or vanish. A miscount here
   // would report a covered destination as missing, which is exactly the lie this block exists

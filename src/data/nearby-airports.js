@@ -27,6 +27,8 @@ export const NEARBY_AIRPORTS = {
   GVA: [],
   BSL: [],
   SZG: [],
+  AMS: [],
+  LHR: [],
 
   // ── Low-cost bases: they ARE the alternatives, so no onward suggestion ───────
   NUE: [],
@@ -35,4 +37,6 @@ export const NEARBY_AIRPORTS = {
   NRN: [],
   BTS: [],
   EIN: [],
+  DRS: [],
+  LEJ: [],
 };

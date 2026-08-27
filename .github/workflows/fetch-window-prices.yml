@@ -24,8 +24,9 @@ on:
   # NOTE: cron is fixed to UTC — it does NOT follow DST. In WINTER (CET, UTC+1) these fire at 02:00
   # and 14:00 German time, i.e. one hour earlier locally; still comfortably before the 06:00/18:00 reads.
   schedule:
-    - cron: '0 1 * * *'
-    - cron: '0 13 * * *'
+    # Avoid :00 — scheduled Actions are most delayed at the start of an hour.
+    - cron: '7 1 * * *'
+    - cron: '7 13 * * *'
   workflow_dispatch: # keep manual runs too (supervised / ad-hoc), alongside the schedule above
     inputs:
       airport:

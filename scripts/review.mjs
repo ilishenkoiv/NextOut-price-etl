@@ -10,7 +10,9 @@
 // No server, no build step, no dependencies — just open the file. Images are referenced by
 // relative path ({IATA}/{file}), so keep review.html inside photos/ next to the folders.
 //
-//   node scripts/review.mjs      → writes photos/review.html
+//   node scripts/review.mjs      → writes photos/review.html for the full catalogue
+//   node scripts/review.mjs --only=BER,MUC  → focused owner review; saved output still preserves
+//                                             every previously curated city
 //   then open photos/review.html in a browser.
 
 import { readFile, writeFile } from 'node:fs/promises';
@@ -24,6 +26,10 @@ const FLAGS_PATH = path.join(PHOTOS_DIR, 'flags.json');
 const AUTO_PATH = path.join(PHOTOS_DIR, 'auto-selected.json');
 const SELECTED_PATH = path.join(PHOTOS_DIR, 'selected.json');
 const OUT_PATH = path.join(PHOTOS_DIR, 'review.html');
+const onlyArg = process.argv.find((arg) => arg.startsWith('--only='));
+const only = onlyArg
+  ? new Set(onlyArg.slice('--only='.length).split(',').map((iata) => iata.trim().toUpperCase()).filter(Boolean))
+  : null;
 
 async function loadJson(p) {
   try {
@@ -88,8 +94,15 @@ async function main() {
   const savedCities = Object.keys(selectedSaved).length;
   const autoOnly = Object.keys(preload).length - savedCities;
   const flaggedCount = Object.values(flags).reduce((n, city) => n + Object.keys(city).length, 0);
-  const entries = Object.values(manifest).sort((a, b) => a.city.localeCompare(b.city));
+  const entries = Object.values(manifest)
+    .filter((entry) => !only || only.has(entry.iata))
+    .sort((a, b) => a.city.localeCompare(b.city));
+  if (only && entries.length !== only.size) {
+    const found = new Set(entries.map((entry) => entry.iata));
+    throw new Error(`Missing requested cities in manifest: ${[...only].filter((iata) => !found.has(iata)).join(', ')}`);
+  }
   const totalCities = entries.length;
+  const reviewIatas = entries.map((entry) => entry.iata);
   const blocks = entries.map((e) => cityBlock(e, flags[e.iata] || {})).join('\n');
 
   const html = `<!doctype html>
@@ -166,6 +179,7 @@ ${blocks}
   // Cities you never touch keep these; editing a city replaces just that city's array.
   // "Save selection" writes the whole merged object back to selected.json.
   const PRELOAD = ${JSON.stringify(preload)};
+  const REVIEW_IATAS = new Set(${JSON.stringify(reviewIatas)});
   const sel = {};
   for (const [iata, files] of Object.entries(PRELOAD)) sel[iata] = files.slice();
 
@@ -190,7 +204,7 @@ ${blocks}
   }
 
   function refreshProgress() {
-    const done = Object.values(sel).filter((a) => a.length === TARGET).length;
+    const done = Object.entries(sel).filter(([iata, files]) => REVIEW_IATAS.has(iata) && files.length === TARGET).length;
     const total = ${totalCities};
     document.getElementById('progress').textContent = done + ' / ' + total + ' cities done';
   }

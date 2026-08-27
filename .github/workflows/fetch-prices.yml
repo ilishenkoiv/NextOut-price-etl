@@ -23,8 +23,9 @@ name: Twice-daily price fetch
 
 on:
   schedule:
-    - cron: '0 23 * * *'   # 01:00 Berlin (CEST) — full 12-month sweep, all twelve jobs
-    - cron: '0 10 * * *'   # 12:00 Berlin (CEST) — near months 1–6 only (first six jobs)
+    # Avoid :00: GitHub documents start-of-hour load as a source of schedule delays/drops.
+    - cron: '17 23 * * *'  # 01:17 Berlin (CEST) — full 12-month sweep, all twelve jobs
+    - cron: '17 10 * * *'  # 12:17 Berlin (CEST) — near months 1–6 only (first six jobs)
   workflow_dispatch:
     inputs:
       scope:

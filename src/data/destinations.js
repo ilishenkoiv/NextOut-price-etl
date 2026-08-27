@@ -156,4 +156,13 @@ export const DESTINATIONS = [
   // ── Central Asia
   { iata: 'TAS', stops: 1, bestMonths: [4, 5, 6, 9, 10] },
   { iata: 'ALA', stops: 1, bestMonths: [5, 6, 7, 8, 9] },
+
+  // ── Germany: domestic city breaks; targetsFor() excludes origin === destination ──
+  { iata: 'BER', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'MUC', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'FRA', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'DUS', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'HAM', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'STR', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
+  { iata: 'CGN', stops: 0, bestMonths: [4, 5, 6, 7, 8, 9, 10, 12] },
 ];

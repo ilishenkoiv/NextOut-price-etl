@@ -418,7 +418,7 @@ console.log(`Selection [${sweepMode}]: catalogue ${allDests.length} → asking $
 
 // Resume: skip (origin, dest) pairs already marked done for THIS plan_date, so the workflow's
 // catch-up pass (and any part that hit the timeout) only collects the tail. Paginated read —
-// window_price_progress can exceed 1000 rows (20 origins × ~132 dests) and PostgREST caps at 1000.
+// window_price_progress can exceed 1000 rows (22 origins × ~139 dests) and PostgREST caps at 1000.
 const doneRows = await loadAll('window_price_progress', 'origin,dest,plan_date',
   ['origin', 'dest', 'plan_date'], (q) => q.eq('origin', ORIGIN).eq('plan_date', planDate));
 const doneDests = new Set(doneRows.map((r) => r.dest));

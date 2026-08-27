@@ -2,7 +2,9 @@ name: Daily cheapest offers snapshot
 
 on:
   schedule:
-    - cron: '30 20 * * *' # 22:30 Berlin summer; after the noon near-horizon sweep
+    # Two daily result epochs: after the full night sweep and after the near-month daytime sweep.
+    # Off the top of the hour to reduce GitHub schedule delays.
+    - cron: '30 6,14 * * *' # 08:30 and 16:30 Berlin summer
   workflow_dispatch:
 
 concurrency:

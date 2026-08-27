@@ -11,6 +11,7 @@
 //
 //   PowerShell:  $env:PEXELS_API_KEY="..."; node scripts/fetch-photos.mjs
 //   bash:        PEXELS_API_KEY=... node scripts/fetch-photos.mjs
+//   one expansion only: node scripts/fetch-photos.mjs --only=BER,MUC,FRA,DUS,HAM,STR,CGN
 //
 // The key comes from env ONLY — this repo is PUBLIC, never hardcode it.
 //
@@ -34,6 +35,10 @@ import { CITIES, getPhotoQueries } from '../src/data/cities.js';
 
 // ── Config / secrets (env only) ──────────────────────────────────────────────
 const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
+const onlyArg = process.argv.find((arg) => arg.startsWith('--only='));
+const ONLY_IATAS = onlyArg
+  ? new Set(onlyArg.slice('--only='.length).split(',').map((iata) => iata.trim().toUpperCase()).filter((iata) => /^[A-Z]{3}$/.test(iata)))
+  : null;
 if (!PEXELS_API_KEY) {
   console.error('ERROR: PEXELS_API_KEY is not set — nothing was requested.');
   console.error('  PowerShell:  $env:PEXELS_API_KEY="..."; node scripts/fetch-photos.mjs');
@@ -91,9 +96,16 @@ async function main() {
   const problems = [];
   const nowISO = new Date().toISOString();
 
-  const total = DESTINATIONS.length;
+  const destinations = ONLY_IATAS ? DESTINATIONS.filter(({ iata }) => ONLY_IATAS.has(iata)) : DESTINATIONS;
+  if (ONLY_IATAS && destinations.length !== ONLY_IATAS.size) {
+    const found = new Set(destinations.map(({ iata }) => iata));
+    const missing = [...ONLY_IATAS].filter((iata) => !found.has(iata));
+    throw new Error(`--only contains IATA not present in DESTINATIONS: ${missing.join(', ')}`);
+  }
+  const total = destinations.length;
+  console.log(ONLY_IATAS ? `Targeted photo fetch: ${[...ONLY_IATAS].join(', ')}` : `Full photo fetch: ${total} destinations`);
   for (let i = 0; i < total; i++) {
-    const { iata } = DESTINATIONS[i];
+    const { iata } = destinations[i];
     const meta = CITIES[iata];
     const n = `[${i + 1}/${total}]`;
 

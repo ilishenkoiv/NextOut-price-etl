@@ -7,9 +7,13 @@
 // Morocco and the Canaries, no long-haul) and may be useful for future ranking hints.
 export const AVAILABLE_ROUTES = {
   // Major hubs: wide network covering most/all destinations.
-  'MUC': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD'],
-  'FRA': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD', 'BER', 'DUS'],
-  'BER': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD'],
+  'MUC': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD', 'BER', 'FRA', 'DUS', 'HAM', 'STR', 'CGN'],
+  'FRA': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD', 'BER', 'MUC', 'DUS', 'HAM', 'STR', 'CGN'],
+  'BER': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'SVQ', 'VIE', 'ZRH', 'PRG', 'WAW', 'DUB', 'NAP', 'FCO', 'VCE', 'BLQ', 'BRQ', 'BUD', 'MUC', 'FRA', 'DUS', 'HAM', 'STR', 'CGN'],
+  'DUS': ['BER', 'MUC', 'FRA', 'HAM', 'STR'],
+  'HAM': ['BER', 'MUC', 'FRA', 'DUS', 'STR', 'CGN'],
+  'STR': ['BER', 'MUC', 'FRA', 'DUS', 'HAM'],
+  'CGN': ['BER', 'MUC', 'HAM'],
   'VIE': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'ALC', 'MAD', 'AGP', 'PRG', 'ZRH', 'BUD', 'BLQ', 'FCO', 'NAP'],
   'ZRH': ['SPU', 'BCN', 'VLC', 'LIS', 'OPO', 'PMO', 'NCE', 'ATH', 'DBV', 'MAD', 'AGP', 'FCO', 'VCE', 'NAP'],
 

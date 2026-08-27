@@ -1,0 +1,34 @@
+name: Fetch German destination photo candidates
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: german-photo-candidates
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Fetch only the seven new German cities
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: node scripts/fetch-photos.mjs --only=BER,MUC,FRA,DUS,HAM,STR,CGN
+      - name: Upload candidates for human selection
+        uses: actions/upload-artifact@v4
+        with:
+          name: german-photo-candidates
+          path: photos/
+          if-no-files-found: error
+          retention-days: 14

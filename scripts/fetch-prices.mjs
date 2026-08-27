@@ -132,7 +132,7 @@ function targetSet(origin, dest) {
 // response. Windows are built once per run (buildBreakWindows) into a Set of `departure|nights`
 // keys; selectCombo keeps an offer when `${o.departure_at}|${o.nights}` is in that set.
 const DACH_COUNTRIES = new Set(['DE', 'AT', 'CH']);
-// The distinct calendar regions (state/canton) of the 20 collector origins.
+// The distinct calendar regions (state/canton) of the 22 collector origins.
 const BREAK_REGIONS = new Set(Object.values(ORIGIN_REGIONS).map((r) => r.subdivision));
 
 // A public_holidays row applies to our origins when it is nationwide (no subdivision) or its
@@ -809,7 +809,7 @@ async function loadPriceBaseline() {
   return { map, seen, alive, rowsRead };
 }
 
-// Distinct public-holiday DATES in [fromIso,toIso] that apply to our 20 origins' regions
+// Distinct public-holiday DATES in [fromIso,toIso] that apply to our 22 origins' regions
 // (§break-windows). Paginated with a STABLE .order() over the table's natural key
 // (country, subdivision_code, date, name_en) — public_holidays can approach/cross PostgREST's
 // 1000-row cap as the horizon widens or CH granularity grows, and an unordered page could repeat or

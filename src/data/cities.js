@@ -143,6 +143,15 @@ export const CITIES = {
   TAS: { city: 'Tashkent', country: 'Uzbekistan' },
   ALA: { city: 'Almaty', country: 'Kazakhstan' },
 
+  // ── Germany ────────────────────────────────────────────────────────────────
+  BER: { city: 'Berlin', country: 'Germany', photoQuery: 'Berlin Brandenburg Gate cityscape', photoQueryFallbacks: ['Berlin Museum Island', 'Berlin East Side Gallery', 'Berlin TV Tower skyline'] },
+  MUC: { city: 'Munich', country: 'Germany', photoQuery: 'Munich Marienplatz cityscape', photoQueryFallbacks: ['Munich English Garden', 'Munich skyline Alps', 'Munich old town'] },
+  FRA: { city: 'Frankfurt', country: 'Germany', photoQuery: 'Frankfurt skyline Main river', photoQueryFallbacks: ['Frankfurt Römer old town', 'Frankfurt Museumsufer', 'Frankfurt city sunset'] },
+  DUS: { city: 'Düsseldorf', country: 'Germany', photoQuery: 'Düsseldorf Rhine promenade skyline', photoQueryFallbacks: ['Düsseldorf MedienHafen', 'Düsseldorf old town Rhine', 'Düsseldorf Japanese quarter'] },
+  HAM: { city: 'Hamburg', country: 'Germany', photoQuery: 'Hamburg Speicherstadt canals', photoQueryFallbacks: ['Hamburg Elbphilharmonie harbour', 'Hamburg Alster lake', 'Hamburg harbour sunset'] },
+  STR: { city: 'Stuttgart', country: 'Germany', photoQuery: 'Stuttgart Schlossplatz city', photoQueryFallbacks: ['Stuttgart vineyards skyline', 'Stuttgart Mercedes museum', 'Stuttgart city hills'] },
+  CGN: { city: 'Cologne', country: 'Germany', photoQuery: 'Cologne Cathedral Rhine skyline', photoQueryFallbacks: ['Cologne old town Rhine', 'Cologne Hohenzollern bridge', 'Cologne cathedral sunset'] },
+
   // ── Asia
   BKK: { city: 'Bangkok', country: 'Thailand' },
   HKT: { city: 'Phuket', country: 'Thailand' },

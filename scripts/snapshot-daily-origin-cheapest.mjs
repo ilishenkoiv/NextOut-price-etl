@@ -57,6 +57,7 @@ const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
   return_at: row.return_at || null,
   transfers: Number(row.transfers ?? 0),
   source_updated_at: row.updated_at || null,
+  snapshot_at: new Date().toISOString(),
 }));
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');

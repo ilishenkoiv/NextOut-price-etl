@@ -1,6 +1,6 @@
 // src/data/origin-regions.js — departure airport → country + state/canton.
 //
-// Maps each of the 20 collector origins (ORIGINS_ALL in origins.js) to the region whose public
+// Maps each of the 22 collector origins (ORIGINS_ALL in origins.js) to the region whose public
 // holidays decide a traveller's date windows. Subdivision codes are written EXACTLY as the holiday
 // source (OpenHolidaysAPI) emits them — ISO 3166-2 for DE and CH, but German abbreviations for AT
 // (AT-WI Vienna, AT-SB Salzburg — NOT the ISO AT-9 / AT-5). Verified live against
@@ -32,6 +32,12 @@ export const ORIGIN_REGIONS = {
   ZRH: { country: 'CH', subdivision: 'CH-ZH' }, // Zürich
   GVA: { country: 'CH', subdivision: 'CH-GE' }, // Genève
   BSL: { country: 'CH', subdivision: 'CH-BS', physical: 'FR (EuroAirport, Saint-Louis) — treated as Basel-Stadt' },
+
+  // ── International hubs added for their own local catchments ─────────────────
+  AMS: { country: 'NL', subdivision: 'NL-NH' }, // Noord-Holland
+  // OpenHolidaysAPI currently has no GB calendar rows; the code remains the honest physical
+  // default and the app falls back to ordinary weekend windows until a GB source is added.
+  LHR: { country: 'GB', subdivision: 'GB-ENG' }, // England
 
   // ── Germany low-cost bases ──────────────────────────────────────────────────
   NUE: { country: 'DE', subdivision: 'DE-BY' }, // Bayern

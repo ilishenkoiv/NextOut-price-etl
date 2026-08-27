@@ -1,4 +1,4 @@
-// scripts/fetch-holidays.mjs — yearly refresh of the public-holiday calendar for DE/AT/CH.
+// scripts/fetch-holidays.mjs — yearly refresh of the public-holiday calendar for DE/AT/CH/NL.
 //
 // Pulls holidays from OpenHolidaysAPI for the next two years and writes them to the
 // `public_holidays` table (migration 20260802120000_public_holidays.sql). Runs once a year via
@@ -29,7 +29,9 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.s
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const YEARS_AHEAD = Number(process.env.YEARS_AHEAD) || 2;
 
-const COUNTRIES = ['DE', 'AT', 'CH'];
+// OpenHolidaysAPI has Dutch rows (used by AMS) but currently no GB calendar. LHR therefore uses
+// ordinary weekend windows until a reliable GB holiday source is added; do not invent rows.
+const COUNTRIES = ['DE', 'AT', 'CH', 'NL'];
 const API_BASE = 'https://openholidaysapi.org';
 const INSERT_CHUNK = 500;
 

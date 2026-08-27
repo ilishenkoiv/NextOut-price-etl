@@ -12670,5 +12670,677 @@
     "rain_days": 6.6,
     "avg_sun_h": 6.7,
     "precip_mm": 33
+  },
+  {
+    "iata": "BER",
+    "month": 1,
+    "avg_tmax": 3,
+    "rain_days": 11.8,
+    "avg_sun_h": 3.3,
+    "precip_mm": 50
+  },
+  {
+    "iata": "BER",
+    "month": 2,
+    "avg_tmax": 5.1,
+    "rain_days": 10.2,
+    "avg_sun_h": 5,
+    "precip_mm": 42
+  },
+  {
+    "iata": "BER",
+    "month": 3,
+    "avg_tmax": 8.5,
+    "rain_days": 10.9,
+    "avg_sun_h": 7.1,
+    "precip_mm": 45
+  },
+  {
+    "iata": "BER",
+    "month": 4,
+    "avg_tmax": 14,
+    "rain_days": 9,
+    "avg_sun_h": 9.9,
+    "precip_mm": 36
+  },
+  {
+    "iata": "BER",
+    "month": 5,
+    "avg_tmax": 18.8,
+    "rain_days": 10.6,
+    "avg_sun_h": 11.2,
+    "precip_mm": 56
+  },
+  {
+    "iata": "BER",
+    "month": 6,
+    "avg_tmax": 22.3,
+    "rain_days": 10.6,
+    "avg_sun_h": 12,
+    "precip_mm": 60
+  },
+  {
+    "iata": "BER",
+    "month": 7,
+    "avg_tmax": 23.9,
+    "rain_days": 12.1,
+    "avg_sun_h": 11.6,
+    "precip_mm": 79
+  },
+  {
+    "iata": "BER",
+    "month": 8,
+    "avg_tmax": 24.1,
+    "rain_days": 10,
+    "avg_sun_h": 11,
+    "precip_mm": 56
+  },
+  {
+    "iata": "BER",
+    "month": 9,
+    "avg_tmax": 19.5,
+    "rain_days": 8.8,
+    "avg_sun_h": 8.6,
+    "precip_mm": 47
+  },
+  {
+    "iata": "BER",
+    "month": 10,
+    "avg_tmax": 14,
+    "rain_days": 9.9,
+    "avg_sun_h": 5.9,
+    "precip_mm": 49
+  },
+  {
+    "iata": "BER",
+    "month": 11,
+    "avg_tmax": 7.8,
+    "rain_days": 9.7,
+    "avg_sun_h": 3.9,
+    "precip_mm": 44
+  },
+  {
+    "iata": "BER",
+    "month": 12,
+    "avg_tmax": 4,
+    "rain_days": 11.5,
+    "avg_sun_h": 2.7,
+    "precip_mm": 47
+  },
+  {
+    "iata": "MUC",
+    "month": 1,
+    "avg_tmax": 3.4,
+    "rain_days": 12.2,
+    "avg_sun_h": 5,
+    "precip_mm": 65
+  },
+  {
+    "iata": "MUC",
+    "month": 2,
+    "avg_tmax": 5.6,
+    "rain_days": 11.4,
+    "avg_sun_h": 6.2,
+    "precip_mm": 57
+  },
+  {
+    "iata": "MUC",
+    "month": 3,
+    "avg_tmax": 9.4,
+    "rain_days": 12.9,
+    "avg_sun_h": 8.1,
+    "precip_mm": 69
+  },
+  {
+    "iata": "MUC",
+    "month": 4,
+    "avg_tmax": 13.8,
+    "rain_days": 12.3,
+    "avg_sun_h": 9.8,
+    "precip_mm": 66
+  },
+  {
+    "iata": "MUC",
+    "month": 5,
+    "avg_tmax": 17.7,
+    "rain_days": 15.8,
+    "avg_sun_h": 10.3,
+    "precip_mm": 116
+  },
+  {
+    "iata": "MUC",
+    "month": 6,
+    "avg_tmax": 21.3,
+    "rain_days": 14.1,
+    "avg_sun_h": 11.6,
+    "precip_mm": 111
+  },
+  {
+    "iata": "MUC",
+    "month": 7,
+    "avg_tmax": 23,
+    "rain_days": 14.8,
+    "avg_sun_h": 11.7,
+    "precip_mm": 107
+  },
+  {
+    "iata": "MUC",
+    "month": 8,
+    "avg_tmax": 22.9,
+    "rain_days": 13.9,
+    "avg_sun_h": 10.6,
+    "precip_mm": 110
+  },
+  {
+    "iata": "MUC",
+    "month": 9,
+    "avg_tmax": 18.4,
+    "rain_days": 11.9,
+    "avg_sun_h": 8.7,
+    "precip_mm": 87
+  },
+  {
+    "iata": "MUC",
+    "month": 10,
+    "avg_tmax": 14.3,
+    "rain_days": 11,
+    "avg_sun_h": 6.7,
+    "precip_mm": 68
+  },
+  {
+    "iata": "MUC",
+    "month": 11,
+    "avg_tmax": 7.9,
+    "rain_days": 11,
+    "avg_sun_h": 5.1,
+    "precip_mm": 65
+  },
+  {
+    "iata": "MUC",
+    "month": 12,
+    "avg_tmax": 4,
+    "rain_days": 13.2,
+    "avg_sun_h": 4.5,
+    "precip_mm": 68
+  },
+  {
+    "iata": "FRA",
+    "month": 1,
+    "avg_tmax": 4.5,
+    "rain_days": 12,
+    "avg_sun_h": 3.9,
+    "precip_mm": 59
+  },
+  {
+    "iata": "FRA",
+    "month": 2,
+    "avg_tmax": 6.6,
+    "rain_days": 10.7,
+    "avg_sun_h": 5.5,
+    "precip_mm": 53
+  },
+  {
+    "iata": "FRA",
+    "month": 3,
+    "avg_tmax": 10.4,
+    "rain_days": 11.6,
+    "avg_sun_h": 7.6,
+    "precip_mm": 53
+  },
+  {
+    "iata": "FRA",
+    "month": 4,
+    "avg_tmax": 15,
+    "rain_days": 10.3,
+    "avg_sun_h": 10.2,
+    "precip_mm": 46
+  },
+  {
+    "iata": "FRA",
+    "month": 5,
+    "avg_tmax": 19,
+    "rain_days": 11,
+    "avg_sun_h": 10.9,
+    "precip_mm": 68
+  },
+  {
+    "iata": "FRA",
+    "month": 6,
+    "avg_tmax": 22.9,
+    "rain_days": 10,
+    "avg_sun_h": 12,
+    "precip_mm": 56
+  },
+  {
+    "iata": "FRA",
+    "month": 7,
+    "avg_tmax": 24.6,
+    "rain_days": 11.3,
+    "avg_sun_h": 11.9,
+    "precip_mm": 62
+  },
+  {
+    "iata": "FRA",
+    "month": 8,
+    "avg_tmax": 24.7,
+    "rain_days": 9.8,
+    "avg_sun_h": 11.1,
+    "precip_mm": 58
+  },
+  {
+    "iata": "FRA",
+    "month": 9,
+    "avg_tmax": 20.3,
+    "rain_days": 8.9,
+    "avg_sun_h": 8.8,
+    "precip_mm": 53
+  },
+  {
+    "iata": "FRA",
+    "month": 10,
+    "avg_tmax": 14.9,
+    "rain_days": 11.1,
+    "avg_sun_h": 6.1,
+    "precip_mm": 57
+  },
+  {
+    "iata": "FRA",
+    "month": 11,
+    "avg_tmax": 8.7,
+    "rain_days": 12,
+    "avg_sun_h": 4,
+    "precip_mm": 61
+  },
+  {
+    "iata": "FRA",
+    "month": 12,
+    "avg_tmax": 5.1,
+    "rain_days": 13.7,
+    "avg_sun_h": 3.1,
+    "precip_mm": 67
+  },
+  {
+    "iata": "DUS",
+    "month": 1,
+    "avg_tmax": 5.3,
+    "rain_days": 14.6,
+    "avg_sun_h": 3.9,
+    "precip_mm": 81
+  },
+  {
+    "iata": "DUS",
+    "month": 2,
+    "avg_tmax": 7.1,
+    "rain_days": 13.4,
+    "avg_sun_h": 5.2,
+    "precip_mm": 74
+  },
+  {
+    "iata": "DUS",
+    "month": 3,
+    "avg_tmax": 10.4,
+    "rain_days": 13.3,
+    "avg_sun_h": 7.2,
+    "precip_mm": 69
+  },
+  {
+    "iata": "DUS",
+    "month": 4,
+    "avg_tmax": 14.5,
+    "rain_days": 11.2,
+    "avg_sun_h": 9.8,
+    "precip_mm": 56
+  },
+  {
+    "iata": "DUS",
+    "month": 5,
+    "avg_tmax": 18.4,
+    "rain_days": 12.3,
+    "avg_sun_h": 10.8,
+    "precip_mm": 71
+  },
+  {
+    "iata": "DUS",
+    "month": 6,
+    "avg_tmax": 21.6,
+    "rain_days": 12.4,
+    "avg_sun_h": 11.3,
+    "precip_mm": 76
+  },
+  {
+    "iata": "DUS",
+    "month": 7,
+    "avg_tmax": 23.2,
+    "rain_days": 14.4,
+    "avg_sun_h": 11.3,
+    "precip_mm": 91
+  },
+  {
+    "iata": "DUS",
+    "month": 8,
+    "avg_tmax": 23.2,
+    "rain_days": 12.8,
+    "avg_sun_h": 10.7,
+    "precip_mm": 86
+  },
+  {
+    "iata": "DUS",
+    "month": 9,
+    "avg_tmax": 19.6,
+    "rain_days": 11,
+    "avg_sun_h": 8.6,
+    "precip_mm": 71
+  },
+  {
+    "iata": "DUS",
+    "month": 10,
+    "avg_tmax": 15,
+    "rain_days": 13,
+    "avg_sun_h": 6.2,
+    "precip_mm": 76
+  },
+  {
+    "iata": "DUS",
+    "month": 11,
+    "avg_tmax": 9.5,
+    "rain_days": 14,
+    "avg_sun_h": 4.3,
+    "precip_mm": 77
+  },
+  {
+    "iata": "DUS",
+    "month": 12,
+    "avg_tmax": 6,
+    "rain_days": 15.2,
+    "avg_sun_h": 3.2,
+    "precip_mm": 86
+  },
+  {
+    "iata": "HAM",
+    "month": 1,
+    "avg_tmax": 3.9,
+    "rain_days": 12.6,
+    "avg_sun_h": 3,
+    "precip_mm": 64
+  },
+  {
+    "iata": "HAM",
+    "month": 2,
+    "avg_tmax": 5.4,
+    "rain_days": 11.8,
+    "avg_sun_h": 4.7,
+    "precip_mm": 59
+  },
+  {
+    "iata": "HAM",
+    "month": 3,
+    "avg_tmax": 8.4,
+    "rain_days": 10.9,
+    "avg_sun_h": 6.8,
+    "precip_mm": 53
+  },
+  {
+    "iata": "HAM",
+    "month": 4,
+    "avg_tmax": 13.3,
+    "rain_days": 11,
+    "avg_sun_h": 9.7,
+    "precip_mm": 49
+  },
+  {
+    "iata": "HAM",
+    "month": 5,
+    "avg_tmax": 17.5,
+    "rain_days": 12,
+    "avg_sun_h": 11,
+    "precip_mm": 67
+  },
+  {
+    "iata": "HAM",
+    "month": 6,
+    "avg_tmax": 20.7,
+    "rain_days": 11.8,
+    "avg_sun_h": 11.7,
+    "precip_mm": 68
+  },
+  {
+    "iata": "HAM",
+    "month": 7,
+    "avg_tmax": 22.4,
+    "rain_days": 13.9,
+    "avg_sun_h": 11.3,
+    "precip_mm": 88
+  },
+  {
+    "iata": "HAM",
+    "month": 8,
+    "avg_tmax": 22.5,
+    "rain_days": 13,
+    "avg_sun_h": 10.6,
+    "precip_mm": 76
+  },
+  {
+    "iata": "HAM",
+    "month": 9,
+    "avg_tmax": 18.7,
+    "rain_days": 10.4,
+    "avg_sun_h": 8.4,
+    "precip_mm": 58
+  },
+  {
+    "iata": "HAM",
+    "month": 10,
+    "avg_tmax": 13.7,
+    "rain_days": 12,
+    "avg_sun_h": 5.8,
+    "precip_mm": 62
+  },
+  {
+    "iata": "HAM",
+    "month": 11,
+    "avg_tmax": 8,
+    "rain_days": 12.1,
+    "avg_sun_h": 3.4,
+    "precip_mm": 56
+  },
+  {
+    "iata": "HAM",
+    "month": 12,
+    "avg_tmax": 4.6,
+    "rain_days": 13,
+    "avg_sun_h": 2.5,
+    "precip_mm": 63
+  },
+  {
+    "iata": "STR",
+    "month": 1,
+    "avg_tmax": 4.9,
+    "rain_days": 12.4,
+    "avg_sun_h": 4.5,
+    "precip_mm": 65
+  },
+  {
+    "iata": "STR",
+    "month": 2,
+    "avg_tmax": 6.9,
+    "rain_days": 11,
+    "avg_sun_h": 5.8,
+    "precip_mm": 58
+  },
+  {
+    "iata": "STR",
+    "month": 3,
+    "avg_tmax": 10.6,
+    "rain_days": 12.4,
+    "avg_sun_h": 7.8,
+    "precip_mm": 66
+  },
+  {
+    "iata": "STR",
+    "month": 4,
+    "avg_tmax": 14.9,
+    "rain_days": 11.5,
+    "avg_sun_h": 9.7,
+    "precip_mm": 57
+  },
+  {
+    "iata": "STR",
+    "month": 5,
+    "avg_tmax": 18.8,
+    "rain_days": 14.2,
+    "avg_sun_h": 10.4,
+    "precip_mm": 89
+  },
+  {
+    "iata": "STR",
+    "month": 6,
+    "avg_tmax": 22.5,
+    "rain_days": 13,
+    "avg_sun_h": 11.6,
+    "precip_mm": 76
+  },
+  {
+    "iata": "STR",
+    "month": 7,
+    "avg_tmax": 24.2,
+    "rain_days": 12.9,
+    "avg_sun_h": 11.8,
+    "precip_mm": 81
+  },
+  {
+    "iata": "STR",
+    "month": 8,
+    "avg_tmax": 24.2,
+    "rain_days": 12.3,
+    "avg_sun_h": 10.8,
+    "precip_mm": 75
+  },
+  {
+    "iata": "STR",
+    "month": 9,
+    "avg_tmax": 20,
+    "rain_days": 11.1,
+    "avg_sun_h": 8.8,
+    "precip_mm": 64
+  },
+  {
+    "iata": "STR",
+    "month": 10,
+    "avg_tmax": 15.5,
+    "rain_days": 11.5,
+    "avg_sun_h": 6.4,
+    "precip_mm": 68
+  },
+  {
+    "iata": "STR",
+    "month": 11,
+    "avg_tmax": 9.2,
+    "rain_days": 11.7,
+    "avg_sun_h": 4.7,
+    "precip_mm": 67
+  },
+  {
+    "iata": "STR",
+    "month": 12,
+    "avg_tmax": 5.6,
+    "rain_days": 13.6,
+    "avg_sun_h": 3.8,
+    "precip_mm": 73
+  },
+  {
+    "iata": "CGN",
+    "month": 1,
+    "avg_tmax": 5.2,
+    "rain_days": 14.6,
+    "avg_sun_h": 3.9,
+    "precip_mm": 86
+  },
+  {
+    "iata": "CGN",
+    "month": 2,
+    "avg_tmax": 7.1,
+    "rain_days": 13.7,
+    "avg_sun_h": 5.2,
+    "precip_mm": 77
+  },
+  {
+    "iata": "CGN",
+    "month": 3,
+    "avg_tmax": 10.3,
+    "rain_days": 13.6,
+    "avg_sun_h": 7.2,
+    "precip_mm": 72
+  },
+  {
+    "iata": "CGN",
+    "month": 4,
+    "avg_tmax": 14.3,
+    "rain_days": 11.2,
+    "avg_sun_h": 9.6,
+    "precip_mm": 56
+  },
+  {
+    "iata": "CGN",
+    "month": 5,
+    "avg_tmax": 18.3,
+    "rain_days": 12.3,
+    "avg_sun_h": 10.6,
+    "precip_mm": 68
+  },
+  {
+    "iata": "CGN",
+    "month": 6,
+    "avg_tmax": 21.6,
+    "rain_days": 12.2,
+    "avg_sun_h": 11.2,
+    "precip_mm": 74
+  },
+  {
+    "iata": "CGN",
+    "month": 7,
+    "avg_tmax": 23.2,
+    "rain_days": 13.8,
+    "avg_sun_h": 11.1,
+    "precip_mm": 88
+  },
+  {
+    "iata": "CGN",
+    "month": 8,
+    "avg_tmax": 23.3,
+    "rain_days": 12.3,
+    "avg_sun_h": 10.5,
+    "precip_mm": 81
+  },
+  {
+    "iata": "CGN",
+    "month": 9,
+    "avg_tmax": 19.5,
+    "rain_days": 11.2,
+    "avg_sun_h": 8.5,
+    "precip_mm": 73
+  },
+  {
+    "iata": "CGN",
+    "month": 10,
+    "avg_tmax": 15,
+    "rain_days": 13.1,
+    "avg_sun_h": 6.1,
+    "precip_mm": 78
+  },
+  {
+    "iata": "CGN",
+    "month": 11,
+    "avg_tmax": 9.4,
+    "rain_days": 14.3,
+    "avg_sun_h": 4.2,
+    "precip_mm": 84
+  },
+  {
+    "iata": "CGN",
+    "month": 12,
+    "avg_tmax": 6,
+    "rain_days": 15.9,
+    "avg_sun_h": 3.2,
+    "precip_mm": 92
   }
 ]

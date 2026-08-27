@@ -13,7 +13,8 @@
     "fetch-photos": "node scripts/fetch-photos.mjs",
     "review-photos": "node scripts/review.mjs",
     "optimize-photos": "node scripts/optimize-photos.mjs",
-    "upload-photos": "node scripts/upload-photos.mjs"
+    "upload-photos": "node scripts/upload-photos.mjs",
+    "deploy-expansion-data": "node scripts/deploy-expansion-data.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.1",
