@@ -10,10 +10,12 @@
 // No server, no build step, no dependencies — just open the file. Images are referenced by
 // relative path ({IATA}/{file}), so keep review.html inside photos/ next to the folders.
 //
-//   node scripts/review.mjs      → writes photos/review.html for the full catalogue
-//   node scripts/review.mjs --only=BER,MUC  → focused owner review; saved output still preserves
-//                                             every previously curated city
-//   then open photos/review.html in a browser.
+//   node scripts/review.mjs
+//     → writes photos/review.html for the full catalogue
+//   node scripts/review.mjs --only=BER,MUC --output=review-german.html
+//     → writes a separate focused owner review without overwriting the full catalogue page;
+//       saved output still preserves every previously curated city
+//   then open the generated file in a browser.
 
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -25,11 +27,19 @@ const MANIFEST_PATH = path.join(PHOTOS_DIR, 'manifest.json');
 const FLAGS_PATH = path.join(PHOTOS_DIR, 'flags.json');
 const AUTO_PATH = path.join(PHOTOS_DIR, 'auto-selected.json');
 const SELECTED_PATH = path.join(PHOTOS_DIR, 'selected.json');
-const OUT_PATH = path.join(PHOTOS_DIR, 'review.html');
 const onlyArg = process.argv.find((arg) => arg.startsWith('--only='));
 const only = onlyArg
   ? new Set(onlyArg.slice('--only='.length).split(',').map((iata) => iata.trim().toUpperCase()).filter(Boolean))
   : null;
+const outputArg = process.argv.find((arg) => arg.startsWith('--output='));
+const outputName = outputArg ? outputArg.slice('--output='.length).trim() : 'review.html';
+if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\.html$/.test(outputName)) {
+  throw new Error(`Invalid --output filename: ${outputName}`);
+}
+if (only && !outputArg) {
+  throw new Error('Focused review requires --output=<name>.html so it cannot overwrite photos/review.html');
+}
+const OUT_PATH = path.join(PHOTOS_DIR, outputName);
 
 async function loadJson(p) {
   try {

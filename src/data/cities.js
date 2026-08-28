@@ -150,7 +150,15 @@ export const CITIES = {
   DUS: { city: 'Düsseldorf', country: 'Germany', photoQuery: 'Düsseldorf Rhine promenade skyline', photoQueryFallbacks: ['Düsseldorf MedienHafen', 'Düsseldorf old town Rhine', 'Düsseldorf Japanese quarter'] },
   HAM: { city: 'Hamburg', country: 'Germany', photoQuery: 'Hamburg Speicherstadt canals', photoQueryFallbacks: ['Hamburg Elbphilharmonie harbour', 'Hamburg Alster lake', 'Hamburg harbour sunset'] },
   STR: { city: 'Stuttgart', country: 'Germany', photoQuery: 'Stuttgart Schlossplatz city', photoQueryFallbacks: ['Stuttgart vineyards skyline', 'Stuttgart Mercedes museum', 'Stuttgart city hills'] },
-  CGN: { city: 'Cologne', country: 'Germany', photoQuery: 'Cologne Cathedral Rhine skyline', photoQueryFallbacks: ['Cologne old town Rhine', 'Cologne Hohenzollern bridge', 'Cologne cathedral sunset'] },
+  CGN: {
+    city: 'Cologne', country: 'Germany',
+    photoQuery: 'Cologne Rheinauhafen Kranhäuser architecture',
+    photoQueryFallbacks: [
+      'Cologne Belgian Quarter street life',
+      'Cologne old town colourful houses',
+      'Cologne carnival city life',
+    ],
+  },
 
   // ── Asia
   BKK: { city: 'Bangkok', country: 'Thailand' },

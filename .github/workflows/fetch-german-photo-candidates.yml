@@ -2,6 +2,11 @@ name: Fetch German destination photo candidates
 
 on:
   workflow_dispatch:
+    inputs:
+      cities:
+        description: 'Comma-separated German destination IATAs'
+        required: true
+        default: 'BER,MUC,FRA,DUS,HAM,STR,CGN'
 
 permissions:
   contents: read
@@ -24,7 +29,8 @@ jobs:
       - name: Fetch only the seven new German cities
         env:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        run: node scripts/fetch-photos.mjs --only=BER,MUC,FRA,DUS,HAM,STR,CGN
+          PHOTO_CITIES: ${{ inputs.cities }}
+        run: node scripts/fetch-photos.mjs --only="$PHOTO_CITIES"
       - name: Upload candidates for human selection
         uses: actions/upload-artifact@v4
         with:
