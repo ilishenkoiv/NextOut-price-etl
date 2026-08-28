@@ -11,6 +11,7 @@ import WebSocket from 'ws';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
 const APPLY = process.argv.includes('--apply');
+const WEATHER_ONLY = process.argv.includes('--weather-only');
 const GERMAN_DESTINATIONS = ['BER', 'MUC', 'FRA', 'DUS', 'HAM', 'STR', 'CGN'];
 const ORIGIN_ROWS = [
   { airport:'AMS', physical_country:'NL', physical_subdivision_code:'NL-NH', calendar_country:'NL', calendar_subdivision_code:'NL-NH' },
@@ -26,7 +27,7 @@ if (climate.length !== 84 || incomplete.length) {
   throw new Error(`German climate coverage must be 7×12=84; got ${climate.length}. Incomplete: ${incomplete.map(([iata,count]) => `${iata}:${count}`).join(', ') || 'none'}`);
 }
 
-console.log(`Plan: upsert ${ORIGIN_ROWS.length} origin_regions rows (AMS, LHR)`);
+if (!WEATHER_ONLY) console.log(`Plan: upsert ${ORIGIN_ROWS.length} origin_regions rows (AMS, LHR)`);
 console.log(`Plan: upsert ${climate.length} weather_climate rows (${GERMAN_DESTINATIONS.join(', ')}, 12 months each)`);
 if (!APPLY) {
   console.log('DRY RUN — no network request and no write. Add --apply with SUPABASE_SERVICE_KEY to deploy.');
@@ -42,15 +43,21 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   realtime: { transport:WebSocket },
 });
 
-const originsWrite = await supabase.from('origin_regions').upsert(ORIGIN_ROWS, { onConflict:'airport' });
-if (originsWrite.error) throw new Error(`origin_regions upsert failed: ${originsWrite.error.message}`);
+if (!WEATHER_ONLY) {
+  const originsWrite = await supabase.from('origin_regions').upsert(ORIGIN_ROWS, { onConflict:'airport' });
+  if (originsWrite.error) throw new Error(`origin_regions upsert failed: ${originsWrite.error.message}`);
+}
 
 const climateWrite = await supabase.from('weather_climate').upsert(climate, { onConflict:'iata,month' });
 if (climateWrite.error) throw new Error(`weather_climate upsert failed: ${climateWrite.error.message}`);
 
-const originsCheck = await supabase.from('origin_regions').select('airport').in('airport', ['AMS','LHR']);
-if (originsCheck.error || originsCheck.data?.length !== 2) throw new Error(`origin verification failed: ${originsCheck.error?.message ?? originsCheck.data?.length}`);
+if (!WEATHER_ONLY) {
+  const originsCheck = await supabase.from('origin_regions').select('airport').in('airport', ['AMS','LHR']);
+  if (originsCheck.error || originsCheck.data?.length !== 2) throw new Error(`origin verification failed: ${originsCheck.error?.message ?? originsCheck.data?.length}`);
+}
 const climateCheck = await supabase.from('weather_climate').select('iata,month').in('iata', GERMAN_DESTINATIONS);
 if (climateCheck.error || climateCheck.data?.length !== 84) throw new Error(`climate verification failed: ${climateCheck.error?.message ?? climateCheck.data?.length}`);
 
-console.log('Applied and verified: 2 origin regions + 84 climate rows.');
+console.log(WEATHER_ONLY
+  ? 'Applied and verified: 84 German climate rows (7 cities × 12 months).'
+  : 'Applied and verified: 2 origin regions + 84 climate rows.');
