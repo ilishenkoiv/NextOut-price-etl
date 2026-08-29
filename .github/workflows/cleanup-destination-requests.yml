@@ -1,0 +1,36 @@
+name: Daily destination request cleanup
+
+# Deletes voluntary city/country requests after 24 calendar months. Missing table = successful
+# no-op, so the maintenance workflow remains safe if a fresh environment is not migrated yet.
+on:
+  schedule:
+    - cron: '0 10 * * *' # 10:00 UTC, clear of price sweeps and other cleanup jobs
+  workflow_dispatch:
+
+concurrency:
+  group: destination-request-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete destination requests older than 24 months
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Delete old destination requests
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/cleanup-destination-requests.mjs

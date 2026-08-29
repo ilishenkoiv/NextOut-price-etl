@@ -1,0 +1,43 @@
+name: Monthly destination-holidays refresh
+
+on:
+  schedule:
+    - cron: '27 4 2 * *'
+  workflow_dispatch:
+    inputs:
+      iatas:
+        description: 'Optional comma-separated IATAs; blank = all 139'
+        required: false
+        type: string
+      dry_run:
+        description: 'Discover only, no Supabase writes'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: destination-events-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Discover curated holiday editions for six months
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          EVENT_IATAS: ${{ inputs.iatas }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          WIKIDATA_CONCURRENCY: '3'
+          WIKIDATA_USER_AGENT: 'NextOutDestinationEvents/1.0 (https://nextout.de; kontakt@nextout.de)'
+        run: node scripts/fetch-destination-events.mjs

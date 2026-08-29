@@ -1,8 +1,8 @@
 // scripts/collect-storage-metrics.mjs — daily storage-usage measurement.
 //
 // Calls the SECURITY DEFINER function public.collect_storage_metrics(), which counts every public
-// table (rows + bytes), the whole database size, and the price-snapshots Storage bucket (objects +
-// bytes), and INSERTS one row per item under a single measured_at. Old rows are never touched — the
+// table (rows + bytes), the whole database size, and all Storage buckets (objects + bytes), and
+// INSERTS one row per item under a single measured_at. Old rows are never touched — the
 // table is a history, so growth is visible over time. Runs once a day via
 // .github/workflows/storage-metrics.yml, and by hand:
 //   PowerShell:  $env:SUPABASE_SERVICE_KEY="..."; node scripts/collect-storage-metrics.mjs
@@ -89,7 +89,9 @@ if (!rows.length) {
 const measuredAt = rows[0].measured_at;
 const tables = rows.filter((r) => r.kind === 'table').sort((a, b) => Number(b.bytes) - Number(a.bytes));
 const dbTotal = rows.find((r) => r.kind === 'db_total');
-const bucket = rows.find((r) => r.kind === 'snapshot_bucket');
+const storageTotal = rows.find((r) => r.kind === 'storage_total')
+  || rows.find((r) => r.kind === 'snapshot_bucket'); // legacy migration compatibility
+const buckets = rows.filter((r) => r.kind === 'storage_bucket').sort((a, b) => Number(b.bytes) - Number(a.bytes));
 
 console.log(`\nRecorded ${rows.length} row(s) at measured_at ${measuredAt}:`);
 console.log('  ' + 'TABLE'.padEnd(26) + 'ROWS'.padStart(12) + 'SIZE (MB)'.padStart(14));
@@ -99,6 +101,9 @@ for (const t of tables) {
 }
 console.log('  ' + '-'.repeat(52));
 if (dbTotal) console.log('  ' + 'DATABASE (total)'.padEnd(26) + '-'.padStart(12) + mb(dbTotal.bytes).padStart(14) + `  (of 500 MB free tier)`);
-if (bucket) console.log('  ' + 'price-snapshots (bucket)'.padEnd(26) + String(bucket.row_count ?? '-').padStart(12) + mb(bucket.bytes).padStart(14) + `  (Storage, of 1 GB free tier)`);
+if (storageTotal) console.log('  ' + 'STORAGE (all buckets)'.padEnd(26) + String(storageTotal.row_count ?? '-').padStart(12) + mb(storageTotal.bytes).padStart(14) + `  (of 1 GB free tier)`);
+for (const bucket of buckets) {
+  console.log('  ' + `  ${bucket.name}`.padEnd(26) + String(bucket.row_count ?? '-').padStart(12) + mb(bucket.bytes).padStart(14));
+}
 
 console.log(`\nDone. Appended one measurement (${rows.length} rows). History preserved.`);

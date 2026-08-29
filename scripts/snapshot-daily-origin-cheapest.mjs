@@ -20,15 +20,26 @@ export function compareOffer(a, b) {
 }
 
 export function selectDailyCheapest(offers, today) {
-  const best = new Map();
+  return selectDailyCheapestPool(offers, today, 1);
+}
+
+export function selectDailyCheapestPool(offers, today, limit = 10) {
+  const groups = new Map();
   for (const row of offers) {
     if (!row.origin || !row.dest || !['any', 'direct'].includes(row.flight_type)) continue;
     if (!row.departure_at || row.departure_at < today || !(Number(row.price) > 0)) continue;
     const key = `${row.origin}|${row.flight_type}`;
-    const current = best.get(key);
-    if (!current || compareOffer(row, current) < 0) best.set(key, row);
+    const identity = `${row.origin}|${row.dest}|${row.flight_type}|${row.departure_at}|${row.return_at || ''}`;
+    const group = groups.get(key) || new Map();
+    const current = group.get(identity);
+    if (!current || compareOffer(row, current) < 0) group.set(identity, row);
+    groups.set(key, group);
   }
-  return [...best.values()];
+  return [...groups.entries()].flatMap(([, group]) => [...group.values()]
+    .sort(compareOffer).slice(0, Math.max(1, Math.min(10, limit)))
+    .map((row, index) => ({ ...row, rank:index + 1 })))
+    .sort((a, b) => String(a.origin).localeCompare(String(b.origin))
+      || String(a.flight_type).localeCompare(String(b.flight_type)) || a.rank - b.rank);
 }
 
 async function main() {
@@ -46,10 +57,13 @@ async function main() {
     if (data.length < PAGE) break;
   }
 
-const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
+  const snapshotAt = new Date().toISOString();
+  const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
   observed_on: observedOn,
+  snapshot_at: snapshotAt,
   origin: row.origin,
   flight_type: row.flight_type,
+  rank: row.rank,
   dest: row.dest,
   price: Number(row.price),
   currency: 'EUR',
@@ -57,8 +71,8 @@ const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
   return_at: row.return_at || null,
   transfers: Number(row.transfers ?? 0),
   source_updated_at: row.updated_at || null,
-  snapshot_at: new Date().toISOString(),
-}));
+  }));
+  const chosen = pool.filter((row) => row.rank === 1).map(({ rank: _rank, ...row }) => row);
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');
 
@@ -71,7 +85,16 @@ const { error: writeError } = await supabase.from('daily_origin_cheapest')
     }
     throw writeError;
   }
-  console.log(`Saved ${chosen.length} daily cheapest rows for ${observedOn} from ${offers.length} future offers.`);
+
+  const { error: poolError } = await supabase.from('daily_origin_cheapest_pool').insert(pool);
+  if (poolError && !tableMissing(poolError)) throw poolError;
+  if (poolError) console.log('daily_origin_cheapest_pool table does not exist yet — rank-1 compatibility snapshot saved.');
+  else {
+    const retentionCutoff = new Date(Date.now() - 31 * 86400_000).toISOString();
+    const { error: cleanupError } = await supabase.from('daily_origin_cheapest_pool').delete().lt('snapshot_at', retentionCutoff);
+    if (cleanupError) console.warn(`Pool retention cleanup skipped: ${cleanupError.message || cleanupError}`);
+  }
+  console.log(`Saved ${chosen.length} rank-1 rows and ${pool.length} pool rows for ${observedOn} from ${offers.length} future offers.`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
