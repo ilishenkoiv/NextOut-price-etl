@@ -17,15 +17,21 @@ name: Twice-daily price fetch
 # the app (lib/prices.ts) — without it the user can pick a month nothing is collected for.
 # That is a separate, paired change.
 #
-# WINTER TIME: GitHub Actions cron is UTC and does NOT follow the CET switch. The Berlin times
-# noted below assume CEST (summer, UTC+2); in winter (CET, UTC+1) the runs land one hour
-# earlier. Adjust in late October if wanted.
+# The schedules use an explicit Europe/Berlin timezone. GitHub therefore keeps the owner-facing
+# times stable across CET/CEST changes; no late-October/manual UTC adjustment is required.
 
 on:
   schedule:
     # Avoid :00: GitHub documents start-of-hour load as a source of schedule delays/drops.
-    - cron: '17 23 * * *'  # 01:17 Berlin (CEST) — full 12-month sweep, all twelve jobs
-    - cron: '17 10 * * *'  # 12:17 Berlin (CEST) — near months 1–6 only (first six jobs)
+    # The full sweep starts on the PREVIOUS afternoon. With the measured 8.5 h runtime and the
+    # observed 4 h 52 min GitHub scheduler delay, it still finishes around 04:40 Berlin and keeps
+    # almost four hours of headroom before the 08:30 morning data deadline.
+    - cron: '17 15 * * *'
+      timezone: 'Europe/Berlin'  # 15:17 Berlin — full 12-month sweep, all twelve jobs
+    # The near refresh has enough headroom for the observed delay plus its ~4 h runtime before
+    # the 16:30 evening data deadline.
+    - cron: '17 7 * * *'
+      timezone: 'Europe/Berlin'  # 07:17 Berlin — near months 1–6 only (first six jobs)
   workflow_dispatch:
     inputs:
       scope:
@@ -342,15 +348,15 @@ jobs:
           overwrite: true
 
   # ── FAR window: months 7–12 ───────────────────────────────────────────────────────────────
-  # These six run ONLY on the nightly full sweep (cron '17 23') or a manual far/both run —
-  # never on the noon near-only run ('17 10').
+  # These six run ONLY on the previous-afternoon full sweep (cron '17 15') or a manual far/both
+  # run — never on the morning near-only run ('17 7').
   month_7:
     name: month 7
     needs: month_6
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -392,7 +398,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -434,7 +440,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -476,7 +482,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -518,7 +524,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -560,7 +566,7 @@ jobs:
     if: >-
       always() &&
       (
-        (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') ||
+        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
         github.event.inputs.scope == 'both'
       )
@@ -661,7 +667,7 @@ jobs:
           # working. THESE TWO LINES MUST TRACK THE `if:` BLOCKS ABOVE — if a schedule changes
           # there and not here, the watchdog starts lying in one direction or the other.
           NEAR_EXPECTED: ${{ github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' }}
-          FAR_EXPECTED: ${{ (github.event_name == 'schedule' && github.event.schedule == '17 23 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' }}
+          FAR_EXPECTED: ${{ (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' }}
           R_M1: ${{ needs.month_1.result }}
           R_M2: ${{ needs.month_2.result }}
           R_M3: ${{ needs.month_3.result }}
