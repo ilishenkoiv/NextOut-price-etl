@@ -5,8 +5,8 @@ name: Carousel window prices
 # each window's exact dates. Writes public.window_prices — NOT offers — so it never collides with
 # the main collector's data or its prune. Logic: scripts/fetch-window-prices.mjs.
 #
-# SCHEDULED twice a day (01:00 and 13:00 UTC) plus manual workflow_dispatch (kept for supervised /
-# ad-hoc runs). See the schedule note on the `on:` block for the winter DST shift.
+# SCHEDULED twice a day at stable Europe/Berlin times plus manual workflow_dispatch (kept for
+# supervised / ad-hoc runs).
 #
 # The sweep is split into 20 PARTS, one per home airport. The parts run STRICTLY SEQUENTIALLY
 # (max-parallel: 1) so they never double the request rate against the partner, and fail-fast: false
@@ -19,14 +19,12 @@ name: Carousel window prices
 # already-collected destinations are skipped via window_price_progress, so only the tail (parts that
 # hit the timeout) is re-collected. One catch-up pass, not a loop.
 on:
-  # Twice a day at 01:00 and 13:00 UTC. In German SUMMER time (CEST, UTC+2) that is 03:00 and 15:00
-  # local, so the freshly collected window prices are ready well before the 06:00 and 18:00 reads.
-  # NOTE: cron is fixed to UTC — it does NOT follow DST. In WINTER (CET, UTC+1) these fire at 02:00
-  # and 14:00 German time, i.e. one hour earlier locally; still comfortably before the 06:00/18:00 reads.
   schedule:
     # Avoid :00 — scheduled Actions are most delayed at the start of an hour.
-    - cron: '7 1 * * *'
-    - cron: '7 13 * * *'
+    - cron: '7 3 * * *'
+      timezone: 'Europe/Berlin'
+    - cron: '7 15 * * *'
+      timezone: 'Europe/Berlin'
   workflow_dispatch: # keep manual runs too (supervised / ad-hoc), alongside the schedule above
     inputs:
       airport:
@@ -44,10 +42,8 @@ on:
         required: false
         default: ''
 
-# Its OWN concurrency group — NOT 'price-fetch' (main sweep) and NOT 'app-errors-cleanup' — so it
-# can never run at the same time as either and collide on the partner rate limit or the database.
-# cancel-in-progress: a new run CANCELS a still-running older one (never queues behind it), so a run
-# that overruns to the next scheduled slot is superseded rather than stacking two sweeps.
+# A new carousel run supersedes an older carousel run. Night maintenance checks both this workflow
+# and the main collector before doing any work.
 concurrency:
   group: window-prices
   cancel-in-progress: true

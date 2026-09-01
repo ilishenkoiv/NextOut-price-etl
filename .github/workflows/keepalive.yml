@@ -30,15 +30,8 @@ name: Schedule keepalive
 
 on:
   schedule:
-    # Sunday 18:00 UTC — 20:00 Berlin in summer (CEST), 19:00 in winter (CET).
-    #
-    # Deliberately nowhere near `fetch-prices.yml`. The nightly sweep starts 23:00 UTC and runs
-    # ~5h30, worst case ~9h35 (until ~08:35 UTC); the noon sweep starts 10:00 UTC and runs
-    # ~2h45, worst case ~4h50 (until ~14:50 UTC). 18:00 UTC sits ~3h after the worst-case end
-    # of the noon sweep and ~5h before the nightly one starts. Nothing would actually break on
-    # an overlap — this job touches one text file and the collector no longer commits — but the
-    # separation costs nothing and keeps the two readable side by side in the Actions list.
-    - cron: '0 18 * * 0'
+    - cron: '17 0 * * 0'
+      timezone: 'Europe/Berlin' # Sunday 00:17 Berlin
   # Manual runs are for verifying the job itself. Below the threshold a manual run is a
   # harmless dry run: it prints the day count and exits without touching the repository.
   workflow_dispatch:
@@ -46,12 +39,13 @@ on:
 # One keepalive run at a time. The only realistic overlap is a manual run fired while the
 # weekly one is in flight; two pushes racing would fail the loser on a non-fast-forward.
 concurrency:
-  group: keepalive
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 # The one place in this repository allowed to write to it. `fetch-prices.yml` stays on
 # `contents: read`. Nothing else is needed: no actions, packages or issues scopes.
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -61,7 +55,28 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+
       - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
         # Pinned to the major version, same as `fetch-prices.yml`. The default shallow clone
         # (fetch-depth: 1) is enough — we only read the timestamp of the tip commit, and a push
         # from a shallow checkout is fine because its parent is already on the remote. Checkout
@@ -70,6 +85,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Stamp if the default branch has been quiet for 40 days
+        if: steps.night.outputs.allowed == 'true'
         run: |
           set -euo pipefail
 

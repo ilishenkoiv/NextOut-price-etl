@@ -2,7 +2,8 @@ name: Monthly destination-holidays refresh
 
 on:
   schedule:
-    - cron: '27 4 2 * *'
+    - cron: '52 0 2 * *'
+      timezone: 'Europe/Berlin' # 2nd day of each month, 00:52 Berlin
   workflow_dispatch:
     inputs:
       iatas:
@@ -16,10 +17,11 @@ on:
         type: boolean
 
 concurrency:
-  group: destination-events-refresh
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -27,13 +29,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          # This workflow can run for 90 minutes, so it must actually start before 01:00.
+          if (( minute_of_day < 60 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+      - if: steps.night.outputs.allowed == 'true'
+        uses: actions/checkout@v4
+      - if: steps.night.outputs.allowed == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
-      - run: npm ci
+      - if: steps.night.outputs.allowed == 'true'
+        run: npm ci
       - name: Discover curated holiday editions for six months
+        if: steps.night.outputs.allowed == 'true'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           EVENT_IATAS: ${{ inputs.iatas }}

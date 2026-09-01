@@ -56,10 +56,8 @@ env:
   # Public project URL (not a secret) — the script also defaults to this.
   SUPABASE_URL: https://xpalogebawoljlafsafs.supabase.co
 
-# Hard guarantee that two RUNS never collect at once. The nightly sweep is long enough that
-# it can overrun into the noon start; without this, the two would collect simultaneously and
-# double the request rate past the upstream limit. With a single workflow-level concurrency
-# group, a new run stays PENDING until the in-progress one finishes.
+# Hard guarantee that two main price-fetch runs never collect at once. A new run stays PENDING
+# until the in-progress one finishes.
 # cancel-in-progress: false — never abort a run mid-collection (it's writing to Supabase);
 # make the newcomer wait instead. (This covers whole runs; the job order WITHIN a run is
 # enforced separately by the `needs:` chain.)
