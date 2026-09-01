@@ -32,7 +32,7 @@ on:
         required: false
         default: 'MUC'
       full_sweep:
-        description: 'Full catalogue pass? auto = monthly by date · on = force full · off = force narrow'
+        description: 'Destination plan: auto = top 50 + daily 1/7 tail · on = force full · off = top only'
         required: false
         type: choice
         default: 'auto'
@@ -98,7 +98,7 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
-          # on/off force the sweep mode; auto (default) lets the script decide by plan-date.
+          # on/off force full/top-only; auto checks the top destinations plus today's weekly tail.
           FULL_SWEEP: ${{ github.event.inputs.full_sweep == 'on' && '1' || github.event.inputs.full_sweep == 'off' && '0' || '' }}
           TOP_DESTS: ${{ github.event.inputs.top_dests }}
         run: node scripts/fetch-window-prices.mjs
@@ -138,7 +138,7 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
-          # on/off force the sweep mode; auto (default) lets the script decide by plan-date.
+          # on/off force full/top-only; auto checks the top destinations plus today's weekly tail.
           FULL_SWEEP: ${{ github.event.inputs.full_sweep == 'on' && '1' || github.event.inputs.full_sweep == 'off' && '0' || '' }}
           TOP_DESTS: ${{ github.event.inputs.top_dests }}
         run: node scripts/fetch-window-prices.mjs

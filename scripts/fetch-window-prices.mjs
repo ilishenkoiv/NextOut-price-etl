@@ -8,10 +8,10 @@
 //     hard-coded list.
 //   • BOTH flight variants per destination: direct (non-stop) and any (incl. connections).
 //   • strictly the window's exact dates: departure = window start, return = window end.
-//   • DESTINATIONS ARE NARROWED BY HISTORY: only the TOP_DESTS (50) catalogue destinations that
-//     have most often yielded a fare for THIS origin — ranked by their own window_prices row count,
-//     so no find-counter is stored anywhere new. Destinations that never produced a fare are kept
-//     for a PERIODIC FULL PASS (monthly), not dropped, so a newly opened route is still discovered.
+//   • DESTINATIONS ARE NARROWED BY HISTORY: the TOP_DESTS (50) catalogue destinations that have
+//     most often yielded a fare for THIS origin are checked every day. The remaining catalogue is
+//     split into seven stable daily slices, so every destination is still checked once per week
+//     without a monthly full-pass spike.
 //
 // WHERE IT WRITES
 //   public.window_prices (migration 20260810120000_window_prices.sql) — its OWN table, so it never
@@ -44,10 +44,10 @@
 //   HORIZON_MONTHS       — override the 6-month horizon (default 6).
 //   PLAN_DATE            — override "today" (YYYY-MM-DD) for a reproducible window set.
 //   TOP_DESTS            — history-narrowed destinations asked per origin (default 50).
-//   FULL_SWEEP           — '1' force a full catalogue pass, '0' force the narrow list;
-//                          default: automatic monthly pass (see FULL_SWEEP_DOM).
-//   FULL_SWEEP_DOM       — day-of-month cutoff for the automatic full pass (default 3).
+//   FULL_SWEEP           — '1' force a full catalogue pass, '0' force top-only;
+//                          default: TOP_DESTS plus today's one-seventh catalogue tail.
 import { createClient } from '@supabase/supabase-js';
+import { planWindowDestinations } from './window-destination-plan.mjs';
 
 const TP_TOKEN = process.env.TP_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
@@ -374,24 +374,13 @@ const windows = computeAllWindows(holidays, regions, planDate);
 const priceRows = await loadAll('prices', 'origin,dest,month', ['origin', 'dest', 'month'], (q) => q.eq('origin', ORIGIN));
 const allDests = [...new Set(priceRows.map((r) => r.dest))].sort();
 
-// ── History-narrowed destination list ────────────────────────────────────────────────────────
-// Ask only the TOP_DESTS destinations that have historically produced fares for THIS origin, ranked
-// by how many window_prices rows they already have. The find-count is NOT stored anywhere new:
-// window_prices IS the history — one row per fare found — so we just count its rows per dest.
+// ── History-ranked daily destination plan ─────────────────────────────────────────────────────
+// Ask the TOP_DESTS destinations every day plus one stable seventh of everything else. The
+// find-count is NOT stored anywhere new: window_prices IS the history — one row per fare found — so
+// we just count its rows per dest.
 const TOP_DESTS = Number(process.env.TOP_DESTS) || 50;
-
-// Periodic FULL catalogue pass so destinations that never produced a fare are re-checked and a newly
-// opened route is discovered. Airlines add routes almost only at the two IATA season boundaries
-// (late March / late October), plus the odd mid-season addition; a MONTHLY full pass catches any new
-// route within ~4 weeks — well inside the 10-day…6-month booking horizon — while a full pass costs
-// only today's behaviour, amortised over ~a month. Anchored to the plan date's day-of-month so ALL
-// 20 origin-parts of one run (same PLAN_DATE) make the SAME choice, with NO run counter to store.
-// Override: FULL_SWEEP=1 forces a full pass, FULL_SWEEP=0 forces the narrow list.
-const FULL_SWEEP_DOM = Number(process.env.FULL_SWEEP_DOM) || 3;
 const fullSweepEnv = (process.env.FULL_SWEEP || '').trim();
-const isFullSweep = fullSweepEnv === '1' ? true
-  : fullSweepEnv === '0' ? false
-  : Number(planDate.slice(8, 10)) <= FULL_SWEEP_DOM;
+const destinationMode = fullSweepEnv === '1' ? 'full' : fullSweepEnv === '0' ? 'top-only' : 'auto';
 
 // Find counts from history: rows per dest in window_prices for this origin. Paginated read ordered by
 // the full PK (repo rule: every .range() pairs with .order() on a unique key).
@@ -400,20 +389,14 @@ const histRows = await loadAll('window_prices', 'origin,dest',
 const findCount = new Map();
 for (const r of histRows) findCount.set(r.dest, (findCount.get(r.dest) || 0) + 1);
 
-// Top-N catalogue dests by find count (ties broken by IATA for a stable list). Dests with no history
-// are left out of the narrow list but stay in `allDests` for the periodic full pass above.
-const rankedDests = allDests
-  .filter((d) => findCount.has(d))
-  .sort((a, b) => (findCount.get(b) - findCount.get(a)) || (a < b ? -1 : 1))
-  .slice(0, TOP_DESTS);
-
-// What we will actually sweep. A full pass — or a first-ever run with no history to rank on — asks
-// the whole catalogue; otherwise just the top-N.
-const bootstrap = findCount.size === 0;
-const selectedDests = (isFullSweep || bootstrap) ? allDests : rankedDests;
-const sweepMode = isFullSweep ? 'FULL (periodic catalogue pass)'
-  : bootstrap ? 'FULL (bootstrap — no history yet)'
-  : `TOP-${TOP_DESTS} by history`;
+const destinationPlan = planWindowDestinations({
+  allDests, findCount, planDate, topCount: TOP_DESTS, mode: destinationMode,
+});
+const selectedDests = destinationPlan.selected;
+const sweepMode = destinationPlan.bootstrap ? 'FULL (bootstrap — no history yet)'
+  : destinationMode === 'full' ? 'FULL (manual override)'
+  : destinationMode === 'top-only' ? `TOP-${TOP_DESTS} only (manual override)`
+  : `TOP-${destinationPlan.top.length} + weekly tail ${destinationPlan.slice + 1}/7 (${destinationPlan.tail.length})`;
 console.log(`Selection [${sweepMode}]: catalogue ${allDests.length} → asking ${selectedDests.length}, filtered out ${allDests.length - selectedDests.length} (${findCount.size} dests ever produced a fare).`);
 
 // Resume: skip (origin, dest) pairs already marked done for THIS plan_date, so the workflow's
