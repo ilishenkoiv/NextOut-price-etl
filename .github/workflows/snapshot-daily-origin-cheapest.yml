@@ -1,14 +1,18 @@
 name: Daily cheapest offers snapshot
 
 on:
-  schedule:
-    # Two daily result epochs: after the full night sweep and after the near-month daytime sweep.
-    # Off the top of the hour to reduce GitHub schedule delays.
-    - cron: '30 6,14 * * *' # 08:30 and 16:30 Berlin summer
+  # Build a new roulette only from a completed main sweep. The main collector can start late
+  # and can run for hours, so a wall-clock cron would sometimes publish a half-refreshed pool.
+  workflow_run:
+    workflows: ['Twice-daily price fetch']
+    types: [completed]
   workflow_dispatch:
 
+# Share the collector's repository-wide lock. `workflow_run` normally starts only after the
+# triggering sweep has released it; the shared group also makes a manual snapshot wait behind an
+# active/delayed sweep and closes the small race with another collector run entering the queue.
 concurrency:
-  group: daily-origin-cheapest
+  group: price-fetch
   cancel-in-progress: false
 
 permissions:
@@ -16,6 +20,11 @@ permissions:
 
 jobs:
   snapshot:
+    # A failed/cancelled sweep may contain only part of the horizon. Keep the previous roulette in
+    # that case. Manual runs remain available for an explicit owner retry and still obey the lock.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

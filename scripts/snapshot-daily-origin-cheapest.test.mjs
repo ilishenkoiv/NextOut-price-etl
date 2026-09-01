@@ -50,3 +50,15 @@ test('production snapshot query refuses source observations older than 36 hours'
   assert.match(source, /MAX_SOURCE_AGE_MS = 36 \* 60 \* 60 \* 1000/);
   assert.match(source, /\.gte\('updated_at', freshSince\)/);
 });
+
+test('roulette snapshot waits for a successful main price sweep', () => {
+  const workflow = readFileSync(
+    new URL('../.github/workflows/snapshot-daily-origin-cheapest.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Twice-daily price fetch'\]\s*\n\s+types: \[completed\]/);
+  assert.match(workflow, /group: price-fetch/);
+  assert.match(workflow, /github\.event\.workflow_run\.conclusion == 'success'/);
+  assert.doesNotMatch(workflow, /^\s+schedule:/m);
+  assert.doesNotMatch(workflow, /group: daily-origin-cheapest/);
+});
