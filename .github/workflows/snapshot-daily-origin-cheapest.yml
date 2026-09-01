@@ -5,6 +5,7 @@ on:
     # Revalidate only the tickets in the current roulette every two hours. If the main sweep is
     # late or still running, the gate below skips this run; `workflow_run` rebuilds after the sweep.
     - cron: '37 */2 * * *'
+      timezone: 'Europe/Berlin' # stable local epochs: 00:37, 02:37, ... through CET/CEST
   # A successful main sweep already refreshed the source offers, so rebuild immediately after it.
   workflow_run:
     workflows: ['Twice-daily price fetch']

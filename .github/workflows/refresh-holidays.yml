@@ -3,24 +3,19 @@ name: Yearly holiday-calendar refresh
 # Refreshes the public_holidays table (DE/AT/CH, two years ahead) once a year. The price
 # collector reads it to decide which date windows to search.
 #
-# SCHEDULE — deliberately clear of every other job in this repo:
-#   • price fetch, night sweep : '0 23 * * *' (23:00 UTC)
-#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
-#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
-# This job runs 20 Nov at 03:00 UTC — a different time of day AND a once-a-year date, so it can
-# never overlap the daily price runs or the weekly keepalive.
+# Annual maintenance is scheduled in the Berlin night window and shares the maintenance lock.
 on:
   schedule:
-    - cron: '0 3 20 11 *' # 20 Nov, 03:00 UTC (04:00 Europe/Berlin, CET) — next year's calendar in good time
+    - cron: '52 0 20 11 *'
+      timezone: 'Europe/Berlin' # 20 Nov, 00:52 Berlin
   workflow_dispatch: # manual runs are always possible
 
-# Its OWN concurrency group — not the price-fetch group — so it neither queues behind nor blocks
-# the collector.
 concurrency:
-  group: holidays-refresh
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -29,19 +24,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+
       - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/checkout@v7
 
       - name: Setup Node
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
+        if: steps.night.outputs.allowed == 'true'
         run: npm ci
 
       - name: Fetch holidays → Supabase
+        if: steps.night.outputs.allowed == 'true'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: node scripts/fetch-holidays.mjs

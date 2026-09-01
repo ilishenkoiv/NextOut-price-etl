@@ -14,27 +14,21 @@ name: Daily window_prices cleanup
 # NO new migration is needed: 20260810120000_window_prices.sql already grants service_role DELETE
 # on the table (same key this job uses).
 #
-# SCHEDULE — deliberately clear of every other job in this repo:
-#   • price fetch, night sweep  : '0 23 * * *' (23:00 UTC)
-#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
-#   • app_errors cleanup        : '0 7 * * *'  (07:00 UTC)
-#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
-#   • yearly holiday refresh    : '0 3 20 11 *' (20 Nov, 03:00 UTC)
-#   • window sweep              : '0 1 * * *' and '0 13 * * *' (01:00 / 13:00 UTC) + manual (workflow_dispatch)
-# This job runs daily at 06:00 UTC — a free hour, clear of both price sweeps and the 07:00 cleanup.
+# Scheduled maintenance is restricted to 00:00–06:00 Europe/Berlin. The runtime gate below catches
+# delayed GitHub schedules and daytime manual dispatches. Maintenance is serialized, and the gate
+# refuses to start while either price collector or the roulette refresh is active/queued.
 on:
   schedule:
-    - cron: '0 6 * * *' # 06:00 UTC daily — free hour, clear of the 23:00/10:00 sweeps and 07:00 cleanup
+    - cron: '22 1 * * *'
+      timezone: 'Europe/Berlin' # 01:22 Berlin daily
   workflow_dispatch: # manual runs are always possible
 
-# Its OWN concurrency group — NOT the sweep's 'window-prices' and NOT 'price-fetch' — so it never
-# queues behind the long window sweep nor blocks it. Safe because the two act on disjoint date
-# ranges: this deletes only PAST departures, the sweep only writes FUTURE windows.
 concurrency:
-  group: window-prices-cleanup
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -43,19 +37,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+
       - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/checkout@v7
 
       - name: Setup Node
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
+        if: steps.night.outputs.allowed == 'true'
         run: npm ci
 
       - name: Delete window_prices rows whose departure has passed
+        if: steps.night.outputs.allowed == 'true'
         # Same secret the collectors use — the service-role key deletes past RLS.
         # SUPABASE_URL passed alongside it (public, not a secret); default = the value used now.
         env:

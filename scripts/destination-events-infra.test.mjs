@@ -23,7 +23,10 @@ test('review writes are service-role-only and require a valid nights range',()=>
 });
 
 test('workflow is monthly and collector uses a rolling six-month window',()=>{
-  assert.match(workflow,/cron: '27 4 2 \* \*'/);
+  assert.match(workflow,/cron: '52 0 2 \* \*'/);
+  assert.match(workflow,/timezone: 'Europe\/Berlin'/);
+  assert.match(workflow,/group: etl-night-maintenance/);
+  assert.match(workflow,/minute_of_day < 60 && busy == 0/);
   assert.match(workflow,/timeout-minutes: 90/);
   assert.match(workflow,/WIKIDATA_CONCURRENCY: '3'/);
   assert.match(workflow,/scripts\/fetch-destination-events\.mjs/);

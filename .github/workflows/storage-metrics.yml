@@ -10,27 +10,20 @@ name: Daily storage metrics
 # the script no-ops (logs "not applied yet", exits 0), so a run scheduled before the migration lands
 # does not turn the workflow red.
 #
-# SCHEDULE — after the nightly collection, and clear of every other job in this repo:
-#   • price fetch, night sweep  : '0 23 * * *' (23:00 UTC) — the main nightly write
-#   • price fetch, midday sweep : '0 10 * * *' (10:00 UTC)
-#   • window sweep              : '0 1 * * *' and '0 13 * * *' (01:00 / 13:00 UTC)
-#   • window_prices cleanup     : '0 6 * * *'  (06:00 UTC)
-#   • app_errors cleanup        : '0 7 * * *'  (07:00 UTC)
-#   • schedule keepalive        : '0 18 * * 0' (Sun 18:00 UTC)
-# This job runs daily at 08:00 UTC — a free hour, AFTER the nightly sweep has written and AFTER both
-# cleanups have pruned, so the numbers reflect the day's settled, post-cleanup state.
+# Runs after all four daily cleanup slots, before the 02:37 roulette refresh and 03:07 carousel
+# collection. Europe/Berlin keeps the order stable through DST changes.
 on:
   schedule:
-    - cron: '0 8 * * *' # 08:00 UTC daily — after the nightly sweep and the 06:00/07:00 cleanups
+    - cron: '7 2 * * *'
+      timezone: 'Europe/Berlin' # 02:07 Berlin daily, after cleanups
   workflow_dispatch: # manual runs are always possible
 
-# Its OWN concurrency group — read-only against the data, one tiny insert — so it neither queues
-# behind nor blocks any collector or cleanup.
 concurrency:
-  group: storage-metrics
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -39,19 +32,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+
       - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/checkout@v7
 
       - name: Setup Node
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
+        if: steps.night.outputs.allowed == 'true'
         run: npm ci
 
       - name: Measure storage usage and append a row
+        if: steps.night.outputs.allowed == 'true'
         # Same secret every other job uses — the service-role key. It is the ONLY way to execute the
         # collector function and read/write the closed table. SUPABASE_URL is public (not a secret).
         env:

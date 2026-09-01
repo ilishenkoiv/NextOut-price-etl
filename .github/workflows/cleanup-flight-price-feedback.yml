@@ -4,14 +4,16 @@ name: Daily flight price feedback cleanup
 # so this workflow can land before the app migration is enabled in production.
 on:
   schedule:
-    - cron: '0 9 * * *' # 09:00 UTC, clear of price sweeps and other maintenance jobs
+    - cron: '37 1 * * *'
+      timezone: 'Europe/Berlin' # 01:37 Berlin daily
   workflow_dispatch:
 
 concurrency:
-  group: flight-price-feedback-cleanup
+  group: etl-night-maintenance
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -20,16 +22,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Enforce the 00:00–06:00 Berlin maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
       - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/checkout@v7
       - name: Setup Node
+        if: steps.night.outputs.allowed == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '22'
           cache: 'npm'
       - name: Install dependencies
+        if: steps.night.outputs.allowed == 'true'
         run: npm ci
       - name: Delete old flight feedback
+        if: steps.night.outputs.allowed == 'true'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
