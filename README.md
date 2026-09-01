@@ -23,6 +23,15 @@ network or malformed-response failure preserves the previous value. If the main 
 fetch` is queued or running, the two-hour refresh skips its work. A successful main sweep triggers
 the roulette rebuild itself, so the lightweight checker never competes with the main collector.
 
+## Storage retention
+
+`.github/workflows/cleanup-price-storage.yml` runs at 00:02 Europe/Berlin on the first day of each
+quarter. It keeps canonical `price-snapshots` objects for 365 days and
+`window_price_progress` resume markers for 35 days. Unknown Storage objects are never deleted.
+The workflow uses the shared night-maintenance lock and skips all work outside the protected night
+window or while the main price collector, carousel collector, or roulette refresh is active/queued.
+Manual runs default to `dry-run`; scheduled quarterly runs use `apply`.
+
 ## Destination events
 
 `npm run fetch-events` discovers exact-date Wikidata records within 35 km of all 139 destination
