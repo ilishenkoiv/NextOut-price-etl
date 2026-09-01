@@ -1,0 +1,70 @@
+name: Quarterly price snapshot cleanup
+
+on:
+  schedule:
+    - cron: '2 0 1 1,4,7,10 *'
+      timezone: 'Europe/Berlin' # first day of each quarter, 00:02 Berlin
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry-run only reports candidates; apply performs deletion'
+        type: choice
+        options: [dry-run, apply]
+        default: dry-run
+
+concurrency:
+  group: etl-night-maintenance
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  cleanup:
+    name: Prune old snapshots and sweep markers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Enforce the Berlin night maintenance window
+        id: night
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour="$(TZ=Europe/Berlin date +%H)"
+          minute="$(TZ=Europe/Berlin date +%M)"
+          minute_of_day=$((10#$hour * 60 + 10#$minute))
+          busy=0
+          for status in in_progress queued; do
+            count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
+            busy=$((busy + count))
+          done
+          if (( minute_of_day < 140 && busy == 0 )); then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
+          fi
+
+      - name: Checkout
+        if: steps.night.outputs.allowed == 'true'
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        if: steps.night.outputs.allowed == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.night.outputs.allowed == 'true'
+        run: npm ci
+
+      - name: Keep one year of snapshots and 35 days of progress markers
+        if: steps.night.outputs.allowed == 'true'
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.mode != 'apply' && '1' || '0' }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/cleanup-price-storage.mjs

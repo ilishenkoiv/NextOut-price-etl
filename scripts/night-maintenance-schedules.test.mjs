@@ -8,6 +8,7 @@ const maintenance = [
   'cleanup-window-prices.yml',
   'cleanup-flight-price-feedback.yml',
   'cleanup-destination-requests.yml',
+  'cleanup-price-storage.yml',
   'storage-metrics.yml',
   'keepalive.yml',
   'refresh-holidays.yml',
@@ -44,4 +45,13 @@ test('roulette refresh epochs stay fixed in Berlin around the maintenance gap', 
   const workflow = fs.readFileSync(new URL('snapshot-daily-origin-cheapest.yml', workflowDir), 'utf8');
   assert.match(workflow, /cron: '37 \*\/2 \* \* \*'/);
   assert.match(workflow, /timezone: 'Europe\/Berlin'/);
+});
+
+test('quarterly storage retention runs at the start of the protected night gap', () => {
+  const workflow = fs.readFileSync(new URL('cleanup-price-storage.yml', workflowDir), 'utf8');
+  assert.match(workflow, /cron: '2 0 1 1,4,7,10 \*'/);
+  assert.match(workflow, /node scripts\/cleanup-price-storage\.mjs/);
+  assert.match(workflow, /Keep one year of snapshots and 35 days of progress markers/);
+  assert.match(workflow, /options: \[dry-run, apply\]/);
+  assert.match(workflow, /DRY_RUN:.*github\.event_name == 'workflow_dispatch'/);
 });
