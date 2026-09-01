@@ -1,28 +1,33 @@
 name: Daily cheapest offers snapshot
 
 on:
-  # Build a new roulette only from a completed main sweep. The main collector can start late
-  # and can run for hours, so a wall-clock cron would sometimes publish a half-refreshed pool.
+  schedule:
+    # Revalidate only the tickets in the current roulette every two hours. If the main sweep is
+    # late or still running, the gate below skips this run; `workflow_run` rebuilds after the sweep.
+    - cron: '37 */2 * * *'
+  # A successful main sweep already refreshed the source offers, so rebuild immediately after it.
   workflow_run:
     workflows: ['Twice-daily price fetch']
     types: [completed]
   workflow_dispatch:
 
-# Share the collector's repository-wide lock. `workflow_run` normally starts only after the
-# triggering sweep has released it; the shared group also makes a manual snapshot wait behind an
-# active/delayed sweep and closes the small race with another collector run entering the queue.
+# Never put this workflow in the collector's `price-fetch` group. GitHub retains only one pending
+# run per concurrency group, so a two-hour refresh could otherwise replace a queued main sweep.
+# Duplicate roulette refreshes may collapse safely; the main collector always keeps priority.
 concurrency:
-  group: price-fetch
+  group: roulette-refresh
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   snapshot:
     # A failed/cancelled sweep may contain only part of the horizon. Keep the previous roulette in
     # that case. Manual runs remain available for an explicit owner retry and still obey the lock.
     if: >-
+      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
@@ -33,8 +38,32 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-      - run: npm ci
+      - id: collector-gate
+        name: Check whether the main price sweep is active
+        if: github.event_name != 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          active="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/fetch-prices.yml/runs" \
+            -f per_page=20 --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length')"
+          if [ "$active" -gt 0 ]; then
+            echo 'refresh=false' >> "$GITHUB_OUTPUT"
+            echo "Main price sweep is active (${active} run(s)); targeted refresh skipped. Its workflow_run event will rebuild the roulette after completion."
+          else
+            echo 'refresh=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install dependencies
+        if: github.event_name == 'workflow_run' || steps.collector-gate.outputs.refresh == 'true'
+        run: npm ci
+      - name: Revalidate current roulette tickets
+        if: github.event_name != 'workflow_run' && steps.collector-gate.outputs.refresh == 'true'
+        env:
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/refresh-roulette-prices.mjs
       - name: Save daily cheapest real offer per origin
+        if: github.event_name == 'workflow_run' || steps.collector-gate.outputs.refresh == 'true'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}

@@ -9,6 +9,7 @@
   "scripts": {
     "test": "node --test",
     "fetch-prices": "node scripts/fetch-prices.mjs",
+    "refresh-roulette": "node scripts/refresh-roulette-prices.mjs",
     "fetch-holidays": "node scripts/fetch-holidays.mjs",
     "fetch-events": "node scripts/fetch-destination-events.mjs",
     "audit-holiday-sources": "node scripts/audit-destination-holiday-sources.mjs",
