@@ -17,7 +17,11 @@
     "review-photos": "node scripts/review.mjs",
     "optimize-photos": "node scripts/optimize-photos.mjs",
     "upload-photos": "node scripts/upload-photos.mjs",
-    "deploy-expansion-data": "node scripts/deploy-expansion-data.mjs"
+    "deploy-expansion-data": "node scripts/deploy-expansion-data.mjs",
+    "weather:fetch-weekly": "python scripts/fetch-copernicus-weekly.py",
+    "weather:build-weekly": "node scripts/build-weekly-climate.mjs",
+    "weather:verify-weekly": "node scripts/verify-weekly-climate.mjs",
+    "weather:verify-production": "node scripts/verify-production-weekly.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.1",

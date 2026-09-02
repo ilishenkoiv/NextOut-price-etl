@@ -9,6 +9,8 @@ node_modules/
 # logs / os
 *.log
 .DS_Store
+__pycache__/
+*.pyc
 
 # price snapshots — uploaded to the private `price-snapshots` Supabase Storage bucket by
 # scripts/fetch-prices.mjs, no longer committed here. Files already in history are left
@@ -22,6 +24,11 @@ snapshot-report-*.json
 # curated destination photos — downloaded/generated locally, NOT committed (public repo).
 # Includes candidates, optimized WebP, manifest.json, selected.json, review.html.
 photos/
+
+# Large local Copernicus downloads/intermediates. The compact verified JSON and generated SQL
+# migration remain tracked as the reproducible release payload.
+data/copernicus-weekly/
+data/weather-weekly-normals.partial.json
 
 # ad-hoc local analytics over the collected tables — read-only throwaway tooling, run by hand
 # against a live database. Not part of the pipeline and not meant for a public repository.
