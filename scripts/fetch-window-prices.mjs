@@ -46,6 +46,7 @@
 //   TOP_DESTS            — history-narrowed destinations asked per origin (default 50).
 //   FULL_SWEEP           — '1' force a full catalogue pass, '0' force top-only;
 //                          default: TOP_DESTS plus today's one-seventh catalogue tail.
+import { withPriceProvenance } from './price-provenance.mjs';
 import { createClient } from '@supabase/supabase-js';
 import { planWindowDestinations } from './window-destination-plan.mjs';
 
@@ -294,7 +295,7 @@ const WP_CONFLICT = 'origin,dest,flight_type,departure_at,return_at';
 async function upsertWithRetry(table, rows, delays) {
   const maxAttempts = delays.length + 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const { error } = await supabase.from(table).upsert(rows, { onConflict: WP_CONFLICT });
+    const { error } = await supabase.from(table).upsert(table === 'window_prices' ? withPriceProvenance(rows, 'window_prices') : rows, { onConflict: WP_CONFLICT });
     if (!error) return rows.length;
     console.warn(`    ${table} upsert attempt ${attempt}/${maxAttempts} failed: ${error.code || ''} ${error.message}`);
     if (attempt === maxAttempts) throw new Error(`${table} upsert failed after ${maxAttempts} attempts: ${error.message}`);

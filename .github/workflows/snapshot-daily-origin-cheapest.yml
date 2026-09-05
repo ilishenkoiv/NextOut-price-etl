@@ -2,10 +2,10 @@ name: Daily cheapest offers snapshot
 
 on:
   schedule:
-    # Revalidate only the tickets in the current roulette every two hours. If the main sweep is
-    # late or still running, the gate below skips this run; `workflow_run` rebuilds after the sweep.
-    - cron: '37 */2 * * *'
-      timezone: 'Europe/Berlin' # stable local epochs: 00:37, 02:37, ... through CET/CEST
+    # Priority-0 price-only recheck. It never rebuilds or re-ranks the immutable roulette pool.
+    # An idle gate and in-process watcher make it yield to every other queued/running workflow.
+    - cron: '7,37 * * * *'
+      timezone: 'Europe/Berlin'
   # A successful main sweep already refreshed the source offers, so rebuild immediately after it.
   workflow_run:
     workflows: ['Twice-daily price fetch']
@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
 
 # Never put this workflow in the collector's `price-fetch` group. GitHub retains only one pending
-# run per concurrency group, so a two-hour refresh could otherwise replace a queued main sweep.
-# Duplicate roulette refreshes may collapse safely; the main collector always keeps priority.
+# run per concurrency group, so a priority-0 refresh could otherwise replace a queued main sweep.
+# Duplicate price-only refreshes may collapse safely; every other workflow keeps priority.
 concurrency:
   group: roulette-refresh
   cancel-in-progress: false
@@ -39,32 +39,28 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-      - id: collector-gate
-        name: Check whether the main price sweep is active
+      - id: idle-gate
+        name: Run only when the entire ETL is idle (priority 0)
         if: github.event_name != 'workflow_run'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          active="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/fetch-prices.yml/runs" \
-            -f per_page=20 --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending")] | length')"
-          if [ "$active" -gt 0 ]; then
-            echo 'refresh=false' >> "$GITHUB_OUTPUT"
-            echo "Main price sweep is active (${active} run(s)); targeted refresh skipped. Its workflow_run event will rebuild the roulette after completion."
-          else
-            echo 'refresh=true' >> "$GITHUB_OUTPUT"
-          fi
+          node --input-type=module -e "import {githubIsIdle} from './scripts/check-flight-price-feedback.mjs'; import fs from 'node:fs'; const idle=await githubIsIdle({token:process.env.GITHUB_TOKEN,repository:process.env.GITHUB_REPOSITORY,runId:process.env.GITHUB_RUN_ID,ownWorkflowName:'Daily cheapest offers snapshot'}); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'idle='+idle+'\\n');"
       - name: Install dependencies
-        if: github.event_name == 'workflow_run' || steps.collector-gate.outputs.refresh == 'true'
+        if: github.event_name == 'workflow_run' || steps.idle-gate.outputs.idle == 'true'
         run: npm ci
-      - name: Revalidate current roulette tickets
-        if: github.event_name != 'workflow_run' && steps.collector-gate.outputs.refresh == 'true'
+      - name: Revalidate current roulette tickets without rebuilding its pool
+        if: github.event_name != 'workflow_run' && steps.idle-gate.outputs.idle == 'true'
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/refresh-roulette-prices.mjs
       - name: Save daily cheapest real offer per origin
-        if: github.event_name == 'workflow_run' || steps.collector-gate.outputs.refresh == 'true'
+        # Only a completed primary sweep rebuilds the immutable pool. Scheduled priority-0 runs
+        # above update exact offer prices only, leaving membership/order/history untouched.
+        if: github.event_name == 'workflow_run'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}

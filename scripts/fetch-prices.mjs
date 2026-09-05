@@ -17,6 +17,7 @@
 // Hotellook integration was removed because the upstream endpoints (engine.hotellook.com)
 // were discontinued and return 404 on everything.
 
+import { withPriceProvenance } from './price-provenance.mjs';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
@@ -1209,7 +1210,7 @@ async function main() {
     while (priceBuf.length >= BATCH || (force && priceBuf.length > 0)) {
       const rows = priceBuf.splice(0, BATCH);
       const r = await writeWithRetry(`prices upsert (${rows.length} rows)`, () =>
-        supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' }),
+        supabase.from('prices').upsert(withPriceProvenance(rows, 'prices'), { onConflict: 'origin,dest,month' }),
       { target: 'prices', rows: rows.length });
       if (r.ok) pricesWritten += rows.length;
       else {
@@ -1266,7 +1267,7 @@ async function main() {
       const rows = offerBuf.splice(0, BATCH);
       const r = await writeWithRetry(`offers upsert (${rows.length} rows)`, () => supabase
         .from('offers')
-        .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }),
+        .upsert(withPriceProvenance(rows, 'offers'), { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }),
       { target: 'offers', rows: rows.length });
       if (r.ok) offersWritten += rows.length;
       else {

@@ -51,17 +51,19 @@ test('production snapshot query refuses source observations older than 36 hours'
   assert.match(source, /\.gte\('updated_at', freshSince\)/);
 });
 
-test('roulette refresh runs every two hours and waits behind the main price sweep', () => {
+test('priority-0 roulette price refresh runs every 30 minutes and never rebuilds the pool', () => {
   const workflow = readFileSync(
     new URL('../.github/workflows/snapshot-daily-origin-cheapest.yml', import.meta.url),
     'utf8',
   );
-  assert.match(workflow, /cron: '37 \*\/2 \* \* \*'/);
+  assert.match(workflow, /cron: '7,37 \* \* \* \*'/);
   assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Twice-daily price fetch'\]\s*\n\s+types: \[completed\]/);
   assert.match(workflow, /group: roulette-refresh/);
-  assert.match(workflow, /actions\/workflows\/fetch-prices\.yml\/runs/);
-  assert.match(workflow, /select\(\.status == \"queued\" or \.status == \"in_progress\"/);
+  assert.match(workflow, /githubIsIdle/);
+  assert.match(workflow, /ownWorkflowName:'Daily cheapest offers snapshot'/);
   assert.match(workflow, /github\.event\.workflow_run\.conclusion == 'success'/);
-  assert.match(workflow, /node scripts\/refresh-roulette-prices\.mjs[\s\S]+node scripts\/snapshot-daily-origin-cheapest\.mjs/);
+  assert.match(workflow, /node scripts\/refresh-roulette-prices\.mjs/);
+  assert.match(workflow, /if: github\.event_name == 'workflow_run'/);
+  assert.doesNotMatch(workflow, /steps\.idle-gate\.outputs\.idle == 'true'[\s\S]{0,500}node scripts\/snapshot-daily-origin-cheapest\.mjs/);
   assert.doesNotMatch(workflow, /^\s+group: price-fetch\s*$/m);
 });

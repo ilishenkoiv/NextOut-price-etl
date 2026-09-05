@@ -1,5 +1,16 @@
 # NextOut Price ETL
 
+## Pending rollout: feedback price accuracy (2026-09-03)
+
+Local changes only: apply `migrations/20260903120000_flight_price_accuracy.sql` BEFORE publishing
+the new provenance writers. It preserves the old feedback RPC, captures an immutable database
+snapshot on receipt, and provides an owner-only audit plus a leased service-role queue.
+`check-flight-price-feedback.yml` is **priority 0**: checks all other repository workflow states,
+skips when busy/unknown, and yields if primary work arrives. No numeric GitHub priority is assumed.
+Up to 12 checks/run, three attempts/record, existing TP/Supabase secrets, no user details in logs.
+API cache data is labelled with its actual check time; it is not live checkout or a past price.
+Publish workflow/provenance together only after migration and the owner's normal commit/push signal.
+
 A standalone data-collection pipeline that gathers flight prices for the *NextOut* travel
 app and writes them into a Supabase database. It contains no product logic — no ranking,
 no scoring, no UI.
@@ -16,12 +27,15 @@ no scoring, no UI.
 
 ## Roulette price freshness
 
-`.github/workflows/snapshot-daily-origin-cheapest.yml` revalidates only the exact tickets in the
-current roulette every two hours, then builds a new roulette snapshot. A confirmed fare updates the
-cached offer; a successful empty response removes only that exact unavailable offer; an HTTP,
-network or malformed-response failure preserves the previous value. If the main `Twice-daily price
-fetch` is queued or running, the two-hour refresh skips its work. A successful main sweep triggers
-the roulette rebuild itself, so the lightweight checker never competes with the main collector.
+`.github/workflows/snapshot-daily-origin-cheapest.yml` has two deliberately separate paths. A
+successful main `Twice-daily price fetch` builds the next immutable roulette snapshot. Independently,
+a scheduled **priority-0** run every 30 minutes revalidates only the exact tickets already present
+in that snapshot: it never changes membership, ordering, or a user's revealed ticket. It starts
+only when every other workflow is idle and polls during each provider request; any new queued or
+running task aborts the recheck safely. A service-only checkpoint retains the last completed ticket,
+so the next idle interval resumes rather than competing. A confirmed fare updates the cached offer;
+a successful empty response removes only that exact unavailable offer; HTTP, network, and malformed
+responses retain the previously known price.
 
 ## Storage retention
 
