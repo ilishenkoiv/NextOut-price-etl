@@ -17,10 +17,10 @@ no scoring, no UI.
 ## Roulette price freshness
 
 `.github/workflows/snapshot-daily-origin-cheapest.yml` revalidates only the exact tickets in the
-current roulette every two hours, then builds a new roulette snapshot. A confirmed fare updates the
+current roulette every 30 minutes, then builds a new roulette snapshot. A confirmed fare updates the
 cached offer; a successful empty response removes only that exact unavailable offer; an HTTP,
 network or malformed-response failure preserves the previous value. If the main `Twice-daily price
-fetch` is queued or running, the two-hour refresh skips its work. A successful main sweep triggers
+fetch` is queued or running, the 30-minute refresh skips its work. A successful main sweep triggers
 the roulette rebuild itself, so the lightweight checker never competes with the main collector.
 
 ## Storage retention

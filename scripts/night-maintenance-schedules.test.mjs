@@ -29,10 +29,10 @@ test('every scheduled maintenance workflow is Berlin-night-only and collector-aw
   }
 });
 
-test('short maintenance leaves a buffer before the 02:37 roulette refresh', () => {
+test('short maintenance leaves a buffer before the 02:07 roulette refresh', () => {
   for (const name of maintenance.filter((name) => name !== 'refresh-destination-events.yml')) {
     const workflow = fs.readFileSync(new URL(name, workflowDir), 'utf8');
-    assert.match(workflow, /minute_of_day < 140 && busy == 0/, `${name}: 02:20 cutoff`);
+    assert.match(workflow, /minute_of_day < 100 && busy == 0/, `${name}: 01:40 cutoff`);
   }
 });
 
@@ -43,7 +43,7 @@ test('the 90-minute monthly refresh must start before 01:00', () => {
 
 test('roulette refresh epochs stay fixed in Berlin around the maintenance gap', () => {
   const workflow = fs.readFileSync(new URL('snapshot-daily-origin-cheapest.yml', workflowDir), 'utf8');
-  assert.match(workflow, /cron: '37 \*\/2 \* \* \*'/);
+  assert.match(workflow, /cron: '7,37 \* \* \* \*'/);
   assert.match(workflow, /timezone: 'Europe\/Berlin'/);
 });
 

@@ -2,10 +2,11 @@ name: Daily cheapest offers snapshot
 
 on:
   schedule:
-    # Revalidate only the tickets in the current roulette every two hours. If the main sweep is
+    # Revalidate only the tickets in the current roulette every 30 minutes. If the main sweep is
     # late or still running, the gate below skips this run; `workflow_run` rebuilds after the sweep.
-    - cron: '37 */2 * * *'
-      timezone: 'Europe/Berlin' # stable local epochs: 00:37, 02:37, ... through CET/CEST
+    # Avoid :00, where GitHub's scheduler is most congested.
+    - cron: '7,37 * * * *'
+      timezone: 'Europe/Berlin' # stable local epochs: :07 and :37 through CET/CEST
   # A successful main sweep already refreshed the source offers, so rebuild immediately after it.
   workflow_run:
     workflows: ['Twice-daily price fetch']
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
 
 # Never put this workflow in the collector's `price-fetch` group. GitHub retains only one pending
-# run per concurrency group, so a two-hour refresh could otherwise replace a queued main sweep.
+# run per concurrency group, so a 30-minute refresh could otherwise replace a queued main sweep.
 # Duplicate roulette refreshes may collapse safely; the main collector always keeps priority.
 concurrency:
   group: roulette-refresh

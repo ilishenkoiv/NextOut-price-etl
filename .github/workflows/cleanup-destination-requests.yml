@@ -35,7 +35,7 @@ jobs:
             count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
             busy=$((busy + count))
           done
-          if (( minute_of_day < 140 && busy == 0 )); then
+          if (( minute_of_day < 100 && busy == 0 )); then
             echo "allowed=true" >> "$GITHUB_OUTPUT"
           else
             echo "allowed=false" >> "$GITHUB_OUTPUT"
