@@ -22,6 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # `gh run list` needs a checked-out repository to infer GITHUB_REPOSITORY.
+      # Keeping this before the gate makes a skipped maintenance run observable and
+      # prevents a false "success" caused by gh failing outside a worktree.
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Enforce the 00:00–06:00 Berlin maintenance window
         id: night
         env:
@@ -41,9 +47,6 @@ jobs:
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
           fi
-      - name: Checkout
-        if: steps.night.outputs.allowed == 'true'
-        uses: actions/checkout@v7
       - name: Setup Node
         if: steps.night.outputs.allowed == 'true'
         uses: actions/setup-node@v6
