@@ -46,13 +46,16 @@
 //   TOP_DESTS            — history-narrowed destinations asked per origin (default 50).
 //   FULL_SWEEP           — '1' force a full catalogue pass, '0' force top-only;
 //                          default: TOP_DESTS plus today's one-seventh catalogue tail.
+import { withPriceProvenance } from './price-provenance.mjs';
 import { createClient } from '@supabase/supabase-js';
 import { planWindowDestinations } from './window-destination-plan.mjs';
+import { marketForOrigin } from '../src/data/origin-markets.js';
 
 const TP_TOKEN = process.env.TP_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const ORIGIN = (process.env.ORIGIN || '').trim().toUpperCase();
+const MARKET = ORIGIN ? marketForOrigin(ORIGIN) : null;
 const HORIZON_MONTHS = Number(process.env.HORIZON_MONTHS) || 6;
 
 if (!TP_TOKEN || !SUPABASE_SERVICE_KEY || !ORIGIN) {
@@ -238,7 +241,7 @@ async function fetchWindowFare(dest, start, end, direct) {
   const url =
     `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=${ORIGIN}` +
     `&destination=${dest}&departure_at=${start}&return_at=${end}&direct=${direct}` +
-    `&currency=eur&limit=500&token=${TP_TOKEN}`;
+    `&currency=eur&market=${MARKET}&limit=500&token=${TP_TOKEN}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
@@ -294,7 +297,7 @@ const WP_CONFLICT = 'origin,dest,flight_type,departure_at,return_at';
 async function upsertWithRetry(table, rows, delays) {
   const maxAttempts = delays.length + 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const { error } = await supabase.from(table).upsert(rows, { onConflict: WP_CONFLICT });
+    const { error } = await supabase.from(table).upsert(table === 'window_prices' ? withPriceProvenance(rows, 'window_prices') : rows, { onConflict: WP_CONFLICT });
     if (!error) return rows.length;
     console.warn(`    ${table} upsert attempt ${attempt}/${maxAttempts} failed: ${error.code || ''} ${error.message}`);
     if (attempt === maxAttempts) throw new Error(`${table} upsert failed after ${maxAttempts} attempts: ${error.message}`);
@@ -428,7 +431,7 @@ for (let di = 0; di < dests.length; di += 1) {
       made += 1;
       if (fare) {
         buffer.push({
-          origin: ORIGIN, dest, flight_type: flightType,
+          origin: ORIGIN, market: MARKET, dest, flight_type: flightType,
           departure_at: w.start, return_at: w.end, nights: w.nights,
           window_kind: w.kind, // 'weekend' | 'weekend_around' | 'holiday' — the window that produced this fare
           price: fare.price, transfers: fare.transfers, airline: fare.airline,
@@ -443,7 +446,7 @@ for (let di = 0; di < dests.length; di += 1) {
         // fare is NEVER overwritten by an empty/error answer (the table's core rule).
         missCounts[outcome] += 1;
         missBuffer.push({
-          origin: ORIGIN, dest, flight_type: flightType,
+          origin: ORIGIN, market: MARKET, dest, flight_type: flightType,
           departure_at: w.start, return_at: w.end,
           window_kind: w.kind, outcome, detail: detail || '',
           checked_at: new Date().toISOString(),

@@ -1,0 +1,37 @@
+name: Flight price feedback audit · priority 0
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: flight-price-audit-priority-zero
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Skip when any other workflow is active or queued
+        id: idle
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e "import {githubIsIdle} from './scripts/check-flight-price-feedback.mjs'; import fs from 'node:fs'; const idle=await githubIsIdle({token:process.env.GITHUB_TOKEN,repository:process.env.GITHUB_REPOSITORY,runId:process.env.GITHUB_RUN_ID}); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'idle='+idle+'\n');"
+      - run: npm ci
+        if: steps.idle.outputs.idle == 'true'
+      - name: Process a small batch, yielding to primary jobs
+        if: steps.idle.outputs.idle == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/check-flight-price-feedback.mjs

@@ -17,12 +17,14 @@
 // Hotellook integration was removed because the upstream endpoints (engine.hotellook.com)
 // were discontinued and return 404 on everything.
 
+import { withPriceProvenance } from './price-provenance.mjs';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
 import { writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
+import { marketForOrigin } from '../src/data/origin-markets.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
 import { ORIGIN_REGIONS } from '../src/data/origin-regions.js';
@@ -632,13 +634,14 @@ function nightsBetween(dep, ret) {
 // offers are clamped to departure-in-`ym` (§dedup), so the boundary window never files a trip
 // under a neighbouring month, and the same trip from two windows collapses on the offers PK.
 async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
+  const market = marketForOrigin(origin);
   const url =
     `https://api.travelpayouts.com/aviasales/v3/prices_for_dates?origin=${origin}` +
     `&destination=${dest}&departure_at=${ym}&return_at=${retYm}&direct=${direct}` +
     // limit RAISED 30→500: the cheapest 30 were all short trips (1–4n) → the long durations
     // (10/14n) drowned. 500 returns EVERY duration for combo selection. Still ONE request
     // (TP rate-limits per REQUEST, not per row) — no extra API calls.
-    `&currency=eur&limit=500&token=${TP_TOKEN}`;
+    `&currency=eur&market=${market}&limit=500&token=${TP_TOKEN}`;
   const res = await request(url);
   // Not an answer: a refusal that survived every retry, or a client-side error (§refusal). Either
   // way the cell stays UNVERIFIED — nothing is written, the previous value is kept. `reason`
@@ -671,6 +674,7 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
     const return_at = toDateOnly(x.return_at); // null for one-way
     offers.push({
       origin,
+      market,
       dest,
       month: ym,
       flight_type: flightType,
@@ -725,9 +729,10 @@ async function probeType(origin, dest, ym, retNext, direct, request) {
 // cell's type is the cheapest record's (0 changes → direct, else any) and only offers consistent
 // with that type are kept, so selection and pruning stay single-typed like a normal probe.
 async function fetchCalendarMonth(origin, dest, ym, request) {
+  const market = marketForOrigin(origin);
   const url =
     'https://api.travelpayouts.com/v2/prices/month-matrix' +
-    `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&show_to_affiliates=true&token=${TP_TOKEN}`;
+    `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&market=${market}&show_to_affiliates=true&token=${TP_TOKEN}`;
   const res = await request(url);
   // Same contract as everywhere: a refusal or a client error is NOT an empty calendar — it just
   // means we could not read one, so the fallback is ignored and no known price is clobbered.
@@ -750,7 +755,7 @@ async function fetchCalendarMonth(origin, dest, ym, request) {
   const offers = parsed
     .filter((o) => (type === 'direct' ? o.transfers === 0 : true))
     .map((o) => ({
-      origin, dest, month: ym, flight_type: type,
+      origin, market, dest, month: ym, flight_type: type,
       departure_at: o.departure_at, return_at: o.return_at,
       nights: nightsBetween(o.departure_at, o.return_at),
       price: o.price, transfers: o.transfers, airline: null, updated_at: nowIso,
@@ -873,10 +878,10 @@ function berlinStampParts(d = new Date()) {
 // A shared constant would make this check tautological — it would compare the builder's header
 // to itself and pass on any typo. Duplicated, it is a real assertion: change one and the other
 // objects. The two literals must be edited together, and that is the point.
-const SNAPSHOT_CSV_HEADER_EXPECTED = 'origin,dest,depart_month,price_direct,price_any,currency,fetched_at,scope';
-const SNAPSHOT_CSV_FIELDS = SNAPSHOT_CSV_HEADER_EXPECTED.split(',').length; // 8
-const SNAPSHOT_MONTH_COL = 2; // depart_month
-const SNAPSHOT_SCOPE_COL = 7; // scope
+const SNAPSHOT_CSV_HEADER_EXPECTED = 'origin,market,dest,depart_month,price_direct,price_any,currency,fetched_at,scope';
+const SNAPSHOT_CSV_FIELDS = SNAPSHOT_CSV_HEADER_EXPECTED.split(',').length; // 9
+const SNAPSHOT_MONTH_COL = 3; // depart_month
+const SNAPSHOT_SCOPE_COL = 8; // scope
 // Marker for the log line, deliberately distinct from WRITE_LOSS_MARKER: this is a malformed
 // artifact, not a lost write, and conflating the two greps would blur the difference.
 const SNAPSHOT_INVALID_MARKER = 'SNAPSHOT-INVALID';
@@ -1008,9 +1013,9 @@ async function uploadSnapshot(rows, scope) {
     // object for a local run than for CI.
     const key = `snapshots/${y}/${mo}/${y}-${mo}-${da}_${hh}${mi}_${scope}.csv.gz`;
     const esc = (v) => (v == null ? '' : String(v));
-    let csv = 'origin,dest,depart_month,price_direct,price_any,currency,fetched_at,scope\n';
+    let csv = 'origin,market,dest,depart_month,price_direct,price_any,currency,fetched_at,scope\n';
     for (const r of rows) {
-      csv += [r.origin, r.dest, r.month, esc(r.direct), esc(r.any), 'EUR', r.fetched_at, scope].join(',') + '\n';
+      csv += [r.origin, r.market, r.dest, r.month, esc(r.direct), esc(r.any), 'EUR', r.fetched_at, scope].join(',') + '\n';
     }
     // Validate, then upload NO MATTER WHAT the verdict is, under the unchanged key. A snapshot
     // that fails a check is the one you most want to look at, and refusing to store it — or
@@ -1209,7 +1214,7 @@ async function main() {
     while (priceBuf.length >= BATCH || (force && priceBuf.length > 0)) {
       const rows = priceBuf.splice(0, BATCH);
       const r = await writeWithRetry(`prices upsert (${rows.length} rows)`, () =>
-        supabase.from('prices').upsert(rows, { onConflict: 'origin,dest,month' }),
+        supabase.from('prices').upsert(withPriceProvenance(rows, 'prices'), { onConflict: 'origin,dest,month' }),
       { target: 'prices', rows: rows.length });
       if (r.ok) pricesWritten += rows.length;
       else {
@@ -1266,7 +1271,7 @@ async function main() {
       const rows = offerBuf.splice(0, BATCH);
       const r = await writeWithRetry(`offers upsert (${rows.length} rows)`, () => supabase
         .from('offers')
-        .upsert(rows, { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }),
+        .upsert(withPriceProvenance(rows, 'offers'), { onConflict: 'origin,dest,month,flight_type,departure_at,return_at' }),
       { target: 'offers', rows: rows.length });
       if (r.ok) offersWritten += rows.length;
       else {
@@ -1501,9 +1506,10 @@ async function main() {
         const pair = usedType === 'direct' ? { direct: res.min, any: null } : { direct: null, any: res.min };
         byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month).
-        priceBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+        const market = marketForOrigin(origin);
+        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
         // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
-        snapshotRows.push({ origin, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
+        snapshotRows.push({ origin, market, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
         // price_history: log ONLY when this price differs from the baseline (or the route is new).
         const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
@@ -1512,7 +1518,7 @@ async function main() {
           || (prev.direct ?? null) !== (pair.direct ?? null)
           || (prev.any_stops ?? null) !== (pair.any ?? null);
         if (changed && hasPrice) {
-          historyBuf.push({ origin, dest, month: ym, direct: pair.direct, any_stops: pair.any });
+          historyBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any });
           pricesChanged += 1;
         } else if (!changed) {
           pricesUnchanged += 1;

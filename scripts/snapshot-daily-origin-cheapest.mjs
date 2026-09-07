@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { pathToFileURL } from 'node:url';
+import { marketForOrigin } from '../src/data/origin-markets.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -60,7 +61,7 @@ async function main() {
   const offers = [];
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase.from('offers')
-    .select('origin,dest,flight_type,price,departure_at,return_at,transfers,updated_at')
+    .select('origin,market,dest,flight_type,price,departure_at,return_at,transfers,updated_at,price_source')
     .gte('departure_at', observedOn).gte('updated_at', freshSince).gt('price', 0)
     .order('origin').order('flight_type').order('price').range(from, from + PAGE - 1);
     if (error) throw error;
@@ -73,6 +74,7 @@ async function main() {
   observed_on: observedOn,
   snapshot_at: snapshotAt,
   origin: row.origin,
+  market: row.market || marketForOrigin(row.origin),
   flight_type: row.flight_type,
   rank: row.rank,
   dest: row.dest,
@@ -82,6 +84,7 @@ async function main() {
   return_at: row.return_at || null,
   transfers: Number(row.transfers ?? 0),
   source_updated_at: row.updated_at || null,
+  price_source: row.price_source || null,
   }));
   // Keep the compatibility table's historical contract: one rank-1 row for each origin/mode.
   // The roulette pool above is intentionally different: ten unique destinations per origin.
@@ -89,6 +92,7 @@ async function main() {
     observed_on: observedOn,
     snapshot_at: snapshotAt,
     origin: row.origin,
+    market: row.market || marketForOrigin(row.origin),
     flight_type: row.flight_type,
     dest: row.dest,
     price: Number(row.price),
@@ -97,6 +101,7 @@ async function main() {
     return_at: row.return_at || null,
     transfers: Number(row.transfers ?? 0),
     source_updated_at: row.updated_at || null,
+  price_source: row.price_source || null,
   }));
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');
