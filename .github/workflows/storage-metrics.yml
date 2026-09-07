@@ -32,11 +32,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Enforce the 00:00–06:00 Berlin maintenance window
         id: night
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A manual measurement only appends today's idempotent metrics row and is safe at any
+          # time. Scheduled runs retain the protected night/collector-idle gate below.
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual storage measurement: allowed outside the maintenance window."
+            exit 0
+          fi
           hour="$(TZ=Europe/Berlin date +%H)"
           minute="$(TZ=Europe/Berlin date +%M)"
           minute_of_day=$((10#$hour * 60 + 10#$minute))
@@ -51,10 +61,6 @@ jobs:
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "Skipping maintenance: Berlin time ${hour}:${minute}; active/queued collectors: ${busy}."
           fi
-
-      - name: Checkout
-        if: steps.night.outputs.allowed == 'true'
-        uses: actions/checkout@v7
 
       - name: Setup Node
         if: steps.night.outputs.allowed == 'true'
