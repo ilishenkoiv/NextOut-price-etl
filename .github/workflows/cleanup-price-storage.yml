@@ -37,6 +37,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A manual dry-run is read-only. Allow it at any time so retention can be
+          # audited without waiting for the next quarterly window; `apply` remains
+          # subject to the same night/idle gate as the scheduled deletion.
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ inputs.mode }}" == 'dry-run' ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dry-run: allowing read-only retention audit outside the maintenance window."
+            exit 0
+          fi
           hour="$(TZ=Europe/Berlin date +%H)"
           minute="$(TZ=Europe/Berlin date +%M)"
           minute_of_day=$((10#$hour * 60 + 10#$minute))
