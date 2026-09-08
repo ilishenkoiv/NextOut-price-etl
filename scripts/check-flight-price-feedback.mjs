@@ -92,7 +92,8 @@ export async function main(env = process.env) {
   const { createClient } = await import('@supabase/supabase-js');
   const db = createClient(env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co', env.SUPABASE_SERVICE_KEY,
     { auth: { persistSession: false } });
-  for (let i = 0; i < 12; i++) {
+  let processed = 0;
+  for (;;) {
     if (!await idle()) break;
     const { data, error } = await db.rpc('claim_flight_price_audit');
     if (error) throw new Error('Audit claim failed; verify migration and service-role grants.');
@@ -108,8 +109,10 @@ export async function main(env = process.env) {
     if (finished.error || finished.data !== true) throw new Error('Audit completion failed; lease will expire safely.');
     console.log(`Priority 0: ${result.status}`); // no user trip, ID, provider body or credential in logs
     if (result.status === 'pending') break;
+    processed++;
     await pause(1100);
   }
+  console.log(`Priority 0 nightly audit: ${processed} record(s) completed.`);
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   main().catch(() => { console.error('Price audit failed; inspect safe job status and deployment prerequisites.'); process.exitCode = 1; });

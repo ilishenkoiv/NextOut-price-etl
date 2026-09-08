@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { githubIsIdle, checkTicket, classifyResponse, ticketFromFeedback, WORKFLOW_NAME } from './check-flight-price-feedback.mjs';
 import { withPriceProvenance } from './price-provenance.mjs';
+import fs from 'node:fs';
 
 const ticket={origin:'BER',dest:'PMI',depart:'2027-01-10',ret:'2027-01-17',mode:'direct'};
 const fare={origin:'BER',destination:'PMI',departure_at:'2027-01-10T00:00:00Z',return_at:'2027-01-17T00:00:00Z',transfers:0,price:120};
@@ -56,4 +57,14 @@ test('provenance follows each row observation and does not mutate input',()=>{
   assert.equal(out.price_source.run_id,'123');assert.equal(out.price_source.run_attempt,2);
   assert.equal(out.price_source.observed_at,row.updated_at);assert.equal(row.price_source,undefined);
   assert.equal(out.price_source.market,'de');
+});
+test('nightly workflow runs once in Berlin and drains the queue instead of stopping at twelve',()=>{
+  const workflow=fs.readFileSync(new URL('../.github/workflows/check-flight-price-feedback.yml',import.meta.url),'utf8');
+  const worker=fs.readFileSync(new URL('./check-flight-price-feedback.mjs',import.meta.url),'utf8');
+  assert.match(workflow,/cron: '47 4 \* \* \*'/);
+  assert.match(workflow,/timezone: 'Europe\/Berlin'/);
+  assert.match(workflow,/timeout-minutes: 120/);
+  assert.match(workflow,/Process all accumulated feedback audits/);
+  assert.match(worker,/for \(;;\)/);
+  assert.doesNotMatch(worker,/i < 12/);
 });

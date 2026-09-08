@@ -18,9 +18,10 @@ backfilled from origin; their older provenance remains unchanged.
 Local changes only: apply `migrations/20260903120000_flight_price_accuracy.sql` BEFORE publishing
 the new provenance writers. It preserves the old feedback RPC, captures an immutable database
 snapshot on receipt, and provides an owner-only audit plus a leased service-role queue.
-`check-flight-price-feedback.yml` is **priority 0**: checks all other repository workflow states,
-skips when busy/unknown, and yields if primary work arrives. No numeric GitHub priority is assumed.
-Up to 12 checks/run, three attempts/record, existing TP/Supabase secrets, no user details in logs.
+`check-flight-price-feedback.yml` runs once nightly at 04:47 Europe/Berlin with **priority 0**:
+checks all other repository workflow states, skips when busy/unknown, and yields if primary work
+arrives. It drains all accumulated eligible feedback audits in the free night window. No numeric
+GitHub priority is assumed. Three attempts/record, existing TP/Supabase secrets, no user details in logs.
 API cache data is labelled with its actual check time; it is not live checkout or a past price.
 Publish workflow/provenance together only after migration and the owner's normal commit/push signal.
 
