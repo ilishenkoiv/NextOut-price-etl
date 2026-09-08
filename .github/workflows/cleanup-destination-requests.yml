@@ -41,7 +41,9 @@ jobs:
             count="$(gh run list --status "$status" --limit 100 --json workflowName --jq '[.[] | select(.workflowName == "Twice-daily price fetch" or .workflowName == "Carousel window prices" or .workflowName == "Daily cheapest offers snapshot")] | length')" || count=1
             busy=$((busy + count))
           done
-          if (( minute_of_day < 140 && busy == 0 )); then
+          # GitHub scheduled this 01:52 job at 03:29 on 08.09. Keep the documented 00:00–06:00
+          # maintenance window instead of silently skipping every delayed runner start.
+          if (( minute_of_day < 360 && busy == 0 )); then
             echo "allowed=true" >> "$GITHUB_OUTPUT"
           else
             echo "allowed=false" >> "$GITHUB_OUTPUT"

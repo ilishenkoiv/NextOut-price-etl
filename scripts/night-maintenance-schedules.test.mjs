@@ -30,10 +30,15 @@ test('every scheduled maintenance workflow is Berlin-night-only and collector-aw
 });
 
 test('short maintenance leaves a buffer before the low-priority roulette refresh window', () => {
-  for (const name of maintenance.filter((name) => name !== 'refresh-destination-events.yml')) {
+  for (const name of maintenance.filter((name) => !['refresh-destination-events.yml', 'cleanup-destination-requests.yml'].includes(name))) {
     const workflow = fs.readFileSync(new URL(name, workflowDir), 'utf8');
     assert.match(workflow, /minute_of_day < 140 && busy == 0/, `${name}: 02:20 cutoff`);
   }
+});
+
+test('destination cleanup tolerates delayed runners inside the documented night window', () => {
+  const workflow = fs.readFileSync(new URL('cleanup-destination-requests.yml', workflowDir), 'utf8');
+  assert.match(workflow, /minute_of_day < 360 && busy == 0/);
 });
 
 test('the 90-minute monthly refresh must start before 01:00', () => {
