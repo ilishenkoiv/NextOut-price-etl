@@ -49,6 +49,7 @@
 import { withPriceProvenance } from './price-provenance.mjs';
 import { createClient } from '@supabase/supabase-js';
 import { planWindowDestinations } from './window-destination-plan.mjs';
+import { PRIORITY_EXOTIC_DESTINATIONS, priorityWatchRouteKeys } from './quote-integrity.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 
 const TP_TOKEN = process.env.TP_TOKEN;
@@ -394,6 +395,8 @@ for (const r of histRows) findCount.set(r.dest, (findCount.get(r.dest) || 0) + 1
 
 const destinationPlan = planWindowDestinations({
   allDests, findCount, planDate, topCount: TOP_DESTS, mode: destinationMode,
+  priorityDests:[...PRIORITY_EXOTIC_DESTINATIONS,...priorityWatchRouteKeys(await loadAll('price_watch_push_rules','origin,dest,watch_scope,country_code',
+    ['installation_id','watch_id'],q=>q.eq('origin',ORIGIN).eq('active',true))).map(key=>key.split('|')[1])],
 });
 const selectedDests = destinationPlan.selected;
 const sweepMode = destinationPlan.bootstrap ? 'FULL (bootstrap — no history yet)'

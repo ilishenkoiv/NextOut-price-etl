@@ -24,6 +24,7 @@ export function planWindowDestinations({
   topCount = 50,
   tailSlices = DEFAULT_TAIL_SLICES,
   mode = 'auto',
+  priorityDests = [],
 }) {
   if (!Number.isInteger(topCount) || topCount < 1) throw new Error('topCount must be a positive integer');
   if (!Number.isInteger(tailSlices) || tailSlices < 1) throw new Error('tailSlices must be a positive integer');
@@ -54,5 +55,6 @@ export function planWindowDestinations({
   const wholeTail = catalogue.filter((dest) => !topSet.has(dest));
   const slice = ((epochDay(planDate) % tailSlices) + tailSlices) % tailSlices;
   const tail = wholeTail.filter((_, index) => index % tailSlices === slice);
-  return { selected: [...top, ...tail], top, tail, slice, bootstrap: false, wholeTailCount: wholeTail.length };
+  const priority=priorityDests.filter(dest=>catalogue.includes(dest));
+  return { selected: [...new Set([...top, ...tail, ...priority])], top, tail, slice, bootstrap: false, wholeTailCount: wholeTail.length };
 }

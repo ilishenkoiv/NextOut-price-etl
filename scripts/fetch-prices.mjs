@@ -18,6 +18,7 @@
 // were discontinued and return 404 on everything.
 
 import { withPriceProvenance } from './price-provenance.mjs';
+import { roundTripOffers, monthlyQuoteProvenance, augmentDailyPriority, priorityWatchRouteKeys } from './quote-integrity.mjs';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { gzipSync } from 'node:zlib';
@@ -641,7 +642,7 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
     // limit RAISED 30→500: the cheapest 30 were all short trips (1–4n) → the long durations
     // (10/14n) drowned. 500 returns EVERY duration for combo selection. Still ONE request
     // (TP rate-limits per REQUEST, not per row) — no extra API calls.
-    `&currency=eur&market=${market}&limit=500&token=${TP_TOKEN}`;
+    `&currency=eur&market=${market}&limit=500&one_way=false&token=${TP_TOKEN}`;
   const res = await request(url);
   // Not an answer: a refusal that survived every retry, or a client-side error (§refusal). Either
   // way the cell stays UNVERIFIED — nothing is written, the previous value is kept. `reason`
@@ -689,8 +690,9 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
   }
   // `prices` min over the SAME departure-in-`ym` offers, so the cell price and its offers agree
   // (and a cross-month trip from the boundary window can set it).
-  const min = offers.length ? Math.min(...offers.map((o) => o.price)) : null;
-  return { ok: true, min, offers };
+  const roundTrips = roundTripOffers(offers);
+  const min = roundTrips.length ? Math.min(...roundTrips.map((o) => o.price)) : null;
+  return { ok: true, min, offers:roundTrips };
 }
 
 // Probe ONE cell for ONE flight type over BOTH return windows (§edge-months): return_at=ym and
@@ -732,7 +734,7 @@ async function fetchCalendarMonth(origin, dest, ym, request) {
   const market = marketForOrigin(origin);
   const url =
     'https://api.travelpayouts.com/v2/prices/month-matrix' +
-    `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&market=${market}&show_to_affiliates=true&token=${TP_TOKEN}`;
+    `?currency=eur&origin=${origin}&destination=${dest}&month=${ym}-01&market=${market}&show_to_affiliates=true&one_way=false&token=${TP_TOKEN}`;
   const res = await request(url);
   // Same contract as everywhere: a refusal or a client error is NOT an empty calendar — it just
   // means we could not read one, so the fallback is ignored and no known price is clobbered.
@@ -749,10 +751,12 @@ async function fetchCalendarMonth(origin, dest, ym, request) {
     parsed.push({ departure_at, return_at: toDateOnly(x.return_date), price, transfers });
   }
   if (!parsed.length) return { ok: false, min: null, offers: [], type: null }; // no content → ignore (§calendar)
-  const cheapest = parsed.reduce((a, b) => (b.price < a.price ? b : a));
+  const valid = parsed.filter(o=>roundTripOffers([{...o,nights:nightsBetween(o.departure_at,o.return_at)}]).length);
+  if(!valid.length)return {ok:false,min:null,offers:[],type:null};
+  const cheapest = valid.reduce((a, b) => (b.price < a.price ? b : a));
   const type = cheapest.transfers === 0 ? 'direct' : 'any';
   // Keep only offers that fit the chosen column: 'direct' means non-stop only; 'any' takes all.
-  const offers = parsed
+  const offers = valid
     .filter((o) => (type === 'direct' ? o.transfers === 0 : true))
     .map((o) => ({
       origin, market, dest, month: ym, flight_type: type,
@@ -1166,7 +1170,17 @@ async function main() {
   // a 502 burst — always cost the SAME airports, the ones sitting in the tail (DRS, LEJ went
   // uncollected repeatedly). Shuffling spreads that damage over the whole network instead of
   // concentrating it, while the seed keeps the run replayable: same date, same order.
-  const { live, dead, probed, slice } = planRoutes(seen, alive);
+  // Read only route identifiers, never tokens or user identifiers. No new Cron is needed:
+  // these routes bypass the weekly dead slice on each existing daily collection pass.
+  const watchRoutes = new Set();
+  for(let offset=0;;offset+=1000){
+    const {data,error}=await supabase.from('price_watch_push_rules').select('origin,dest,watch_scope,country_code')
+      .eq('active',true).order('installation_id').order('watch_id').range(offset,offset+999);
+    if(error)throw new Error('Cannot read active watch route priority; abort before provider requests.');
+    for(const key of priorityWatchRouteKeys(data??[]))watchRoutes.add(key);
+    if((data??[]).length<1000)break;
+  }
+  const { live, dead, probed, slice } = augmentDailyPriority(planRoutes(seen, alive),watchRoutes);
   const deadProbed = new Set(probed.map((r) => r.key));
   // Full deterministic plan (same seed as always). Manual sampling is applied to THIS shuffled
   // order — a prefix of a uniform shuffle is itself a uniform random subset — so a capped or
@@ -1507,7 +1521,7 @@ async function main() {
         byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month).
         const market = marketForOrigin(origin);
-        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString() });
+        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString(), price_source:monthlyQuoteProvenance(res.offers,res.min) });
         // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
         snapshotRows.push({ origin, market, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
@@ -1678,7 +1692,7 @@ async function main() {
 
 // Pure selection helpers, exported for unit tests. Nothing here touches the network, the Supabase
 // client or any secret, so a test can import them without booting the collector (see IS_ENTRYPOINT).
-export { selectCombo, targetSet };
+export { selectCombo, targetSet, fetchFlightMonth, fetchCalendarMonth };
 
 // Run the collector ONLY when invoked directly (`node fetch-prices.mjs`), never on import.
 if (IS_ENTRYPOINT) {
