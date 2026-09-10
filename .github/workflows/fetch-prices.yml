@@ -77,6 +77,18 @@ permissions:
   contents: read
 
 jobs:
+  # Job conditions cannot read env; expose the tracked switch through needs instead.
+  collection_config:
+    name: collection horizon gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      far_enabled: ${{ steps.horizon.outputs.far_enabled }}
+    steps:
+      - name: Read tracked horizon switch
+        id: horizon
+        run: echo "far_enabled=$ENABLE_FAR_MONTHS" >> "$GITHUB_OUTPUT"
+
   # ── NEAR window: months 1–6 ───────────────────────────────────────────────────────────────
   # These six run on BOTH cron schedules (near is refreshed twice daily) and on a manual
   # near/both run. Skipped only for a manual far-only run.
@@ -354,9 +366,9 @@ jobs:
   # change by setting ENABLE_FAR_MONTHS to true. The chain and watchdog coverage then restore.
   month_7:
     name: month 7
-    needs: month_6
+    needs: [collection_config, month_6]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -396,9 +408,9 @@ jobs:
 
   month_8:
     name: month 8
-    needs: month_7
+    needs: [collection_config, month_7]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -438,9 +450,9 @@ jobs:
 
   month_9:
     name: month 9
-    needs: month_8
+    needs: [collection_config, month_8]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -480,9 +492,9 @@ jobs:
 
   month_10:
     name: month 10
-    needs: month_9
+    needs: [collection_config, month_9]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -522,9 +534,9 @@ jobs:
 
   month_11:
     name: month 11
-    needs: month_10
+    needs: [collection_config, month_10]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -564,9 +576,9 @@ jobs:
 
   month_12:
     name: month 12
-    needs: month_11
+    needs: [collection_config, month_11]
     if: >-
-      always() && env.ENABLE_FAR_MONTHS == 'true' &&
+      always() && needs.collection_config.outputs.far_enabled == 'true' &&
       (
         (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
         github.event.inputs.scope == 'far' ||
@@ -618,6 +630,7 @@ jobs:
   watchdog:
     name: watchdog
     needs:
+      - collection_config
       - month_1
       - month_2
       - month_3
@@ -669,7 +682,8 @@ jobs:
           # working. THESE TWO LINES MUST TRACK THE `if:` BLOCKS ABOVE — if a schedule changes
           # there and not here, the watchdog starts lying in one direction or the other.
           NEAR_EXPECTED: ${{ github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' }}
-          FAR_EXPECTED: ${{ env.ENABLE_FAR_MONTHS == 'true' && ((github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both') }}
+          FAR_EXPECTED: ${{ needs.collection_config.outputs.far_enabled == 'true' && ((github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both') }}
+          CONFIG_RESULT: ${{ needs.collection_config.result }}
           R_M1: ${{ needs.month_1.result }}
           R_M2: ${{ needs.month_2.result }}
           R_M3: ${{ needs.month_3.result }}
@@ -686,6 +700,9 @@ jobs:
           set -uo pipefail
           fail=0
           reasons=()
+          if [ "$CONFIG_RESULT" != success ]; then
+            fail=1; reasons+=("collection horizon gate did not succeed")
+          fi
 
           printf '%-13s  %-8s  %-9s  %8s  %-8s  %-8s  %s\n' JOB EXPECTED RESULT ROWS SNAPSHOT UPLOAD DETAIL
           printf '%s\n' '--------------------------------------------------------------------------------------------'

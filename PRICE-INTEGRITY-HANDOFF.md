@@ -1,5 +1,15 @@
 # Price integrity — rollout 10.09.2026
 
+## Prebuild repair 10.09 — local, not published
+
+Run 34467238874 at 9769114 failed before any jobs. The six far-month job conditions referenced
+the unavailable job-level `env` context. `collection_config` now exports the tracked false
+switch through job outputs; far collectors and watchdog use `needs`. A failed config job is
+reported by watchdog. Schedules, six-month horizon, sequential collection and concurrency stay
+unchanged. Tests: 96/96 PASS; YAML parsing and job dependency/context checks PASS.
+Publish this repair only with owner authorization; successful collection and validated coverage
+still require production readback. No collector, SQL or deployment was executed in this repair.
+
 Published to GitHub `main`: `9769114 Limit price collection to six months`.
 The country-watch schema was manually applied by the owner before this publish. Both scheduled
 price sweeps now collect months 1–6 only, across all 22 origins and the whole destination network;
