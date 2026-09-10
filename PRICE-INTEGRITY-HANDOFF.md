@@ -1,5 +1,13 @@
 # Price integrity — rollout 10.09.2026
 
+## Repair published 10.09
+
+Owner confirmed continuation after the explicit push request. Commit dfa7a91080fd72a9826d20d10a9cb32b76e2f2fc
+was pushed to origin/main and verified with ls-remote. The old collector run34462645694
+was still in_progress at ab80088; no successful run of the repaired version is confirmed yet.
+No manual collector dispatch or database changes were executed. Earlier local-only notes below are history.
+
+
 ## Prebuild repair 10.09 — local, not published
 
 Run 34467238874 at 9769114 failed before any jobs. The six far-month job conditions referenced
