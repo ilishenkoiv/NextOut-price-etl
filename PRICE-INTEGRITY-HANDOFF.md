@@ -1,12 +1,21 @@
-# Price integrity — local work09.09.2026
+# Price integrity — rollout 10.09.2026
+
+Published to GitHub `main`: `9769114 Limit price collection to six months`.
+The country-watch schema was manually applied by the owner before this publish. Both scheduled
+price sweeps now collect months 1–6 only, across all 22 origins and the whole destination network;
+the preserved month 7–12 jobs are disabled by `ENABLE_FAR_MONTHS=false`. Baseline reads retry
+transient Supabase/Cloudflare failures up to four attempts. Await the first validated scheduled
+run before calling the data rollout complete.
 
 End-of-day: country priority now expands watch_scope/country_code using the public catalogue.
-Apply the app repository's 20260909190000_country_price_watches.sql BEFORE deploying this ETL.
+The app repository's `20260909190000_country_price_watches.sql` was applied manually by the owner
+on 10.09 before this ETL deployment.
 Both main and window planners are covered;93 tests passed. Save this branch to origin only,
 do not merge main or execute collectors tonight. Full coordinated rollout is in the app's
 docs/owner/MORNING-2026-09-10.md. No production changes were executed while closing the day.
 
-Base origin/main ab80088, branch codex/price-integrity-20260909. No push/deploy/workflow run.
+Base origin/main ab80088, branch codex/price-integrity-20260909; published to main as 9769114.
+No post-publish collector run has been observed yet.
 Changes: quote-integrity.mjs used by v3/calendar before min, one_way=false, monthly sample_offer
 preserved by provenance. Default daily main dead plan and window auto plan include selected
 LGK/KBV/HKT/DPS/MLE/SEZ and active watch routes. Manual top-only window mode unchanged.
