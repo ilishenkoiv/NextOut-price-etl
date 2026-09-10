@@ -134,3 +134,11 @@ describe('fetch-prices.mjs — an honest empty answer must not delete offers', (
     assert.match(BODY, /updated_at\.lt\./);       // last observation over a year old
   });
 });
+
+describe('fetch-prices.mjs — baseline read resilience', () => {
+  it('retries transient baseline failures before aborting the run', () => {
+    assert.match(SRC, /const BASELINE_READ_RETRY_BACKOFF_MS = \[2000, 5000, 15000\]/);
+    assert.match(SRC, /async function readBaselinePage/);
+    assert.match(SRC, /await readBaselinePage\(`baseline page/);
+  });
+});

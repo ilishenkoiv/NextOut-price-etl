@@ -344,12 +344,12 @@ for (let i = 0; i < MONTH_COUNT; i += 1) {
   MONTHS.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`);
 }
 
-// The WHOLE horizon, independent of which slice this job collects — months 1..12 from the
+// The WHOLE active horizon, independent of which slice this job collects — months 1..6 from the
 // current one. Used only to judge whether a route-pair is dead: "no price in ANY month" has
 // to mean the full horizon, not the three months this particular job happens to hold. It
 // also excludes months that have fallen out of the horizon, whose stale rows would otherwise
 // keep a long-dead pair looking alive. HORIZON_MONTH_COUNT tracks the app's `horizonMonths`.
-const HORIZON_MONTH_COUNT = Number(process.env.HORIZON_MONTH_COUNT) || 12;
+const HORIZON_MONTH_COUNT = Number(process.env.HORIZON_MONTH_COUNT) || 6;
 const HORIZON_MONTHS = new Set();
 for (let i = 0; i < HORIZON_MONTH_COUNT; i += 1) {
   const d = new Date(now.getFullYear(), now.getMonth() + 1 + i, 1);
@@ -420,6 +420,34 @@ function isTransientWriteFailure(status) {
   if (status == null) return true; // thrown before any response existed → network/socket
   if (status === 0) return true;   // postgrest-js: fetch itself never completed
   return status >= 500;            // 5xx, Cloudflare's 52x included
+}
+
+// Baseline is read before any collection starts. A failed read must still abort — otherwise the
+// run would treat every price as changed and corrupt price_history — but a transient Supabase or
+// Cloudflare failure must not sacrifice an entire month without retrying. Reads are idempotent,
+// so they use the same bounded backoff as writes without participating in WRITE-LOSS accounting.
+const BASELINE_READ_RETRY_BACKOFF_MS = [2000, 5000, 15000];
+async function readBaselinePage(label, run) {
+  for (let attempt = 1; ; attempt += 1) {
+    let res = null;
+    let err = null;
+    try {
+      res = await run();
+      err = res?.error ?? null;
+    } catch (e) {
+      err = e;
+    }
+    if (!err) return res;
+
+    const status = httpStatusOf(res, err);
+    const transient = isTransientWriteFailure(status);
+    if (!transient || attempt > BASELINE_READ_RETRY_BACKOFF_MS.length) {
+      throw new Error(`could not load existing prices (baseline): ${describeError(status, err)}`);
+    }
+    const wait = BASELINE_READ_RETRY_BACKOFF_MS[attempt - 1];
+    console.warn(`    ⚠ ${label} — ${describeError(status, err)}  · attempt ${attempt}/${BASELINE_READ_RETRY_BACKOFF_MS.length + 1}, retrying in ${wait / 1000}s`);
+    await sleep(wait);
+  }
 }
 
 // ── Write-failure tally, reported at the very end of the job ─────────────────
@@ -786,21 +814,17 @@ async function loadPriceBaseline() {
   let from = 0;
   let rowsRead = 0;
   for (;;) {
-    const res = await supabase
+    const res = await readBaselinePage(`baseline page ${from / PAGE + 1}`, () => supabase
       .from('prices')
       .select('origin,dest,month,direct,any_stops')
       .order('origin', { ascending: true })
       .order('dest', { ascending: true })
       .order('month', { ascending: true })
-      .range(from, from + PAGE - 1);
+      .range(from, from + PAGE - 1));
     const { data, error } = res;
-    if (error) {
-      // A read failure here would make EVERY route look "changed" and flood price_history —
-      // and would also wipe the dead list, silently turning the skip off. Abort loudly, but
-      // through describeError: this message ends up in the fatal handler, and a Cloudflare
-      // HTML page there is just as unreadable as it is mid-run.
-      throw new Error(`could not load existing prices (baseline): ${describeError(httpStatusOf(res, error), error)}`);
-    }
+    // readBaselinePage has already retried every transient failure and throws on the final
+    // failure. This remains a defensive guard if a future client returns an unusual error shape.
+    if (error) throw new Error(`could not load existing prices (baseline): ${describeError(httpStatusOf(res, error), error)}`);
     if (!data || data.length === 0) break;
     for (const r of data) {
       map.set(`${r.origin}|${r.dest}|${r.month}`, { direct: r.direct, any_stops: r.any_stops });
@@ -1045,7 +1069,7 @@ async function uploadSnapshot(rows, scope) {
 
     gz = gzipSync(Buffer.from(csv, 'utf8'), { level: 9 });
     const kb = (gz.length / 1024).toFixed(1);
-    // A full 12-month sweep gzips to ~60 KB, so 50 MB is a tripwire rather than a real
+    // A full active-horizon sweep gzips to ~60 KB, so 50 MB is a tripwire rather than a real
     // bound. Warn loudly but still attempt the upload, so the server's own answer lands in
     // the log instead of our guess about what it would have said.
     if (gz.length > SNAPSHOT_MAX_BYTES) {
@@ -1140,7 +1164,7 @@ async function main() {
   console.log(`Loaded ${rowsRead} existing price rows (baseline for change detection; ${existingPrices.size} route-months)`);
 
   // ── Break windows (§break-windows): built ONCE, before the route walk, from public_holidays over
-  // the FULL 12-month collection horizon (a bridge's departure may sit in this job's month even if
+  // the FULL active collection horizon (a bridge's departure may sit in this job's month even if
   // the holiday does not). No Travelpayouts requests — this only re-tags offers already fetched.
   // If the table is EMPTY or UNAVAILABLE we collect exactly as before (no windows) and say so.
   const horizonFromIso = isoDay(new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 1)));
