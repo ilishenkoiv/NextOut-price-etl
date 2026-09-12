@@ -1,3 +1,4 @@
+import { withSupabaseRetry } from './supabase-retry.mjs';
 // Revalidate only the exact tickets present in the latest roulette snapshot.
 //
 // This is deliberately separate from the main month sweep. It makes at most one partner request
@@ -110,23 +111,23 @@ function matchOffer(query, ticket) {
 }
 
 async function latestPool(supabase) {
-  const { data: latest, error: latestError } = await supabase
+  const { data: latest, error: latestError } = await withSupabaseRetry(() => supabase
     .from('daily_origin_cheapest_pool')
     .select('snapshot_at')
     .order('snapshot_at', { ascending: false })
     .limit(1)
-    .maybeSingle();
+    .maybeSingle(), {label:'roulette snapshot read'});
   if (latestError) throw latestError;
   if (!latest) return [];
 
   const rows = [];
   for (let from = 0; ; from += PAGE) {
-    const { data, error } = await supabase
+    const { data, error } = await withSupabaseRetry(() => supabase
       .from('daily_origin_cheapest_pool')
       .select('origin,dest,flight_type,departure_at,return_at,price,snapshot_at')
       .eq('snapshot_at', latest.snapshot_at)
       .order('origin').order('rank')
-      .range(from, from + PAGE - 1);
+      .range(from, from + PAGE - 1), {label:'roulette pool page'});
     if (error) throw error;
     rows.push(...data);
     if (data.length < PAGE) break;
@@ -135,21 +136,21 @@ async function latestPool(supabase) {
 }
 
 async function loadCheckpoint(supabase) {
-  const { data, error } = await supabase.from('roulette_price_refresh_checkpoint')
-    .select('snapshot_at,cursor_key').eq('singleton', true).maybeSingle();
+  const { data, error } = await withSupabaseRetry(() => supabase.from('roulette_price_refresh_checkpoint')
+    .select('snapshot_at,cursor_key').eq('singleton', true).maybeSingle(), {label:'roulette checkpoint read'});
   if (error) throw new Error(`roulette refresh checkpoint read failed: ${error.message}`);
   return data;
 }
 
 async function saveCheckpoint(supabase, snapshotAt, cursorKey) {
-  const { error } = await supabase.from('roulette_price_refresh_checkpoint').upsert({
+  const { error } = await withSupabaseRetry(() => supabase.from('roulette_price_refresh_checkpoint').upsert({
     singleton:true, snapshot_at:snapshotAt, cursor_key:cursorKey, updated_at:new Date().toISOString(),
-  }, { onConflict:'singleton' });
+  }, { onConflict:'singleton' }), {label:'roulette checkpoint write'});
   if (error) throw new Error(`roulette refresh checkpoint write failed: ${error.message}`);
 }
 
 async function clearCheckpoint(supabase) {
-  const { error } = await supabase.from('roulette_price_refresh_checkpoint').delete().eq('singleton', true);
+  const { error } = await withSupabaseRetry(() => supabase.from('roulette_price_refresh_checkpoint').delete().eq('singleton', true), {label:'roulette checkpoint clear'});
   if (error) throw new Error(`roulette refresh checkpoint clear failed: ${error.message}`);
 }
 
@@ -191,12 +192,12 @@ async function main() {
     if (result.status === 'found') {
       const updatedAt = new Date().toISOString();
       const [patch] = withPriceProvenance([{ price: result.fare.price, transfers: result.fare.transfers, airline: result.fare.airline, updated_at: updatedAt, flight_type: ticket.flight_type, market: marketForOrigin(ticket.origin) }], 'offers');
-      const { error } = await matchOffer(supabase.from('offers').update(patch), ticket);
+      const { error } = await withSupabaseRetry(() => matchOffer(supabase.from('offers').update(patch), ticket), {label:'roulette offer update'});
       if (error) throw new Error(`offer update failed for ${ticketKey(ticket)}: ${error.message}`);
       counts.found += 1;
       if (Number(ticket.price) !== result.fare.price) counts.changed += 1;
     } else if (result.status === 'unavailable') {
-      const { error } = await matchOffer(supabase.from('offers').delete(), ticket);
+      const { error } = await withSupabaseRetry(() => matchOffer(supabase.from('offers').delete(), ticket), {label:'roulette offer delete'});
       if (error) throw new Error(`offer delete failed for ${ticketKey(ticket)}: ${error.message}`);
       counts.unavailable += 1;
     } else {

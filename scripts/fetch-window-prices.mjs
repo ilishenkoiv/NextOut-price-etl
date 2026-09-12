@@ -1,3 +1,4 @@
+import { withSupabaseRetry, canCheckpointWindow } from './supabase-retry.mjs';
 // scripts/fetch-window-prices.mjs — dedicated price sweep for the carousel's break windows,
 // ONE home airport per run (the workflow fans it out into 20 sequential parts).
 //
@@ -202,10 +203,12 @@ function computeAllWindows(holidays, regions, today) {
 async function loadAll(table, columns, orderCols, apply) {
   const PAGE = 1000; const out = [];
   for (let from = 0; ; from += PAGE) {
-    let q = supabase.from(table).select(columns);
-    for (const c of orderCols) q = q.order(c, { ascending: true });
-    if (apply) q = apply(q);
-    const { data, error } = await q.range(from, from + PAGE - 1);
+    const { data, error } = await withSupabaseRetry(() => {
+      let q = supabase.from(table).select(columns);
+      for (const c of orderCols) q = q.order(c, { ascending: true });
+      if (apply) q = apply(q);
+      return q.range(from, from + PAGE - 1);
+    }, {label:table+' page '+from});
     if (error) throw new Error(`${table} read failed: ${error.code || ''} ${error.message}`);
     out.push(...data);
     if (data.length < PAGE) break;
@@ -426,12 +429,14 @@ if (!dests.length) {
 let made = 0;
 for (let di = 0; di < dests.length; di += 1) {
   const dest = dests[di];
+  const destinationOutcomes = new Set();
   quotaHeader(`${ORIGIN}→${dest} (${di + 1}/${dests.length})`); // §log header carrying remaining quota
   for (const w of windows) {
     for (const direct of [true, false]) {
       const flightType = direct ? 'direct' : 'any';
       const { fare, outcome, detail } = await fetchWindowFare(dest, w.start, w.end, direct);
       made += 1;
+      destinationOutcomes.add(fare ? 'found' : outcome);
       if (fare) {
         buffer.push({
           origin: ORIGIN, market: MARKET, dest, flight_type: flightType,
@@ -466,11 +471,15 @@ for (let di = 0; di < dests.length; di += 1) {
   await flush();
   await flushMisses();
   await flushFoundDeletes();
-  const { error: progErr } = await supabase
-    .from('window_price_progress')
-    .upsert({ origin: ORIGIN, dest, plan_date: planDate, done_at: new Date().toISOString() },
-      { onConflict: 'origin,dest,plan_date' });
-  if (progErr) console.warn(`    progress upsert failed for ${ORIGIN}→${dest}: ${progErr.code || ''} ${progErr.message}`);
+  if (canCheckpointWindow(destinationOutcomes)) {
+    const { error: progErr } = await withSupabaseRetry(() => supabase
+      .from('window_price_progress')
+      .upsert({ origin: ORIGIN, dest, plan_date: planDate, done_at: new Date().toISOString() },
+        { onConflict: 'origin,dest,plan_date' }), {label:'window progress '+ORIGIN+' to '+dest});
+    if (progErr) throw new Error('Window progress write failed: '+(progErr.code||'unknown'));
+  } else {
+    console.warn('Incomplete destination '+ORIGIN+' to '+dest+': provider errors; left uncheckpointed for catch-up.');
+  }
 }
 await flush();
 await flushMisses();
