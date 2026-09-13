@@ -1,4 +1,4 @@
-import { withSupabaseRetry, canCheckpointWindow } from './supabase-retry.mjs';
+import { withSupabaseRetry, canCheckpointWindow, retryMetadataFetch } from './supabase-retry.mjs';
 // scripts/fetch-window-prices.mjs — dedicated price sweep for the carousel's break windows,
 // ONE home airport per run (the workflow fans it out into 20 sequential parts).
 //
@@ -82,7 +82,7 @@ if (keyRole(SUPABASE_SERVICE_KEY) !== 'service_role') {
   console.warn(`WARNING: SUPABASE_SERVICE_KEY role = "${keyRole(SUPABASE_SERVICE_KEY)}" (expected "service_role") — writes will likely be denied.`);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false }, global:{fetch:retryMetadataFetch} });
 
 // ── date helpers (UTC, date-only ISO) — same rules as lib/breakWindows.ts ─────────────────────────
 const pad2 = (n) => String(n).padStart(2, '0');

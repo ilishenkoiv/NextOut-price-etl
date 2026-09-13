@@ -1,4 +1,4 @@
-import { withSupabaseRetry } from './supabase-retry.mjs';
+import { withSupabaseRetry, retryMetadataFetch } from './supabase-retry.mjs';
 // Revalidate only the exact tickets present in the latest roulette snapshot.
 //
 // This is deliberately separate from the main month sweep. It makes at most one partner request
@@ -156,7 +156,7 @@ async function clearCheckpoint(supabase) {
 
 async function main() {
   if (!TP_TOKEN || !SUPABASE_SERVICE_KEY) throw new Error('Missing TP_TOKEN or SUPABASE_SERVICE_KEY.');
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false }, global:{fetch:retryMetadataFetch} });
   const tickets = await latestPool(supabase);
   if (!tickets.length) {
     console.log('No roulette pool exists yet — targeted refresh skipped.');

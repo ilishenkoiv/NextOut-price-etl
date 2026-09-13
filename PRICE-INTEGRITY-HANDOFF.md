@@ -1,3 +1,7 @@
+## 13.09 local retry update — not published
+
+Bounded 20s database requests; outer retry disables nested SDK retries, preserves Retry-After from PostgREST errors, adds jitter and redacted status/recovery logs. Wired to window collector and roulette refresh. 103 tests PASS, including real PostgREST builder with mocked HTTP 504. No production writes or publish. Dashboard C: recovery classifier + minute polling (five-minute cache), 16 tests PASS. D: transfer awaits explicit permission after auto-review rejection.
+
 # Price integrity — rollout 10.09.2026
 
 ## Repair published 10.09
