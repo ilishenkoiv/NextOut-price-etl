@@ -66,7 +66,8 @@ env:
 # make the newcomer wait instead. (This covers whole runs; the job order WITHIN a run is
 # enforced separately by the `needs:` chain.)
 concurrency:
-  group: price-fetch
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 # Nothing in this workflow writes to the repo any more: the price snapshot is uploaded to the
@@ -79,6 +80,7 @@ permissions:
 jobs:
   # Job conditions cannot read env; expose the tracked switch through needs instead.
   collection_config:
+    if: vars.COLLECTION_MODE != 'coordinated'
     name: collection horizon gate
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -96,9 +98,7 @@ jobs:
     name: month 1
     # First link in the chain: no predecessor, so no always() needed.
     if: >-
-      github.event_name == 'schedule' ||
-      github.event.inputs.scope == 'near' ||
-      github.event.inputs.scope == 'both'
+      vars.COLLECTION_MODE != 'coordinated' && (github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both')
     runs-on: ubuntu-latest
     # A SINGLE month has ample headroom under this ceiling; it is kept unchanged so the cap
     # still catches a genuinely stuck run.
@@ -155,12 +155,7 @@ jobs:
     # always() lets it run even when its predecessor failed or was skipped; `needs:` only orders.
     needs: month_1
     if: >-
-      always() &&
-      (
-        github.event_name == 'schedule' ||
-        github.event.inputs.scope == 'near' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && ( github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -197,12 +192,7 @@ jobs:
     name: month 3
     needs: month_2
     if: >-
-      always() &&
-      (
-        github.event_name == 'schedule' ||
-        github.event.inputs.scope == 'near' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && ( github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -239,12 +229,7 @@ jobs:
     name: month 4
     needs: month_3
     if: >-
-      always() &&
-      (
-        github.event_name == 'schedule' ||
-        github.event.inputs.scope == 'near' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && ( github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -281,12 +266,7 @@ jobs:
     name: month 5
     needs: month_4
     if: >-
-      always() &&
-      (
-        github.event_name == 'schedule' ||
-        github.event.inputs.scope == 'near' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && ( github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -323,12 +303,7 @@ jobs:
     name: month 6
     needs: month_5
     if: >-
-      always() &&
-      (
-        github.event_name == 'schedule' ||
-        github.event.inputs.scope == 'near' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && ( github.event_name == 'schedule' || github.event.inputs.scope == 'near' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -368,12 +343,7 @@ jobs:
     name: month 7
     needs: [collection_config, month_6]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -410,12 +380,7 @@ jobs:
     name: month 8
     needs: [collection_config, month_7]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -452,12 +417,7 @@ jobs:
     name: month 9
     needs: [collection_config, month_8]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -494,12 +454,7 @@ jobs:
     name: month 10
     needs: [collection_config, month_9]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -536,12 +491,7 @@ jobs:
     name: month 11
     needs: [collection_config, month_10]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -578,12 +528,7 @@ jobs:
     name: month 12
     needs: [collection_config, month_11]
     if: >-
-      always() && needs.collection_config.outputs.far_enabled == 'true' &&
-      (
-        (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') ||
-        github.event.inputs.scope == 'far' ||
-        github.event.inputs.scope == 'both'
-      )
+      vars.COLLECTION_MODE != 'coordinated' && (always() && needs.collection_config.outputs.far_enabled == 'true' && ( (github.event_name == 'schedule' && github.event.schedule == '17 15 * * *') || github.event.inputs.scope == 'far' || github.event.inputs.scope == 'both' ))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -645,7 +590,8 @@ jobs:
       - month_12
     # always() — the whole point is to report on runs that went wrong, including ones where every
     # collector failed, was cancelled, or never started.
-    if: always()
+    if: >-
+      vars.COLLECTION_MODE != 'coordinated' && (always())
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # CONCURRENCY: nothing to add here. The `concurrency` block at the top of this file is

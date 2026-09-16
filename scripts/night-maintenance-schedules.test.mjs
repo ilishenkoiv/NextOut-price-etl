@@ -15,11 +15,12 @@ const maintenance = [
   'refresh-destination-events.yml',
 ];
 
-test('every scheduled maintenance workflow is Berlin-night-only and collector-aware', () => {
+test('legacy maintenance remains collector-aware and all work shares a serial queue', () => {
   for (const name of maintenance) {
     const workflow = fs.readFileSync(new URL(name, workflowDir), 'utf8');
     assert.match(workflow, /timezone: 'Europe\/Berlin'/, `${name}: timezone`);
-    assert.match(workflow, /group: etl-night-maintenance/, `${name}: maintenance lock`);
+    assert.match(workflow, /group: nextout-data-collection/, `${name}: shared serial lock`);
+    assert.match(workflow, /queue: max/, `${name}: queued jobs are not replaced`);
     assert.match(workflow, /actions: read/, `${name}: run-list permission`);
     assert.match(workflow, /for status in in_progress queued/, `${name}: active and queued collectors`);
     assert.match(workflow, /Twice-daily price fetch/, `${name}: main collector guard`);

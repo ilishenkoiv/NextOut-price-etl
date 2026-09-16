@@ -1,6 +1,9 @@
 # dependencies
 node_modules/
 
+# Downloaded coordinate evidence; the reviewed registry lives in src/data.
+data/expansion-airports-source.json
+
 # secrets — never commit tokens/keys (they come from env / GitHub Secrets)
 .env
 .env.local

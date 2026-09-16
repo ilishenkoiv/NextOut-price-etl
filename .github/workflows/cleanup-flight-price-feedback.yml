@@ -9,7 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: etl-night-maintenance
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -18,6 +19,7 @@ permissions:
 
 jobs:
   cleanup:
+    if: vars.COLLECTION_MODE != 'coordinated'
     name: Delete flight feedback older than 365 days
     runs-on: ubuntu-latest
     timeout-minutes: 10

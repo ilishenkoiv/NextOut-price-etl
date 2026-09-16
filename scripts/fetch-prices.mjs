@@ -27,6 +27,7 @@ import { pathToFileURL } from 'node:url';
 import { HUB_AIRPORTS, LOWCOST_AIRPORTS, ORIGINS_ALL } from '../src/data/origins.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
+import { expansionTargets, EXPANSION_TARGETS } from '../src/data/expansion-targets.js';
 import { ORIGIN_COORDS, DEST_COORDS } from '../src/data/coords.js';
 import { ORIGIN_REGIONS } from '../src/data/origin-regions.js';
 import { isoDay, buildBreakWindows } from './break-windows.mjs';
@@ -88,7 +89,8 @@ if (SUPABASE_SERVICE_KEY && SERVICE_KEY_ROLE !== 'service_role') {
 // stops per destination (0 = near/direct, 1 = long-haul/one-stop).
 const STOPS = {};
 const DEST_IATAS = [];
-for (const d of DESTINATIONS) {
+const EXPANDED_TARGETS = expansionTargets(process.env.EXPANSION_WAVE || 0);
+for (const d of [...DESTINATIONS, ...EXPANDED_TARGETS]) {
   if (STOPS[d.iata] === undefined) { STOPS[d.iata] = d.stops; DEST_IATAS.push(d.iata); }
 }
 
@@ -119,10 +121,11 @@ function haversineKm(a, b) {
   return Math.round(2 * R * Math.asin(Math.sqrt(h)));
 }
 function targetSet(origin, dest) {
-  const oc = ORIGIN_COORDS[origin], dc = DEST_COORDS[dest];
+  const extra = EXPANSION_TARGETS.find(d => d.iata === dest);
+  const oc = ORIGIN_COORDS[origin], dc = DEST_COORDS[dest] ?? (extra ? [extra.lat, extra.lng] : null);
   if (!oc || !dc) return [5, 7, 10, 12, 14]; // safe default if a coord is ever missing
   const km = haversineKm(oc, dc);
-  const stops = STOPS[dest] ?? 1;
+  const stops = STOPS[dest] ?? extra?.stops ?? 1;
   if (km < 1500) return [3, 5, 7, 10, 12, 14];
   if (km <= 4000) return [5, 7, 10, 12, 14];
   return stops === 0 ? [5, 7, 10, 12, 14] : [7, 10, 12, 14];
@@ -1716,7 +1719,7 @@ async function main() {
 
 // Pure selection helpers, exported for unit tests. Nothing here touches the network, the Supabase
 // client or any secret, so a test can import them without booting the collector (see IS_ENTRYPOINT).
-export { selectCombo, targetSet, fetchFlightMonth, fetchCalendarMonth };
+export { selectCombo, targetSet, fetchFlightMonth, fetchCalendarMonth, probeType };
 
 // Run the collector ONLY when invoked directly (`node fetch-prices.mjs`), never on import.
 if (IS_ENTRYPOINT) {

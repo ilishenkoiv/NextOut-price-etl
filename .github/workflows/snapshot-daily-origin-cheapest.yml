@@ -12,11 +12,11 @@ on:
     types: [completed]
   workflow_dispatch:
 
-# Never put this workflow in the collector's `price-fetch` group. GitHub retains only one pending
-# run per concurrency group, so a priority-0 refresh could otherwise replace a queued main sweep.
-# Duplicate price-only refreshes may collapse safely; every other workflow keeps priority.
+# Coordinated mode moves this work into the worker's maintenance windows. The
+# shared queue:max lock also serializes the preserved legacy/manual fallback.
 concurrency:
-  group: roulette-refresh
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -28,9 +28,7 @@ jobs:
     # A failed/cancelled sweep may contain only part of the horizon. Keep the previous roulette in
     # that case. Manual runs remain available for an explicit owner retry and still obey the lock.
     if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      vars.COLLECTION_MODE != 'coordinated' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

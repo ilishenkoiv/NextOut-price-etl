@@ -1,3 +1,23 @@
+## 16.09 sequential collection — local implementation, not published
+
+Owner confirmed manual application of ENABLE-SEQUENTIAL-COLLECTION.sql on16.09.
+Read-only GitHub-backed schema validation is prepared but needs this code published.
+Direct publication to origin/main was rejected by automatic approval review:
+explicit authorization for this 44-file production publication target is required.
+No push or mode switch occurred. At10:02UTC old main35082444832 is still in month1,
+and old carousel35061613784 is queued. Do not run the new collector alongside them.
+
+Prepared a resumable main/window/fast/audit/roulette worker, shared queued workflow
+lock, private fenced state and atomic cell writes. All 43 airport targets are
+available behind 0/10/21/43 rollout waves; app snapshot exposure is independently
+gated and remains at zero new targets. Source state is still based on production31b1077.
+No production SQL, workflow dispatch, mode-variable change or live provider sweep
+has been executed. Photos and owner weather actions are explicitly deferred to the end.
+Owner SQL package: ../../NextOut-eas-build-bd4ec06/supabase/manual/ENABLE-SEQUENTIAL-COLLECTION.sql.
+Apply before enabling coordinated mode. Detailed operator plan lives in the app's
+docs/owner/COLLECTION-IMPLEMENTATION-2026-09-16.md. The watch-country GB/NL change
+already present in this worktree is preserved.
+
 ## 13.09 local retry update — not published
 
 Bounded 20s database requests; outer retry disables nested SDK retries, preserves Retry-After from PostgREST errors, adds jitter and redacted status/recovery logs. Wired to window collector and roulette refresh. 103 tests PASS, including real PostgREST builder with mocked HTTP 504. No production writes or publish. Dashboard C: recovery classifier + minute polling (five-minute cache), 16 tests PASS. D: transfer awaits explicit permission after auto-review rejection.

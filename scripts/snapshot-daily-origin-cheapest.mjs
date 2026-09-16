@@ -1,6 +1,12 @@
 import { createClient } from '@supabase/supabase-js';
 import { pathToFileURL } from 'node:url';
 import { marketForOrigin } from '../src/data/origin-markets.js';
+import { DESTINATIONS } from '../src/data/destinations.js';
+import { expansionTargets } from '../src/data/expansion-targets.js';
+
+export function publishedSnapshotDestinations(wave=0){
+  return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -53,23 +59,26 @@ export function selectDailyCheapestPool(offers, today, limit = 10) {
     .sort((a, b) => String(a.origin).localeCompare(String(b.origin)) || a.rank - b.rank);
 }
 
-async function main() {
+export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0) } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
-  const observedOn = new Date().toISOString().slice(0, 10);
+  const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
+  const observedOn = (requestedSnapshotAt ?? new Date().toISOString()).slice(0, 10);
   const freshSince = new Date(Date.now() - MAX_SOURCE_AGE_MS).toISOString();
   const offers = [];
+  const published=publishedSnapshotDestinations(expansionWave);
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase.from('offers')
     .select('origin,market,dest,flight_type,price,departure_at,return_at,transfers,updated_at,price_source')
     .gte('departure_at', observedOn).gte('updated_at', freshSince).gt('price', 0)
-    .order('origin').order('flight_type').order('price').range(from, from + PAGE - 1);
+    .order('origin').order('flight_type').order('price').order('dest').order('departure_at').order('return_at').range(from, from + PAGE - 1);
     if (error) throw error;
-    offers.push(...data);
+    // Collection can warm new airports before their app metadata/weather/photos
+    // are ready. Do not let an unknown destination displace the published pool.
+    offers.push(...data.filter(row=>published.has(row.dest)));
     if (data.length < PAGE) break;
   }
 
-  const snapshotAt = new Date().toISOString();
+  const snapshotAt = requestedSnapshotAt ?? new Date().toISOString();
   const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
   observed_on: observedOn,
   snapshot_at: snapshotAt,
@@ -116,7 +125,9 @@ const { error: writeError } = await supabase.from('daily_origin_cheapest')
     throw writeError;
   }
 
-  const { error: poolError } = await supabase.from('daily_origin_cheapest_pool').insert(pool);
+  const { error: poolError } = requestedSnapshotAt
+    ? await supabase.from('daily_origin_cheapest_pool').upsert(pool,{onConflict:'snapshot_at,origin,flight_type,rank'})
+    : await supabase.from('daily_origin_cheapest_pool').insert(pool);
   if (poolError && !tableMissing(poolError)) throw poolError;
   if (poolError) console.log('daily_origin_cheapest_pool table does not exist yet — rank-1 compatibility snapshot saved.');
   else {

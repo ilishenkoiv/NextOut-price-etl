@@ -14,7 +14,7 @@ const ONLY=new Set((process.env.EVENT_IATAS||'').split(',').map(x=>x.trim().toUp
 const ENDPOINT='https://query.wikidata.org/sparql';
 const AGENT=process.env.WIKIDATA_USER_AGENT||'NextOutDestinationEvents/1.0 (https://nextout.de; kontakt@nextout.de)';
 const GAP=Math.max(100,Number(process.env.WIKIDATA_REQUEST_GAP_MS)||350), CHUNK=250;
-const CONCURRENCY=Math.max(1,Math.min(5,Math.trunc(Number(process.env.WIKIDATA_CONCURRENCY)||3)));
+const CONCURRENCY=process.env.COLLECTION_MODE==='coordinated'?1:Math.max(1,Math.min(5,Math.trunc(Number(process.env.WIKIDATA_CONCURRENCY)||3)));
 if(!DRY&&!KEY){console.error('Missing SUPABASE_SERVICE_KEY (or use DRY_RUN=1).');process.exit(1);}
 const db=KEY?createClient(URL,KEY,{auth:{persistSession:false,autoRefreshToken:false},realtime:{transport:WebSocket}}):null;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const runAt=new Date().toISOString(); const window=sixMonthWindow();let nextRequestAt=0;

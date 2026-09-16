@@ -13,12 +13,16 @@ on:
         default: dry-run
 
 concurrency:
-  group: etl-night-maintenance
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 permissions:
   actions: read
   contents: read
+
+env:
+  COLLECTION_MODE: ${{ vars.COLLECTION_MODE }}
 
 jobs:
   cleanup:
@@ -37,6 +41,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$COLLECTION_MODE" = "coordinated" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # A manual dry-run is read-only. Allow it at any time so retention can be
           # audited without waiting for the next quarterly window; `apply` remains
           # subject to the same night/idle gate as the scheduled deletion.

@@ -45,8 +45,9 @@ on:
 # A new carousel run supersedes an older carousel run. Night maintenance checks both this workflow
 # and the main collector before doing any work.
 concurrency:
-  group: window-prices
-  cancel-in-progress: true
+  group: nextout-data-collection
+  queue: max
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -56,6 +57,7 @@ jobs:
   # midnight, so without a shared date each part would call berlinToday() at its own start and plan
   # a different window set. Every part of BOTH passes receives this exact date via PLAN_DATE.
   plan-date:
+    if: vars.COLLECTION_MODE != 'coordinated'
     runs-on: ubuntu-latest
     outputs:
       date: ${{ steps.pick.outputs.date }}
@@ -65,6 +67,7 @@ jobs:
         run: echo "date=$(TZ=Europe/Berlin date +%F)" >> "$GITHUB_OUTPUT"
 
   sweep:
+    if: vars.COLLECTION_MODE != 'coordinated'
     # First pass. One part per home airport. Airports mirror origin_regions.airport (20 codes); the
     # script aborts if ORIGIN is not a known home airport, so a stale code fails loudly.
     needs: plan-date
@@ -109,7 +112,8 @@ jobs:
     # hit the 90-min cap) is re-collected. Runs even if some first-pass parts failed (!cancelled()),
     # as long as the planning date was pinned.
     needs: [plan-date, sweep]
-    if: ${{ !cancelled() && needs['plan-date'].result == 'success' }}
+    if: >-
+      vars.COLLECTION_MODE != 'coordinated' && (!cancelled() && needs['plan-date'].result == 'success')
     strategy:
       fail-fast: false
       max-parallel: 1

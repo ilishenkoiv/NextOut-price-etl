@@ -8,10 +8,13 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: flight-price-audit-priority-zero
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
+
 jobs:
   check:
+    if: vars.COLLECTION_MODE != 'coordinated'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

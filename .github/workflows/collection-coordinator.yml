@@ -1,0 +1,49 @@
+name: Sequential data collection
+on:
+  schedule:
+    - cron: '7 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      validate_only:
+        description: 'Read-only schema/bucket validation; no collection'
+        type: boolean
+        default: true
+concurrency:
+  group: nextout-data-collection
+  queue: max
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  collect:
+    if: vars.COLLECTION_MODE == 'coordinated' || (github.event_name == 'workflow_dispatch' && inputs.validate_only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Verify applied SQL without writing data
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/check-collection-ready.mjs
+      - name: Resume one sequential collector
+        if: github.event_name != 'workflow_dispatch' || !inputs.validate_only
+        env:
+          COLLECTION_MODE: ${{ vars.COLLECTION_MODE }}
+          COLLECTION_SESSION_MINUTES: '235'
+          EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
+          SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/run-collection.mjs

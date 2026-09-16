@@ -19,7 +19,8 @@ on:
   workflow_dispatch: # manual runs are always possible
 
 concurrency:
-  group: etl-night-maintenance
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -28,6 +29,7 @@ permissions:
 
 jobs:
   cleanup:
+    if: vars.COLLECTION_MODE != 'coordinated'
     name: Delete app_errors older than 90 days
     runs-on: ubuntu-latest
     timeout-minutes: 10

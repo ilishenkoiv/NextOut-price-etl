@@ -39,7 +39,8 @@ on:
 # One keepalive run at a time. The only realistic overlap is a manual run fired while the
 # weekly one is in flight; two pushes racing would fail the loser on a non-fast-forward.
 concurrency:
-  group: etl-night-maintenance
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 # The one place in this repository allowed to write to it. `fetch-prices.yml` stays on
@@ -47,6 +48,9 @@ concurrency:
 permissions:
   actions: read
   contents: write
+
+env:
+  COLLECTION_MODE: ${{ vars.COLLECTION_MODE }}
 
 jobs:
   keepalive:
@@ -60,6 +64,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$COLLECTION_MODE" = "coordinated" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           hour="$(TZ=Europe/Berlin date +%H)"
           minute="$(TZ=Europe/Berlin date +%M)"
           minute_of_day=$((10#$hour * 60 + 10#$minute))

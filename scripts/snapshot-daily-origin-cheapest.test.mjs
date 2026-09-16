@@ -58,7 +58,9 @@ test('priority-0 roulette price refresh runs every 30 minutes and never rebuilds
   );
   assert.match(workflow, /cron: '7,37 \* \* \* \*'/);
   assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Twice-daily price fetch'\]\s*\n\s+types: \[completed\]/);
-  assert.match(workflow, /group: roulette-refresh/);
+  assert.match(workflow, /group: nextout-data-collection/);
+  assert.match(workflow, /queue: max/);
+  assert.match(workflow, /vars.COLLECTION_MODE != 'coordinated'/);
   assert.match(workflow, /githubIsIdle/);
   assert.match(workflow, /ownWorkflowName:'Daily cheapest offers snapshot'/);
   assert.match(workflow, /github\.event\.workflow_run\.conclusion == 'success'/);

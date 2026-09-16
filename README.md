@@ -1,5 +1,25 @@
 # NextOut Price ETL
 
+## Sequential coordinator — prepared 2026-09-16, not enabled
+
+`scripts/run-collection.mjs` runs one resumable worker. In each two-hour cycle it
+allocates up to 10 minutes to exact carousel tickets, 55 to the main sweep, 35 to
+the carousel tail, two five-minute maintenance windows and reserve time. Budgets
+survive runner handovers; empty phases lend time to subsequent work.
+
+All workflows share `nextout-data-collection` with `queue: max` and no cancellation.
+The old main/window/audit/snapshot jobs are gated off only when repository variable
+`COLLECTION_MODE=coordinated`. The new workflow otherwise stays disabled by its job gate.
+Apply the two `2026091614*` migrations manually before enabling that variable.
+The worker uses existing `TP_TOKEN`, `SUPABASE_SERVICE_KEY` and `GITHUB_TOKEN`.
+
+`EXPANSION_WAVE` supports 0/10/21/43 new airports. An unfinished pass pins its wave.
+`SNAPSHOT_EXPANSION_WAVE` is separate and defaults to 0: collection alone must not
+publish unknown cities in the app's roulette pool before the app/data rollout.
+The private state tracks actual completion/error counts; a green runner session
+does not imply two complete main passes or guaranteed two-hour GitHub startup.
+Periodic legacy maintenance also uses the serial queue and may delay a worker.
+
 ## Pending rollout: explicit Aviasales market provenance (2026-09-06)
 
 Apply `migrations/20260906120000_aviasales_market_provenance.sql` before publishing the updated

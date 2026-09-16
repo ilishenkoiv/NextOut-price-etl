@@ -12,7 +12,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: german-photo-candidates
+  group: nextout-data-collection
+  queue: max
   cancel-in-progress: false
 
 jobs:
