@@ -1,4 +1,16 @@
-## 16.09 sequential collection — local implementation, not published
+## 16.09 sequential collection — published, first wave configured
+
+Publication confirmed: main3ffb408. Read-only validation35083373280 succeeded:
+8RPCs, private bucket and price schemas confirmed, providerRequests0, no lease claim.
+Owner's SQL step is closed. GitHub variables read back: coordinated / wave10 /
+snapshot-wave0. Old main35082444832 continues; old queued carousel35061613784 is
+confirmed cancelled. Published3ffb408 refuses collection while another workflow
+is active. First new price session awaits an eligible scheduled run after the
+old main finishes; validation success does not claim price collection success.
+The optional drain-trigger patch was rejected and is NOT published. Its three
+code files were restored to3ffb408 after preserving a patch in the app's .work.
+
+### Earlier preparation and approval history — superseded by the status above
 
 Owner confirmed manual application of ENABLE-SEQUENTIAL-COLLECTION.sql on16.09.
 Read-only GitHub-backed schema validation is prepared but needs this code published.

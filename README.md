@@ -1,6 +1,15 @@
 # NextOut Price ETL
 
-## Sequential coordinator — prepared 2026-09-16, not enabled
+## Sequential coordinator — published 2026-09-16, guarded rollout
+
+Initial publication3ffb408 and read-only schema/bucket validation35083373280 passed.
+Production variables are now COLLECTION_MODE=coordinated, EXPANSION_WAVE=10,
+SNAPSHOT_EXPANSION_WAVE=0. Old main35082444832 was left running; queued carousel
+35061613784 was cancelled. Published3ffb408 checks other active workflows before
+claiming a lease, so an early scheduled run refuses to collect until legacy work
+finishes. The next eligible four-hour schedule starts the first new price session.
+An optional immediate-completion handover patch was not approved or published;
+it is archived locally outside this repository. Do not assume a drain-run trigger exists.
 
 `scripts/run-collection.mjs` runs one resumable worker. In each two-hour cycle it
 allocates up to 10 minutes to exact carousel tickets, 55 to the main sweep, 35 to
