@@ -2,7 +2,8 @@
 // side effects on import. Adapters perform one bounded, checkpointed unit at a time.
 const MINUTE = 60_000;
 export const CYCLE_MS = 120 * MINUTE;
-export const MAIN_CYCLE_MS = 12 * 60 * MINUTE;
+// export const MAIN_CYCLE_MS = 12 * 60 * MINUTE; // two main passes/day — uncomment to restore
+export const MAIN_CYCLE_MS = 24 * 60 * MINUTE;    // one main pass/day
 export const SLOTS = Object.freeze([
   { from: 0, to: 10, task: 'fast' },
   { from: 10, to: 15, task: 'maintenance' },
