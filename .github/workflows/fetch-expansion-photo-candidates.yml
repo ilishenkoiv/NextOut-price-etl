@@ -1,0 +1,60 @@
+name: Fetch expansion photo candidates (48 batch)
+
+# Manifest-driven variant of "Fetch German destination photo candidates". Targets are read
+# from an explicit committed manifest (supports IATA and place:<id> resource keys), so photo
+# prep does not depend on catalogue readiness. Side effects: ONLY a downloadable artifact.
+# No DB/Storage writes, no commits, no production upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: 'Path to the photo manifest JSON (committed in the repo)'
+        required: true
+        default: 'docs/owner/photo-expansion-w3/batch-manifest.json'
+      only:
+        description: 'Optional comma-separated resource keys to limit the run (e.g. MAD,place:zurich)'
+        required: false
+        default: ''
+      run:
+        description: 'Optional fixed run id (default: timestamp)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nextout-data-collection
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Fetch candidates from the manifest
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PHOTO_MANIFEST: ${{ inputs.manifest }}
+          PHOTO_ONLY: ${{ inputs.only }}
+          PHOTO_RUN: ${{ inputs.run }}
+        run: |
+          ARGS="--manifest=$PHOTO_MANIFEST"
+          if [ -n "$PHOTO_ONLY" ]; then ARGS="$ARGS --only=$PHOTO_ONLY"; fi
+          if [ -n "$PHOTO_RUN" ]; then ARGS="$ARGS --run=$PHOTO_RUN"; fi
+          node scripts/fetch-photos-batch.mjs $ARGS
+      - name: Publish candidates for human selection
+        uses: actions/upload-artifact@v4
+        with:
+          name: expansion-photo-candidates
+          path: photos-batch/
+          if-no-files-found: error
+          retention-days: 14
