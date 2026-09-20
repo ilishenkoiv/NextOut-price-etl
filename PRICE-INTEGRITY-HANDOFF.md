@@ -1,3 +1,29 @@
+## 20.09 daily-main guarantee — workflow wiring fixed locally, NOT published
+
+Scheduled run 35512249106 at cec4ed15 SUCCEEDED: ended naturally after the 235-min
+budget (13:00:44→16:55:36Z, ~15min before the 250-min hard timeout). Main cursor
+4047→6029/13440, 0 monotonicity violations, no double-commit/cursor reset, fast clean,
+end-of-session pool republished, public snapshot stays wave 0. No permanent Supabase
+error; the transient Supabase retry path was NOT exercised live this session (no
+transient failure occurred), but the existing automated retry tests already cover the
+retry implementation. Audit verdict was SAFE AFTER WORKFLOW WIRING FIX.
+
+Blocker fixed locally: run-collection.mjs gates the guarantee on
+`env.GUARANTEE_DAILY_MAIN==='true'`, but collection-coordinator.yml never passed the
+variable into the "Resume one sequential collector" step, so setting the repo variable
+would have been a silent no-op. Added one line to that step's env:
+`GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}` (explicit false
+fallback → absent/false stays OFF, only literal `true` activates the guarantee). Added
+a contract regression test in collection-workflows.test.mjs that fails if the script
+keeps reading the flag while the workflow stops wiring it. Full suite 194/194 PASS;
+`git diff --check` clean. Only two files changed: the coordinator workflow and that test.
+
+The flag remains OFF: no GitHub variable was created/changed, no workflow_dispatch, no
+commit, no push, no cron/concurrency/session-duration/wave/retry change, no production
+mutation. Next required owner step: commit and push this ETL patch to main, THEN set the
+`GUARANTEE_DAILY_MAIN` GitHub repo variable to `true`, then observe the first scheduled
+run with guarantee active (expect main to finish a full daily pass within 24h).
+
 ## 16.09 sequential collection — published, first wave configured
 
 Publication confirmed: main3ffb408. Read-only validation35083373280 succeeded:
