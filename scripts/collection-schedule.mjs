@@ -4,6 +4,9 @@ const MINUTE = 60_000;
 export const CYCLE_MS = 120 * MINUTE;
 // export const MAIN_CYCLE_MS = 12 * 60 * MINUTE; // two main passes/day — uncomment to restore
 export const MAIN_CYCLE_MS = 24 * 60 * MINUTE;    // one main pass/day
+// Reserve kept when judging whether the current main pass can still finish within MAIN_CYCLE_MS.
+// A pass is "at risk" once its realized pace can no longer reach the end with this much slack.
+export const MAIN_DEADLINE_RESERVE = 0.2;
 export const SLOTS = Object.freeze([
   { from: 0, to: 10, task: 'fast' },
   { from: 10, to: 15, task: 'maintenance' },
@@ -45,18 +48,47 @@ export function prepareJob(state, task, timestamp) {
   return (state.jobs[task] = newJob(task, requestedId, timestamp));
 }
 
+// Whether the current main pass is behind the pace needed to finish within MAIN_CYCLE_MS.
+// It uses the pass's REALIZED wall-clock rate (cells committed / wall-time since the pass started),
+// which already bakes in every real gap: hours with no runner at all, tail/fast sharing, GitHub
+// start delay, DB retries. If the cells still reachable before the 24h deadline at that realized
+// rate fall short of what remains (plus a reserve margin), main must take priority over tail.
+// Pure: reads state, never mutates. Returns false until there is a measured pace and false once
+// main is done — so it can never fabricate risk before the pass has run, nor after it finished.
+export function mainAtRisk(state, clock, { margin = MAIN_DEADLINE_RESERVE } = {}) {
+  const job = state?.jobs?.main;
+  if (!job || job.done) return false;
+  const cp = job.checkpoint;
+  const total = Number(cp?.total);
+  const cursor = Number(cp?.cursor ?? 0);
+  if (!(total > 0)) return false;                       // plan size not known yet
+  const remainingCells = total - cursor;
+  if (remainingCells <= 0) return false;
+  const remainingWall = (job.startedAt + MAIN_CYCLE_MS) - clock;
+  if (remainingWall <= 0) return true;                  // already past the 24h deadline → rush
+  const wallElapsed = clock - job.startedAt;
+  if (!(cursor > 0) || wallElapsed <= 0) return false;  // no realized pace yet
+  const reachable = (cursor / wallElapsed) * remainingWall;
+  return reachable < remainingCells * (1 + margin);
+}
+
 // Each invocation handles at most ONE unit. The caller persists state externally
 // between runner sessions, holds the global lease, and supplies bounded adapters.
 // save() must be fenced by that lease; a failed save throws and stops the worker.
 export class SequentialSchedule {
   #busy = false;
-  constructor({ state = freshScheduleState(), clock = Date.now, lease, save, handlers, stopAt = Infinity }) {
+  constructor({ state = freshScheduleState(), clock = Date.now, lease, save, handlers, stopAt = Infinity,
+    guaranteeDailyMain = false, mainDeadlineReserve = MAIN_DEADLINE_RESERVE }) {
     this.state = state;
     this.clock = clock;
     this.lease = lease;
     this.save = save;
     this.handlers = handlers;
     this.stopAt = stopAt;
+    // When true, a `tail` slot yields to `main` while the current main pass is at risk of missing
+    // its 24h deadline (mainAtRisk). Default false = exact legacy behavior (no regression).
+    this.guaranteeDailyMain = guaranteeDailyMain;
+    this.mainDeadlineReserve = mainDeadlineReserve;
   }
 
   async tick() {
@@ -74,7 +106,12 @@ export class SequentialSchedule {
       const phase=SLOTS[working.frame.phase];
       const reserve=phase.task==='reserve';
       const remaining=reserve?Infinity:(phase.to-phase.from)*MINUTE-working.frame.spentMs;
-      const candidates=reserve?['fast','main','tail','maintenance']:[phase.task];
+      // A tail slot yields to main while the current main pass is at risk of missing its 24h
+      // deadline (only when guaranteeDailyMain is on). Main is tried first; tail stays the fallback,
+      // so an already-safe or done main lets tail keep its own cursor and run normally.
+      const tailYieldsToMain = phase.task==='tail' && this.guaranteeDailyMain
+        && mainAtRisk(working, this.clock(), { margin: this.mainDeadlineReserve });
+      const candidates=reserve?['fast','main','tail','maintenance']:(tailYieldsToMain?['main','tail']:[phase.task]);
       for(const task of candidates){
         const adapter = this.handlers[task];
         if (!adapter) continue;

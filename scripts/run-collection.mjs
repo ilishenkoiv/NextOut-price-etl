@@ -91,8 +91,12 @@ export async function main(env=process.env){
   if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
   const end=Date.now()+minutes*60000;
   const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+  // Daily-main guarantee: OFF by default (exact legacy behavior). Set repo var
+  // GUARANTEE_DAILY_MAIN=true to let a tail slot yield to main while the current main pass is at
+  // risk of missing its 24h deadline (see collection-schedule.mjs mainAtRisk). No schedule change.
+  const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN==='true';
   let engine;
-  engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,
+  engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,guaranteeDailyMain,
     handlers:createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state})});
   let stopping=false;const stop=()=>{stopping=true;};
   process.once('SIGTERM',stop);process.once('SIGINT',stop);

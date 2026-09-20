@@ -6,6 +6,7 @@ import { mainPlan, tailPlan, fastPlan, nextMonth, horizon } from './collection-p
 import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
+import { withSupabaseRetry } from './supabase-retry.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { main as publishSnapshot } from './snapshot-daily-origin-cheapest.mjs';
@@ -15,20 +16,38 @@ const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
 const DAY = 86400000;
 
-export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null }) {
+export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
   const exactKey=t=>[t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|');
-  async function query(builder, deadline = Infinity) {
+  // Bound the transient-retry backoff so no attempt (retry wait + one ~8s request +
+  // the 9s boundary guard) can run past the unit/session deadline. If nothing fits,
+  // delays is empty and the operation runs exactly once, failing honestly.
+  function retryBudget(deadline) {
+    const base = [1000, 3000, 8000]; const delays = []; let projected = clock();
+    for (const d of base) { projected += d + 8000; if (projected + 9000 > deadline) break; delays.push(d); }
+    return { label: 'coordinator db', delays, sleep, random, now: clock, warn: () => {} };
+  }
+  // A retry rebuilds a fresh PostgREST builder via `build` and re-checks the fenced
+  // lease before every attempt. Only reads and PROVEN-idempotent writes pass retry:true;
+  // permanent Postgres/RLS/schema errors are non-transient and surface unchanged, so a
+  // failed operation never becomes a false success and never masks a real error.
+  async function query(build, deadline = Infinity, { retry = false } = {}) {
     if (clock() + 9000 >= deadline) throw new CollectionYield('Database unit would cross boundary');
-    if (!await store.lease()) throw new Error('Database operation forbidden: lease lost');
-    const result = await builder;
+    const attempt = async () => {
+      if (!await store.lease()) throw new Error('Database operation forbidden: lease lost');
+      return build();
+    };
+    const result = retry ? await withSupabaseRetry(attempt, retryBudget(deadline)) : await attempt();
     if (result.error) throw new Error(`Collection database operation failed (${result.error.code ?? 'unknown'})`);
     return result.data;
   }
   async function load(table, columns, order, apply = q => q, deadline = Infinity) {
     const rows = [];
     for (let from = 0; ; from += 1000) {
-      let q = db.from(table).select(columns); for (const key of order) q = q.order(key);
-      const data = await query(apply(q).range(from, from + 999), deadline);
+      const data = await query(() => {
+        let q = db.from(table).select(columns); for (const key of order) q = q.order(key);
+        return apply(q).range(from, from + 999);
+      }, deadline, { retry: true });
       rows.push(...data); if (data.length < 1000) return rows;
     }
   }
@@ -38,7 +57,10 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     return store.plan(`coordinator/${task}-${job.id}-${job.checkpoint?.wave??wave}.json`, build);
   }
   async function commit(name, payload, deadline) {
-    const accepted=await query(db.rpc(name, { ...store.args(), ...payload }), deadline);
+    // collection_commit_main/window/roulette are idempotent by construction (fenced,
+    // upsert-on-conflict / delete-by-PK, price_history append guarded against the
+    // persisted row), so a retry after a committed-but-lost response cannot double-write.
+    const accepted=await query(() => db.rpc(name, { ...store.args(), ...payload }), deadline, { retry: true });
     if(accepted!==true)throw new Error('Collection write was not acknowledged');
     return accepted;
   }
@@ -55,7 +77,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           setDbDeadline(Math.min(deadline,clock()+470000));
           try {
             await publishSnapshot({db,snapshotAt:cp.snapshotAt,expansionWave:cp.snapshotWave??0});
-            const rows=await query(db.from('daily_origin_cheapest_pool').select('snapshot_at').eq('snapshot_at',cp.snapshotAt).limit(1),deadline);
+            const rows=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').eq('snapshot_at',cp.snapshotAt).limit(1),deadline,{retry:true});
             if(!rows.length)throw new Error('Main pass snapshot was not published');
           } finally { setDbDeadline(Infinity); }
           return {status:'done',checkpoint:{...cp,stage:'complete'}};
@@ -108,7 +130,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const date=job.planDate;
           const hhmm=new Date(job.startedAt).toLocaleTimeString('en-GB',{timeZone:'Europe/Berlin',hour:'2-digit',minute:'2-digit',hour12:false}).replace(':','');
           const path=`snapshots/${date.slice(0,4)}/${date.slice(5,7)}/${date}_${hhmm}_coordinator-${job.id}.csv.gz`;
-          await query(db.storage.from('price-snapshots').upload(path,gzipSync(csv),{contentType:'application/gzip',upsert:true}),unitEnd);
+          const body=gzipSync(csv);
+          await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true});
           return {status:'progress',checkpoint:{...cp,stage:'snapshot',snapshotAt:new Date(clock()).toISOString(),snapshotPath:path,
             snapshotWave:Number(process.env.SNAPSHOT_EXPANSION_WAVE||0)}};
         }
@@ -190,7 +213,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const now=clock();const today=new Date(now).toISOString().slice(0,10);let didWork=false;
     if(turn===0){
       if(cp.auditRetryAt>now)continue;
-      const rows=await query(db.rpc('claim_flight_price_audit'),deadline);
+      // NOT retried: claim increments attempts and mints a fresh claim_token per call
+      // (non-idempotent); a retry would burn an attempt or claim a second row.
+      const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline);
       const row=rows?.[0];
       if(row){
         const ticket=ticketFromFeedback(row.feedback,new Date(now).toISOString().slice(0,10));
@@ -202,7 +227,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
           }catch(error){if(error instanceof CollectionYield)outcome={status:'pending',detail:'scheduler_pause'};else throw error;}
         }
-        const result=await query(db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
+        // NOT retried: finalize consumes the claim_token; a retry after success would
+        // report a spurious 'claim expired' failure (non-idempotent).
+        const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
           p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline);
         if(result!==true)throw new Error('Audit claim expired before completion');didWork=true;
       }else cp.auditRetryAt=now+30000;
@@ -212,7 +239,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(!r||(r.done&&r.cycle!==desiredCycle))r={cycle:desiredCycle,cursor:0,done:false,errors:0};
       if(r.done)continue;
       const plan=await store.plan(`coordinator/roulette-${r.cycle}-0.json`,async()=>{
-        const latest=await query(db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline);
+        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
         if(!latest.length)return{tickets:[]};
         const tickets=await load('daily_origin_cheapest_pool','origin,dest,flight_type,departure_at,return_at,rank',
           ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latest[0].snapshot_at),deadline);
@@ -236,19 +263,20 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.checked[turn]===today)continue;
       const table=['','','app_errors','flight_price_feedback','destination_requests'][turn];
       const cutoff=turn===4?calendarMonthsAgoIso(new Date(now)):new Date(now-(turn===2?90:365)*DAY).toISOString();
-      const rows=await query(db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline);
-      if(rows.length){await query(db.from(table).delete().in('id',rows.map(r=>r.id)),deadline);didWork=true;}
+      const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true});
+      if(rows.length){const ids=rows.map(r=>r.id);await query(()=>db.from(table).delete().in('id',ids),deadline,{retry:true});didWork=true;}
       if(rows.length<100)cp.checked[turn]=today;
     }else if(turn===5&&cp.metricsDay!==today){
-      await query(db.rpc('collect_storage_metrics'),deadline);cp.metricsDay=today;didWork=true;
+      // NOT retried: metrics collection may append a snapshot row per call (non-idempotent).
+      await query(()=>db.rpc('collect_storage_metrics'),deadline);cp.metricsDay=today;didWork=true;
     }else if(turn===6&&cp.checked.plans!==today){
       const bucket=db.storage.from('price-snapshots');
-      const rows=await query(bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline);
+      const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true});
       const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
       if(cp.roulette)protectedNames.add(`roulette-${cp.roulette.cycle}-0.json`);
       const expired=rows.filter(r=>/^(main|tail|fast|roulette)-\d+-\d+\.json$/.test(r.name)&&
         !protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
-      if(expired.length){await query(bucket.remove(expired),deadline);didWork=true;}
+      if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true});didWork=true;}
       if(expired.length<100)cp.checked.plans=today;
     }
     if(didWork)return{status:'progress',checkpoint:cp};
