@@ -23,3 +23,14 @@ test('new worker remains opt-in and leaves time to save before the Actions timeo
   assert.match(text,/timeout-minutes: 250/);
   assert.match(text,/EXPANSION_WAVE:.*\|\| '0'/);
 });
+test('coordinator wires GUARANTEE_DAILY_MAIN into the collector whenever the script honors it',()=>{
+  // Contract test: run-collection.mjs gates the daily-main guarantee on env.GUARANTEE_DAILY_MAIN.
+  // If the script keeps that feature but the production workflow stops passing the variable, the
+  // guarantee silently never activates. Catch that regression here.
+  const script=fs.readFileSync(new URL('run-collection.mjs',import.meta.url),'utf8');
+  const workflow=fs.readFileSync(new URL('collection-coordinator.yml',dir),'utf8');
+  if(/env\.GUARANTEE_DAILY_MAIN/.test(script)){
+    assert.match(workflow,/GUARANTEE_DAILY_MAIN:\s*\$\{\{\s*vars\.GUARANTEE_DAILY_MAIN\s*\|\|\s*'false'\s*\}\}/,
+      'run-collection.mjs reads env.GUARANTEE_DAILY_MAIN but collection-coordinator.yml does not pass vars.GUARANTEE_DAILY_MAIN (|| \'false\') into the collector step');
+  }
+});

@@ -42,6 +42,7 @@ jobs:
           COLLECTION_SESSION_MINUTES: '235'
           EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
+          GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
