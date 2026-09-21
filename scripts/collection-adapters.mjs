@@ -2,7 +2,7 @@ import { probeType, fetchCalendarMonth, selectCombo } from './fetch-prices.mjs';
 import { monthlyQuoteProvenance } from './quote-integrity.mjs';
 import { withPriceProvenance } from './price-provenance.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
-import { mainPlan, tailPlan, fastPlan, nextMonth, horizon } from './collection-planning.mjs';
+import { mainPlan, tailPlan, fastPlan, nextMonth, horizon, resolveTrancheDests } from './collection-planning.mjs';
 import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
@@ -90,14 +90,19 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const regions = await load('origin_regions','airport,calendar_subdivision_code',['airport'],undefined,unitEnd);
           const codes = new Set(regions.map(r=>r.calendar_subdivision_code));
           const days = new Set(holidays.filter(h=>codes.has(h.subdivision_code) || (h.level==='country' && [...codes].some(c=>c.startsWith(h.country+'-')))).map(h=>h.date));
-          return { ...mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows}),
+          const trancheDests = resolveTrancheDests(process.env.EXPANSION_TRANCHE_DESTS);
+          return { ...mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows,trancheDests}),
             breakKeys:[...buildBreakWindows(days,months[0]+'-01',nextMonth(months.at(-1))+'-01').keySet] };
         });
-        const total = plan.routes.length * plan.months.length;
+        // cellOrder (when present) front-loads the bounded expansion tranche, then keeps every
+        // remaining cell in the original month-major order. It is a permutation of the same cell ids,
+        // so `total` and cursor/resume semantics are identical to the legacy identity ordering.
+        const total = plan.cellOrder ? plan.cellOrder.length : plan.routes.length * plan.months.length;
         // A cursor is advanced only after the complete cell has been committed.
         while (cp.cursor < total && clock() + 15000 < unitEnd) {
-          const route = plan.routes[cp.cursor % plan.routes.length];
-          const month = plan.months[Math.floor(cp.cursor / plan.routes.length)];
+          const cellId = plan.cellOrder ? plan.cellOrder[cp.cursor] : cp.cursor;
+          const route = plan.routes[cellId % plan.routes.length];
+          const month = plan.months[Math.floor(cellId / plan.routes.length)];
           const natural = route.stops !== 1; let usedType = natural ? 'direct' : 'any';
           const request = url => provider.request(url, unitEnd - 9000);
           let result = await probeType(route.origin,route.dest,month,nextMonth(month),natural,request);
