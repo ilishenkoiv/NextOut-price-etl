@@ -95,13 +95,13 @@ test('lease lost between attempts aborts immediately', async () => {
 test('cursor does not advance when the commit is not confirmed', async () => {
   // plan mock short-circuits reads ⇒ the only DB op is the commit RPC, which fails permanently.
   const plan = () => ({ tickets: [{ origin: 'FRA', dest: 'MAD', flight_type: 'direct', departure_at: '2027-01-10', return_at: '2027-01-17', nights: 7, window_kind: 'weekend' }] });
-  const { adapters } = adaptersWith({ behaviours: [OK_EMPTY,{ status: 403, error: { code: '42501', message: 'denied' } }], plan });
+  const { adapters } = adaptersWith({ behaviours: [{ status: 403, error: { code: '42501', message: 'denied' } }], plan });
   await assert.rejects(() => adapters.fast.step({ job, deadline: 200000 }), /42501/); // throws before cursor++
 });
 
 test('idempotent commit retries transient then acknowledges once, advancing the cursor by one', async () => {
   const plan = () => ({ tickets: [{ origin: 'FRA', dest: 'MAD', flight_type: 'direct', departure_at: '2027-01-10', return_at: '2027-01-17', nights: 7, window_kind: 'weekend' }] });
-  const { adapters, log } = adaptersWith({ behaviours: [OK_EMPTY,TRANSIENT,okAck,okAck], plan });
+  const { adapters, log } = adaptersWith({ behaviours: [TRANSIENT, okAck], plan });
   const result = await adapters.fast.step({ job, deadline: 200000 });
   assert.equal(result.checkpoint.cursor, 1);
   assert.equal(countRpc(log, 'collection_commit_window'), 2); // retried, single acknowledged success
@@ -109,8 +109,7 @@ test('idempotent commit retries transient then acknowledges once, advancing the 
 
 test('non-idempotent claim_flight_price_audit is never retried', async () => {
   const { adapters, log } = adaptersWith({ behaviours: [TRANSIENT] });
-  await assert.rejects(() => adapters.priority.step({ job: { ...job, checkpoint: { cycle:job.id,dueAt:0,phase:'audit',auditDone:false,
-    roulette:{cycle:job.id,cursor:0,done:false,errors:0} } }, deadline: 200000 }),
+  await assert.rejects(() => adapters.maintenance.step({ job: { ...job, checkpoint: { turn: 0, checked: {} } }, deadline: 200000 }),
     /Collection database operation failed/);
   assert.equal(countRpc(log, 'claim_flight_price_audit'), 1); // single attempt, no retry
 });

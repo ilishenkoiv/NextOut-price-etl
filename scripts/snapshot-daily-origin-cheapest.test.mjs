@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins } from './snapshot-daily-origin-cheapest.mjs';
+import { selectDailyCheapest, selectDailyCheapestPool } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
 
 test('selects one deterministic cheapest real future offer per origin and flight type', () => {
@@ -30,10 +30,6 @@ test('stores up to ten cheapest unique destinations per origin across any and di
   assert.equal(pool[0].flight_type, 'direct');
 });
 
-test('production selection derives the approved canonical 22 origins from the shared catalogue',()=>{
-  assert.equal(publishedSnapshotOrigins().size,22);
-});
-
 test('MUC Rome date flood occupies one rank and cannot crowd out other cities', () => {
   const rome = Array.from({ length:10 }, (_, i) => ({
     origin:'MUC', dest:'FCO', flight_type:'direct', price:62 + i,
@@ -49,76 +45,27 @@ test('MUC Rome date flood occupies one rank and cannot crowd out other cities', 
   assert.equal(pool.filter((row) => row.dest === 'FCO').length, 1);
 });
 
-test('the same destination reachable by any and direct is never duplicated in the pool', () => {
-  const pool = selectDailyCheapestPool([
-    { origin:'MUC', dest:'FCO', flight_type:'any', price:120, departure_at:'2026-11-10', return_at:'2026-11-17', transfers:1 },
-    { origin:'MUC', dest:'FCO', flight_type:'direct', price:95, departure_at:'2026-11-10', return_at:'2026-11-17', transfers:0 },
-    { origin:'MUC', dest:'ATH', flight_type:'any', price:130, departure_at:'2026-11-12', return_at:'2026-11-19', transfers:1 },
-  ], '2026-08-31');
-  const fco = pool.filter((row) => row.dest === 'FCO');
-  assert.equal(fco.length, 1, 'FCO appears exactly once across any+direct');
-  assert.equal(fco[0].flight_type, 'direct', 'the cheaper direct fare wins the single slot');
-  assert.equal(new Set(pool.map((r) => r.dest)).size, pool.length, 'every pooled destination is unique per origin');
-});
-
-test('poolExistsForObservedOn is the once-per-day selection guard predicate', () => {
-  assert.equal(poolExistsForObservedOn([], '2026-09-21'), false, 'no rows -> selection may run');
-  assert.equal(poolExistsForObservedOn(null, '2026-09-21'), false, 'a null probe never blocks selection');
-  assert.equal(poolExistsForObservedOn([{ observed_on:'2026-09-21' }], '2026-09-21'), true, 'a matching day blocks re-selection');
-  assert.equal(poolExistsForObservedOn([{ observed_on:'2026-09-20' }], '2026-09-21'), false, 'a different day does not block today');
-});
-
-test('Berlin observed day survives midnight and both DST transitions',()=>{
-  assert.equal(berlinObservedOn('2026-03-29T00:30:00Z'),'2026-03-29');
-  assert.equal(berlinObservedOn('2026-03-29T22:30:00Z'),'2026-03-30');
-  assert.equal(berlinObservedOn('2026-10-25T00:30:00Z'),'2026-10-25');
-  assert.equal(berlinObservedOn('2026-10-25T23:30:00Z'),'2026-10-26');
-});
-
-test('nightly due gate is 03:30 Berlin on winter, spring-DST and fall-DST days',()=>{
-  assert.equal(nightlySelectionDue('2027-01-05T02:29:59Z'),false);
-  assert.equal(nightlySelectionDue('2027-01-05T02:30:00Z'),true);
-  assert.equal(nightlySelectionDue('2026-03-29T01:29:59Z'),false); // 03:29:59 CEST
-  assert.equal(nightlySelectionDue('2026-03-29T01:30:00Z'),true);
-  assert.equal(nightlySelectionDue('2026-10-25T02:29:59Z'),false); // 03:29:59 CET
-  assert.equal(nightlySelectionDue('2026-10-25T02:30:00Z'),true);
-});
-
 test('production snapshot query refuses source observations older than 36 hours', () => {
   const source = readFileSync(new URL('./snapshot-daily-origin-cheapest.mjs', import.meta.url), 'utf8');
   assert.match(source, /MAX_SOURCE_AGE_MS = 36 \* 60 \* 60 \* 1000/);
   assert.match(source, /\.gte\('updated_at', freshSince\)/);
 });
 
-test('legacy standalone workflow is preserved unchanged behind COLLECTION_MODE', () => {
+test('priority-0 roulette price refresh runs every 30 minutes and never rebuilds the pool', () => {
   const workflow = readFileSync(
     new URL('../.github/workflows/snapshot-daily-origin-cheapest.yml', import.meta.url),
     'utf8',
   );
-  assert.match(workflow, /^\s*schedule:/m);
   assert.match(workflow, /cron: '7,37 \* \* \* \*'/);
-  assert.match(workflow, /^\s*workflow_run:/m);
-  assert.match(workflow, /vars.COLLECTION_MODE != 'coordinated'/);
-  assert.match(workflow, /workflow_dispatch/);
-  assert.match(workflow, /node scripts\/refresh-roulette-prices\.mjs/, 'legacy refresh code is retained for manual fallback');
-});
-
-test('Stage 3: the nightly selection workflow is the single, once-per-day selection owner', () => {
-  const workflow = readFileSync(
-    new URL('../.github/workflows/nightly-cheapest-selection.yml', import.meta.url),
-    'utf8',
-  );
-  assert.match(workflow, /name: Nightly cheapest offers selection/);
-  // One daily selection at ~03:30 Europe/Berlin.
-  assert.match(workflow, /cron: '30 3 \* \* \*'/);
-  assert.match(workflow, /timezone: 'Europe\/Berlin'/);
-  // Same-day catch-up after a completed coordinator run (guarded → at most once/day).
-  assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Sequential data collection'\]\s*\n\s+types: \[completed\]/);
-  // Serialized with every other data job so two selections can never run at once.
+  assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Twice-daily price fetch'\]\s*\n\s+types: \[completed\]/);
   assert.match(workflow, /group: nextout-data-collection/);
   assert.match(workflow, /queue: max/);
-  assert.match(workflow, /vars.COLLECTION_MODE == 'coordinated'/);
-  // It runs the selection owner, and issues no provider requests (not a refresh workflow).
-  assert.match(workflow, /node scripts\/snapshot-daily-origin-cheapest\.mjs/);
-  assert.doesNotMatch(workflow, /refresh-roulette-prices/);
+  assert.match(workflow, /vars.COLLECTION_MODE != 'coordinated'/);
+  assert.match(workflow, /githubIsIdle/);
+  assert.match(workflow, /ownWorkflowName:'Daily cheapest offers snapshot'/);
+  assert.match(workflow, /github\.event\.workflow_run\.conclusion == 'success'/);
+  assert.match(workflow, /node scripts\/refresh-roulette-prices\.mjs/);
+  assert.match(workflow, /if: github\.event_name == 'workflow_run'/);
+  assert.doesNotMatch(workflow, /steps\.idle-gate\.outputs\.idle == 'true'[\s\S]{0,500}node scripts\/snapshot-daily-origin-cheapest\.mjs/);
+  assert.doesNotMatch(workflow, /^\s+group: price-fetch\s*$/m);
 });

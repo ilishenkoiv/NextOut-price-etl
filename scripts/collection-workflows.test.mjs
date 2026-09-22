@@ -19,8 +19,7 @@ test('every old main/window/audit/snapshot job is disabled in coordinated mode',
 test('new worker remains opt-in and leaves time to save before the Actions timeout',()=>{
   const text=fs.readFileSync(new URL('collection-coordinator.yml',dir),'utf8');
   assert.match(text,/if: vars.COLLECTION_MODE == 'coordinated'/);
-  assert.match(text,/smoke_minutes:[\s\S]*default: '15'/);
-  assert.match(text,/COLLECTION_SESSION_MINUTES:.*inputs\.smoke_minutes \|\| '235'/);
+  assert.match(text,/COLLECTION_SESSION_MINUTES: '235'/);
   assert.match(text,/timeout-minutes: 250/);
   assert.match(text,/EXPANSION_WAVE:.*\|\| '0'/);
 });

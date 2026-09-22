@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, mainAtRisk, nominalSessionBudgets, priorityCycleProjection } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, mainAtRisk } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -10,19 +10,10 @@ test('a cycle has the agreed budgets and no overlaps or holes', () => {
     end = slot.to;
     budgets[slot.task] = (budgets[slot.task] ?? 0) + slot.to - slot.from;
   }
-  assert.equal(end, 30);
-  assert.deepEqual(budgets, { priority: 2, fast: 2, main: 23, tail: 1, maintenance: 1, reserve: 1 });
-  assert.equal(slotAt(2 * 60000).task, 'fast');
-  assert.equal(slotAt(CYCLE_MS).task, 'priority');
-  const session=nominalSessionBudgets(7*60000,235*60000);
-  assert.equal(session.main/60000,181);
-});
-
-test('priority capacity is honest at maximum backlog: realistic latency fits, timeout latency conflicts with MAIN',()=>{
-  const realistic=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:480,requestMs:500});
-  assert.deepEqual({requests:realistic.requests,windowBatch:realistic.windowBatch,fits:realistic.fitsReservedSlot},{requests:240,windowBatch:10,fits:true});
-  const timeout=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:480,requestMs:8000});
-  assert.equal(timeout.fitsReservedSlot,false);assert.ok(timeout.elapsedMs>30*60000);
+  assert.equal(end, 120);
+  assert.deepEqual(budgets, { fast: 10, maintenance: 10, main: 55, tail: 35, reserve: 10 });
+  assert.equal(slotAt(10 * 60000).task, 'maintenance');
+  assert.equal(slotAt(CYCLE_MS).task, 'fast');
 });
 
 test('unfinished main retains its date and cursor across midnight and a new runner', () => {
@@ -41,16 +32,16 @@ test('plan month follows Berlin while cycle IDs remain monotonic through DST',()
   assert.equal(prepareJob(state,'main',Date.parse('2026-09-30T22:30:00Z')).planDate,'2026-10-01');
   const a=slotAt(Date.parse('2026-10-25T00:00:00Z'));
   const b=slotAt(Date.parse('2026-10-25T02:00:00Z'));
-  assert.equal(b.cycle-a.cycle,4);
+  assert.equal(b.cycle-a.cycle,1);
 });
 
-test('fast checkpoints retain the established two-hour cadence inside 30-minute priority cycles', () => {
+test('fast checkpoints expire per two-hour cycle, not per day', () => {
   const state = freshScheduleState();
   const first = prepareJob(state, 'fast', 0);
   first.done = true;
   assert.equal(prepareJob(state, 'fast', 60000).done, true);
-  assert.equal(prepareJob(state, 'fast', 4*CYCLE_MS).done, false);
-  prepareJob(state, 'fast', 8*CYCLE_MS);
+  assert.equal(prepareJob(state, 'fast', CYCLE_MS).done, false);
+  prepareJob(state, 'fast', 2 * CYCLE_MS);
   assert.equal(state.missedFast, 1);
 });
 
@@ -102,33 +93,6 @@ test('late GitHub start immediately services the due fast cycle', async () => {
   assert.equal((await engine.tick()).task,'main');
 });
 
-test('a due priority cycle preempts a long MAIN unit, then MAIN resumes after the priority checkpoint completes',async()=>{
-  const ran=[];const state=freshScheduleState();state.frame={cycle:0,phase:2,spentMs:0};
-  const engine=new SequentialSchedule({state,clock:()=>4*60000,lease:async()=>true,save:async()=>{},handlers:{
-    priority:{maxUnitMs:100,step:async()=>{ran.push('priority');return{status:'done',checkpoint:{cycle:0,lagMs:0}};}},
-    main:{maxUnitMs:100,step:async()=>{ran.push('main');return{status:'progress',checkpoint:{cursor:1,total:10}};}},
-  }});
-  assert.equal((await engine.tick()).task,'priority');
-  assert.equal((await engine.tick()).task,'main');
-  assert.deepEqual(ran,['priority','main']);
-});
-
-test('unfinished priority rolls into a missed new cycle with its cursors intact',()=>{
-  const state=freshScheduleState();const first=prepareJob(state,'priority',0);first.checkpoint={cycle:0,phase:'roulette',roulette:{cycle:0,cursor:73,done:false},weekend:{cursor:11}};
-  const next=prepareJob(state,'priority',3*CYCLE_MS);
-  assert.equal(next.id,3);assert.equal(next.done,false);assert.equal(next.checkpoint.roulette.cursor,73);assert.equal(next.checkpoint.weekend.cursor,11);
-  assert.equal(state.missedPriority,3);
-});
-
-test('priority cap with less than one max unit remaining cannot deadlock lower phases',async()=>{
-  const state=freshScheduleState();state.frame={cycle:0,phase:2,spentMs:0,prioritySpentMs:5*60000-10000};const ran=[];
-  const engine=new SequentialSchedule({state,clock:()=>5*60000,lease:async()=>true,save:async()=>{},handlers:{
-    priority:{maxUnitMs:45000,step:async()=>{ran.push('priority');return{status:'progress'};}},
-    main:{maxUnitMs:100,step:async()=>{ran.push('main');return{status:'progress',checkpoint:{cursor:1,total:2}};}},
-  }});
-  assert.equal((await engine.tick()).task,'main');assert.deepEqual(ran,['main']);
-});
-
 test('completed main is counted once; fast completion does not complete main', async () => {
   const engine = new SequentialSchedule({ clock: () => 16 * 60000, lease: async () => true,
     save: async () => {}, handlers: { main: { maxUnitMs: 100, step: async () => ({ status: 'done' }) } } });
@@ -137,10 +101,9 @@ test('completed main is counted once; fast completion does not complete main', a
   assert.equal(engine.state.completedMain, 1);
 });
 
-test('an empty maintenance queue advances to reserve and retries later', async () => {
+test('an empty maintenance queue lends its slot to main and retries later', async () => {
   const calls = [];
-  const state=freshScheduleState();state.frame={cycle:0,phase:4,spentMs:0};
-  const engine = new SequentialSchedule({ state,clock: () => 28 * 60000, lease: async () => true,
+  const engine = new SequentialSchedule({ clock: () => 11 * 60000, lease: async () => true,
     save: async () => {}, handlers: {
       maintenance: { maxUnitMs: 100, step: async () => { calls.push('maintenance'); return { status: 'empty' }; } },
       main: { maxUnitMs: 100, step: async () => { calls.push('main'); return { status: 'progress', checkpoint: 1 }; } },
@@ -153,8 +116,8 @@ test('an empty maintenance queue advances to reserve and retries later', async (
 // ── Daily-main guarantee: mainAtRisk + tail-yields-to-main (guaranteeDailyMain) ──────────────
 const MINMS = 60000;
 // A tail-slot clock (cycle 12, minute 50) with an at-risk main pass started 23h earlier.
-const TAIL_CLOCK = 1467 * MINMS;           // 24h + minute 27 (tail slot)
-const FAST_CLOCK = 1442 * MINMS;           // 24h + minute 2 (fast slot)
+const TAIL_CLOCK = 1490 * MINMS;           // 1490 min → cycle 12, minute 50 (tail slot)
+const FAST_CLOCK = 1445 * MINMS;           // 1445 min → cycle 12, minute 5  (fast slot)
 function atRiskMainJob() {
   return { id: 0, planDate: '2026-09-20', checkpoint: { cursor: 100, total: 100000, errors: 0, wave: 43 },
     done: false, startedAt: 110 * MINMS, completedAt: null, retryAt: 0, activeMs: 60000 };
@@ -183,7 +146,7 @@ test('mainAtRisk: false without a job, when done, or before a measured pace; tru
 test('tail slot YIELDS to main when the daily pass is at risk and the guarantee is on', async () => {
   const state = freshScheduleState(); state.jobs.main = atRiskMainJob();
   state.jobs.tail = { id: 0, planDate: '2026-09-20', checkpoint: { cursor: 500, total: 900000 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
-  state.frame = { cycle: 48, phase: 3, spentMs: 0 };   // already at the tail slot
+  state.frame = { cycle: 12, phase: 3, spentMs: 0 };   // already at the tail slot (SLOTS[3] = 45–65)
   const ran = [];
   const engine = new SequentialSchedule({ state, clock: () => TAIL_CLOCK, lease: async () => true, save: async () => {}, guaranteeDailyMain: true, handlers: recordingHandlers(ran) });
   const r = await engine.tick();
@@ -198,7 +161,7 @@ test('tail slot YIELDS to main when the daily pass is at risk and the guarantee 
 
 test('tail slot runs TAIL normally when the guarantee is OFF, even if main is behind (no regression)', async () => {
   const state = freshScheduleState(); state.jobs.main = atRiskMainJob();
-  state.frame = { cycle: 48, phase: 3, spentMs: 0 };
+  state.frame = { cycle: 12, phase: 3, spentMs: 0 };   // already at the tail slot
   const ran = [];
   const engine = new SequentialSchedule({ state, clock: () => TAIL_CLOCK, lease: async () => true, save: async () => {}, guaranteeDailyMain: false, handlers: recordingHandlers(ran) });
   const r = await engine.tick();
@@ -209,7 +172,7 @@ test('tail slot runs TAIL normally when the guarantee is OFF, even if main is be
 test('tail slot runs TAIL when the guarantee is on but main is NOT at risk', async () => {
   const state = freshScheduleState();
   state.jobs.main = { id: 0, planDate: '2026-09-20', checkpoint: { cursor: 90, total: 100, errors: 0 }, done: false, startedAt: TAIL_CLOCK - 60 * MINMS, completedAt: null, retryAt: 0, activeMs: 60000 };
-  state.frame = { cycle: 48, phase: 3, spentMs: 0 };
+  state.frame = { cycle: 12, phase: 3, spentMs: 0 };   // already at the tail slot
   const ran = [];
   const engine = new SequentialSchedule({ state, clock: () => TAIL_CLOCK, lease: async () => true, save: async () => {}, guaranteeDailyMain: true, handlers: recordingHandlers(ran) });
   const r = await engine.tick();

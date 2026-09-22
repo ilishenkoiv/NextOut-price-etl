@@ -201,9 +201,9 @@ test('2-ADAPTER: the real main adapter walks cellOrder — expansion (ZZZ) is co
   const f = mainFixture(ADAPTER_PLAN, OFFER);
   const result = await f.adapters.main.step({ job: ADAPTER_JOB, deadline: 200000 });
   const commits = f.calls.filter(c => c.name === 'collection_commit_main').map(c => c.args.p_price.dest);
-  assert.deepEqual(commits, ['ZZZ', 'AAA'], 'priced ZZZ month is committed before the priced AAA month; empty months only update route health');
+  assert.deepEqual(commits, ['ZZZ', 'ZZZ', 'AAA', 'AAA'], 'both ZZZ months first, then AAA — cellOrder honored');
   assert.equal(result.checkpoint.cursor, 4);
-  assert.equal(result.checkpoint.stage, 'complete');    // reached total → pass completes (no selection stage)
+  assert.equal(result.checkpoint.stage, 'snapshot');    // reached total → same completion path as legacy
 });
 
 test('4-ADAPTER: a resumed pass continues from its checkpoint cursor within the same cellOrder', async () => {
@@ -211,7 +211,7 @@ test('4-ADAPTER: a resumed pass continues from its checkpoint cursor within the 
   // Resume after the two ZZZ cells were already committed (cursor=2).
   const result = await f.adapters.main.step({ job: { ...ADAPTER_JOB, checkpoint: { cursor: 2, errors: 0, wave: WAVE } }, deadline: 200000 });
   const commits = f.calls.filter(c => c.name === 'collection_commit_main').map(c => c.args.p_price.dest);
-  assert.deepEqual(commits, ['AAA'], 'resume collected only the remaining priced tail cell, none repeated');
+  assert.deepEqual(commits, ['AAA', 'AAA'], 'resume collected only the remaining tail cells, none repeated');
   assert.equal(result.checkpoint.cursor, 4);
 });
 

@@ -44,8 +44,9 @@ function maintenanceAdapters({ script, log = [], lease = async () => true, provi
   const prov = provider ?? { request: async () => ({ kind: 'ok', json: { success: true, data: [] } }) };
   return { adapters: createAdapters({ db, store, provider: prov, wave: 43, clock: () => CLOCK, sleep: async () => {}, random: () => 0 }), log };
 }
-const onlyFeedbackAndRoulette = (over = {}) => ({ cycle:1,dueAt:0,phase:'audit',auditDone:false,
-  roulette:{cycle:1,cursor:0,done:false,errors:0},...over });
+// A checkpoint with retention turns (2–6) already done today, so only turn 0 (feedback) and turn 1
+// (roulette) do work — isolating the two secondary tasks we care about.
+const onlyFeedbackAndRoulette = (over = {}) => ({ turn: 0, checked: { 2: TODAY, 3: TODAY, 4: TODAY, plans: TODAY }, metricsDay: TODAY, ...over });
 const cnt = (log, x) => log.filter(e => e === x).length;
 const POOL = 'daily_origin_cheapest_pool';
 const TICKET = { origin: 'FRA', dest: 'MAD', flight_type: 'direct', departure_at: '2027-01-10', return_at: '2027-01-17', rank: 1 };
@@ -55,14 +56,13 @@ const rouletteScript = () => ({ from: { [POOL]: [{ data: [{ snapshot_at: 'S1' }]
 
 // ── 4. Maintenance turn 0 processes the flight_price_feedback queue ─────────────────────────────
 test('4. maintenance turn 0 claims and finalizes a flight_price_feedback item', async () => {
-  const script = { rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', created_at:new Date(CLOCK-60000).toISOString(),feedback: {} }], error: null }],
+  const script = { rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],
     finish_flight_price_audit: [{ data: true, error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
   // roulette already done this cycle so only turn 0 acts
-  const result=await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette({ roulette: { cycle: 1, cursor: 0, done: true } }) }, deadline: DEADLINE });
+  await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette({ roulette: { cycle: 0, cursor: 0, done: true } }) }, deadline: DEADLINE });
   assert.equal(cnt(log, 'rpc:claim_flight_price_audit'), 1);
   assert.equal(cnt(log, 'rpc:finish_flight_price_audit'), 1);
-  assert.equal(result.checkpoint.auditOldestWaitMs,60000);
 });
 
 // ── 5 + 10. Maintenance turn 1 rechecks the roulette pool by EXACT ticket, no pool rebuild ──────
@@ -71,7 +71,7 @@ test('5+10. maintenance turn 1 rechecks exact roulette tickets and never republi
   const provider = { request: async (url) => { seen.push(url); return { kind: 'ok', json: { success: true, data: [] } }; } };
   const script = { ...rouletteScript(), rpc: { ...rouletteScript().rpc, claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script, provider });
-  const r = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
+  const r = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
   assert.equal(cnt(log, 'rpc:collection_commit_roulette'), 1, 'commits the recheck to offers');
   assert.ok(seen.some(u => u.includes('origin=FRA') && u.includes('destination=MAD') && u.includes('departure_at=2027-01-10')), 'exact ticket rechecked');
   assert.equal(cnt(log, 'upload'), 0, 'no snapshot upload');           // does not rebuild the public pool
@@ -84,9 +84,9 @@ test('6. roulette cursor persists across maintenance windows', async () => {
     rpc: { collection_commit_roulette: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters } = maintenanceAdapters({ script });
   const cp0 = onlyFeedbackAndRoulette();
-  const r1 = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp0 }, deadline: DEADLINE });
+  const r1 = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp0 }, deadline: DEADLINE });
   assert.equal(r1.checkpoint.roulette.cursor, 1);
-  const r2 = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: r1.checkpoint }, deadline: DEADLINE });
+  const r2 = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: r1.checkpoint }, deadline: DEADLINE });
   assert.equal(r2.checkpoint.roulette.cursor, 2, 'resumes from the persisted cursor, not from 0');
   assert.equal(r2.checkpoint.roulette.done, true, 'both tickets checked exactly once');
 });
@@ -94,16 +94,16 @@ test('6. roulette cursor persists across maintenance windows', async () => {
 // ── 7 + 8. The feedback queue and the roulette recheck do not block each other ──────────────────
 // Maintenance does ONE bounded unit per step and rotates cp.turn, so even with BOTH queues
 // permanently busy the two tasks strictly alternate across steps — neither can monopolize.
-test('7+8. a busy feedback queue is bounded to ten claims, then roulette runs (no starvation)', async () => {
+test('7+8. a busy feedback queue and a busy roulette pool alternate across steps (no starvation)', async () => {
   const script = { from: rouletteScript().from,
     rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],   // always busy (last repeats)
       finish_flight_price_audit: [{ data: true, error: null }], collection_commit_roulette: [{ data: true, error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
-  let cp=onlyFeedbackAndRoulette();let result;
-  for(let i=0;i<11;i++){result=await adapters.priority.step({job:{id:1,planDate:TODAY,startedAt:CLOCK,checkpoint:cp},deadline:DEADLINE});cp=result.checkpoint;}
-  assert.equal(cnt(log, 'rpc:finish_flight_price_audit'), 10, 'bounded audit batch drained first');
-  assert.equal(cnt(log, 'rpc:collection_commit_roulette'), 1, 'roulette progressed after the audit bound');
-  assert.equal(result.checkpoint.roulette.cursor, 1);
+  const r1 = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
+  const r2 = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: r1.checkpoint }, deadline: DEADLINE });
+  assert.equal(cnt(log, 'rpc:finish_flight_price_audit'), 1, 'step 1 processed a feedback item (turn 0)');
+  assert.equal(cnt(log, 'rpc:collection_commit_roulette'), 1, 'step 2 reached the roulette recheck (turn 1) despite the busy feedback queue');
+  assert.equal(r2.checkpoint.roulette.cursor, 1, 'roulette progressed — feedback did not block it, and vice versa');
 });
 
 // ── 9. A large feedback queue is drained in small bounded batches (one claim per turn-0 visit) ───
@@ -111,8 +111,8 @@ test('9. a busy feedback queue is processed in bounded portions (≤1 claim per 
   const script = { rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],
     finish_flight_price_audit: [{ data: true, error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
-  const cp = onlyFeedbackAndRoulette({ roulette: { cycle: 1, cursor: 0, done: true } });
-  await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE });
+  const cp = onlyFeedbackAndRoulette({ roulette: { cycle: 0, cursor: 0, done: true } });
+  await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE });
   assert.equal(cnt(log, 'rpc:claim_flight_price_audit'), 1, 'exactly one item claimed per step — no monopolizing the window');
 });
 
@@ -122,7 +122,7 @@ test('11. transient DB failure during the roulette recheck is retried without lo
   const script = { from: { [POOL]: [T, { data: [{ snapshot_at: 'S1' }], error: null }, { data: [TICKET], error: null }] }, // first pool read transient, then ok
     rpc: { collection_commit_roulette: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
-  const r = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
+  const r = await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
   assert.ok(cnt(log, 'from:' + POOL) >= 3, 'the transient pool read was retried (extra builder)');
   assert.equal(r.checkpoint.roulette.cursor, 1, 'checkpoint still advanced after the retry');
 });
@@ -133,7 +133,7 @@ test('12b. finish_flight_price_audit is not retried on a transient error', async
   const script = { rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],
     finish_flight_price_audit: [T] } };
   const { adapters, log } = maintenanceAdapters({ script });
-  await assert.rejects(() => adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette({ roulette: { cycle: 1, cursor: 0, done: true } }) }, deadline: DEADLINE }),
+  await assert.rejects(() => adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette({ roulette: { cycle: 0, cursor: 0, done: true } }) }, deadline: DEADLINE }),
     /Collection database operation failed/);
   assert.equal(cnt(log, 'rpc:finish_flight_price_audit'), 1, 'single attempt — no auto-retry of a non-idempotent finalize');
 });
@@ -145,9 +145,9 @@ test('13. after an error, the next maintenance step resumes and processes the qu
   const script = { rpc: { claim_flight_price_audit: [perm, { data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],
     finish_flight_price_audit: [{ data: true, error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
-  const cp = onlyFeedbackAndRoulette({ roulette: { cycle: 1, cursor: 0, done: true } });
-  await assert.rejects(() => adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE }), /42501/);
-  await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE });
+  const cp = onlyFeedbackAndRoulette({ roulette: { cycle: 0, cursor: 0, done: true } });
+  await assert.rejects(() => adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE }), /42501/);
+  await adapters.maintenance.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp }, deadline: DEADLINE });
   assert.equal(cnt(log, 'rpc:finish_flight_price_audit'), 1, 'the next session finalized the item');
 });
 
@@ -155,7 +155,7 @@ test('13. after an error, the next maintenance step resumes and processes the qu
 function atRiskState(frameMinute, phaseIndex) {
   const s = freshScheduleState();
   s.jobs.main = { id: 0, planDate: TODAY, checkpoint: { cursor: 100, total: 100000, errors: 0, wave: 43 }, done: false, startedAt: 110 * MINMS, completedAt: null, retryAt: 0, activeMs: 60000 };
-  s.frame = { cycle: 48, phase: phaseIndex, spentMs: 0 };
+  s.frame = { cycle: 12, phase: phaseIndex, spentMs: 0 };
   return s;
 }
 const clockAt = (min) => 1440 * MINMS + min * MINMS;   // cycle 12, given minute
@@ -170,28 +170,28 @@ function ranEngine(state, clock, guaranteeDailyMain, ran) {
 }
 
 test('2. main-at-risk does NOT take the fast slot', async () => {
-  const ran = []; const r = await ranEngine(atRiskState(2, 1), clockAt(2), true, ran).tick();
+  const ran = []; const r = await ranEngine(atRiskState(5, 0), clockAt(5), true, ran).tick();
   assert.equal(r.task, 'fast'); assert.deepEqual(ran, ['fast']);
 });
 test('3. main-at-risk does NOT take a maintenance slot', async () => {
-  const ran = []; const r = await ranEngine(atRiskState(28, 4), clockAt(28), true, ran).tick();
+  const ran = []; const r = await ranEngine(atRiskState(12, 1), clockAt(12), true, ran).tick();
   assert.equal(r.task, 'maintenance'); assert.deepEqual(ran, ['maintenance']);
 });
 test('14. tail yields to main ONLY in a tail slot (main runs its own slot as usual)', async () => {
-  const ranTail = []; const rt = await ranEngine(atRiskState(27, 3), clockAt(27), true, ranTail).tick();
+  const ranTail = []; const rt = await ranEngine(atRiskState(50, 3), clockAt(50), true, ranTail).tick();
   assert.equal(rt.task, 'main');                          // tail slot yielded
   const ranMain = []; const rm = await ranEngine(atRiskState(20, 2), clockAt(20), true, ranMain).tick();
   assert.equal(rm.task, 'main');                          // main slot: main anyway
 });
 test('15. after main.done, a tail slot runs tail again', async () => {
-  const s = atRiskState(27, 3); s.jobs.main.done = true;
-  const ran = []; const r = await ranEngine(s, clockAt(27), true, ran).tick();
+  const s = atRiskState(50, 3); s.jobs.main.done = true;
+  const ran = []; const r = await ranEngine(s, clockAt(50), true, ran).tick();
   assert.equal(r.task, 'tail'); assert.deepEqual(ran, ['tail']);
 });
-test('1. fast job id advances once per established two-hour cycle', () => {
+test('1. fast job id advances once per two-hour cycle (fast never skipped over cycles)', () => {
   const s = freshScheduleState();
   const a = prepareJob(s, 'fast', 0).id;
-  const b = prepareJob(s, 'fast', 4*CYCLE_MS).id;
+  const b = prepareJob(s, 'fast', CYCLE_MS).id;
   assert.equal(b - a, 1);
 });
 test('17. concurrent ticks are refused — strictly one unit in flight', async () => {
