@@ -7,6 +7,7 @@ import { CollectionProvider } from './collection-provider.mjs';
 import { SequentialSchedule, freshScheduleState } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { main as publishSnapshot } from './snapshot-daily-origin-cheapest.mjs';
 
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
@@ -23,15 +24,49 @@ export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   return false;
 }
 
-// Stage 3: the coordinator no longer performs selection. Rebuilding the roulette pool
-// (membership/order/rank) is owned exclusively by the nightly selection workflow
-// (`Nightly cheapest offers selection` → scripts/snapshot-daily-origin-cheapest.mjs), which
-// runs once per Berlin day (~03:30) and is protected by an observed_on once-per-day guard.
-// A session end here does NOT republish the pool: between nightly selections the coordinator
-// priority refresh keeps the SELECTED tickets' prices fresh without changing membership,
-// and the nightly owner (plus its post-coordinator catch-up trigger) re-selects at most once
-// per day. This removes the former end-of-session republish, which was a second selection
-// writer competing with the owner.
+// Decouples pool publication from FULL main-pass completion. The main pass is now
+// larger than one Berlin day's collection budget (total ~13.5k route*month cells vs
+// ~2–3k committed per session), so it reaches `done` — and republishes the roulette
+// pool — only once every ~1.5–2 days. Between those completions the newest snapshot
+// stays frozen and a later roulette re-verification can prune an offer the frozen pool
+// still points at, producing the user-visible desync.
+//
+// At the end of every session that did NOT already publish through a completed main
+// pass, and only while this runner still holds the fenced collection lease, rebuild the
+// pool from the CURRENT fresh offers. snapshot-daily-origin-cheapest enforces
+// pool ⊆ offers by construction, so every published candidate has a live offer no matter
+// how far the in-progress main pass got. Safety properties:
+//  - single writer: runs AFTER the sequential loop has stopped, on the same lease — no
+//    concurrent request and no lease override;
+//  - fenced: the lease is re-checked (and renewed) immediately before and after publish;
+//  - no false success: publication is independently read back, and any failure throws so
+//    a session can never report a publication that did not land;
+//  - no partial state: the publisher writes a complete new snapshot_at set or fails; a
+//    failed collection loop throws before reaching here, so a failed session never
+//    publishes;
+//  - no repeated manual republish: this is the automatic replacement for it.
+// A session should publish an end-of-session pool only when a completed main pass did
+// NOT already publish during it. `completedMain` is incremented by the scheduler exactly
+// when the main adapter returns `done` (which is what publishes via the adapter), so an
+// unchanged counter means the pass is still partial/resumed and the pool would otherwise
+// stay frozen for this whole session.
+export function shouldPublishEndOfSession(completedMainBefore, completedMainAfter) {
+  return completedMainAfter === completedMainBefore;
+}
+
+export async function publishEndOfSessionPool({ db, lease, snapshotWave = 0, clock = Date.now, publish = publishSnapshot, log = () => {} }) {
+  if (!await lease()) throw new Error('End-of-session pool publish forbidden: lease lost');
+  const snapshotAt = new Date(clock()).toISOString();
+  await publish({ db, snapshotAt, expansionWave: snapshotWave });
+  if (!await lease()) throw new Error('End-of-session pool publish forbidden: lease lost after publish');
+  const { data, error } = await db.from('daily_origin_cheapest_pool')
+    .select('snapshot_at').eq('snapshot_at', snapshotAt).limit(1);
+  if (error) throw new Error(`End-of-session pool readback failed: ${error.message ?? 'unknown error'}`);
+  if (!data || data.length === 0) throw new Error('End-of-session pool publish was not confirmed by readback');
+  log(JSON.stringify({ event: 'pool_republished_end_of_session', snapshotAt }));
+  return { published: true, snapshotAt };
+}
+
 export async function main(env=process.env){
   if(env.COLLECTION_MODE!=='coordinated')throw new Error('Coordinated mode has not been enabled');
   for(const key of ['TP_TOKEN','SUPABASE_SERVICE_KEY','GITHUB_TOKEN'])if(!env[key])throw new Error(`Missing required ${key}`);
@@ -56,31 +91,36 @@ export async function main(env=process.env){
   if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
   const end=Date.now()+minutes*60000;
   const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
-  // The 30-minute schedule already assigns a nominal 180 minutes of a 235-minute session to MAIN.
-  // The deadline guard is on unless explicitly rolled back; when measured progress is late it may
-  // borrow TAIL, but never priority/FAST/maintenance.
-  const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
+  // Daily-main guarantee: OFF by default (exact legacy behavior). Set repo var
+  // GUARANTEE_DAILY_MAIN=true to let a tail slot yield to main while the current main pass is at
+  // risk of missing its 24h deadline (see collection-schedule.mjs mainAtRisk). No schedule change.
+  const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN==='true';
   let engine;
   engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,guaranteeDailyMain,
     handlers:createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state})});
   let stopping=false;const stop=()=>{stopping=true;};
   process.once('SIGTERM',stop);process.once('SIGINT',stop);
   let lastReport=0;
+  const completedMainBefore=engine.state.completedMain;
   try{
     while(!stopping&&Date.now()+45000<end){
       const result=await engine.tick();
       if(Date.now()-lastReport>60000||result.status==='done'){
         console.log(JSON.stringify({task:result.task,status:result.status,cycle:result.cycle,providerRequests:provider.requests,
-          completedMain:engine.state.completedMain,missedFast:engine.state.missedFast,missedPriority:engine.state.missedPriority,
-          priorityLagMs:engine.state.jobs.priority?.checkpoint?.lagMs,
+          completedMain:engine.state.completedMain,missedFast:engine.state.missedFast,
           progress:Object.fromEntries(Object.entries(engine.state.jobs).map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
         lastReport=Date.now();
       }
       if(result.status==='idle')await new Promise(resolve=>setTimeout(resolve,Math.min(15000,Math.max(1000,result.deadline-Date.now()))));
     }
     // The loop only reaches here when it stops cleanly (budget reached or SIGTERM); a
-    // failed unit throws and skips straight to release. The session does NOT publish the
-    // roulette pool: selection is the nightly owner's sole responsibility (see note above).
+    // failed unit throws and skips straight to release, so a broken session never
+    // publishes. If a completed main pass already republished this session, skip — the
+    // adapter's completion publish is authoritative and re-publishing would be redundant.
+    if(shouldPublishEndOfSession(completedMainBefore,engine.state.completedMain)){
+      await publishEndOfSessionPool({db,lease:()=>store.lease(),
+        snapshotWave:Number(env.SNAPSHOT_EXPANSION_WAVE??0),log:(...a)=>console.log(...a)});
+    }
     if(env.GITHUB_STEP_SUMMARY)await appendFile(env.GITHUB_STEP_SUMMARY,
       `### Sequential collection session\n\nWave: ${wave}. Provider requests: ${provider.requests}. Main passes attempted: ${engine.state.completedMain}.\n\n`+
       Object.entries(engine.state.jobs).map(([task,j])=>`- ${task}: ${j.done?'pass finished':'checkpoint saved'}; ${j.checkpoint?.cursor??0}/${j.checkpoint?.total??'?'} units; ${j.checkpoint?.errors??0} inconclusive responses.\n`).join('')+

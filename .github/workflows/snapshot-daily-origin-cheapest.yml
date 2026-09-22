@@ -2,16 +2,17 @@ name: Daily cheapest offers snapshot
 
 on:
   schedule:
-    # Legacy owner remains published and unchanged until PO flips COLLECTION_MODE.
+    # Priority-0 price-only recheck. It never rebuilds or re-ranks the immutable roulette pool.
+    # An idle gate and in-process watcher make it yield to every other queued/running workflow.
     - cron: '7,37 * * * *'
       timezone: 'Europe/Berlin'
+  # A successful main sweep already refreshed the source offers, so rebuild immediately after it.
   workflow_run:
     workflows: ['Twice-daily price fetch']
     types: [completed]
   workflow_dispatch:
 
-# Coordinated mode moves exact refresh into the worker's priority cycle and selection into the
-# guarded nightly workflow. The
+# Coordinated mode moves this work into the worker's maintenance windows. The
 # shared queue:max lock also serializes the preserved legacy/manual fallback.
 concurrency:
   group: nextout-data-collection

@@ -9,8 +9,7 @@ test('priority-0 roulette recheck is resumable and yields before changing the ne
   assert.match(source, /result\.status === 'yielded'/);
   assert.match(source, /await saveCheckpoint\(supabase, snapshotAt, ticketKey\(ticket\)\)/);
   assert.match(source, /setInterval\(async \(\) =>/);
-  assert.match(source, /ownWorkflowName:REFRESH_WORKFLOW_NAME/);
-  assert.match(source, /REFRESH_WORKFLOW_NAME = process\.env\.REFRESH_WORKFLOW_NAME \|\| ROULETTE_REFRESH_WORKFLOW/);
+  assert.match(source, /ownWorkflowName:ROULETTE_REFRESH_WORKFLOW/);
 });
 
 test('price-only refresh does not write the roulette snapshot tables', () => {

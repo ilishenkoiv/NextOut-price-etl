@@ -1,44 +1,22 @@
 // Shared sequential scheduling core. No network, environment secrets or process
 // side effects on import. Adapters perform one bounded, checkpointed unit at a time.
 const MINUTE = 60_000;
-export const CYCLE_MS = 30 * MINUTE;
+export const CYCLE_MS = 120 * MINUTE;
 // export const MAIN_CYCLE_MS = 12 * 60 * MINUTE; // two main passes/day — uncomment to restore
 export const MAIN_CYCLE_MS = 24 * 60 * MINUTE;    // one main pass/day
 // Reserve kept when judging whether the current main pass can still finish within MAIN_CYCLE_MS.
 // A pass is "at risk" once its realized pace can no longer reach the end with this much slack.
 export const MAIN_DEADLINE_RESERVE = 0.2;
-export const PRIORITY_MAX_CYCLE_MS = 5 * MINUTE;
-export const LOWER_PHASE_RESERVE_MS = 2 * MINUTE;
 export const SLOTS = Object.freeze([
-  { from: 0, to: 2, task: 'priority' },
-  { from: 2, to: 4, task: 'fast' },
-  { from: 4, to: 27, task: 'main' },
-  { from: 27, to: 28, task: 'tail' },
-  { from: 28, to: 29, task: 'maintenance' },
-  { from: 29, to: 30, task: 'reserve' },
+  { from: 0, to: 10, task: 'fast' },
+  { from: 10, to: 15, task: 'maintenance' },
+  { from: 15, to: 45, task: 'main' },
+  { from: 45, to: 65, task: 'tail' },
+  { from: 65, to: 70, task: 'maintenance' },
+  { from: 70, to: 95, task: 'main' },
+  { from: 95, to: 110, task: 'tail' },
+  { from: 110, to: 120, task: 'reserve' },
 ]);
-
-// Exact nominal allocation for a session. Priority work may pre-empt any lower-priority slot;
-// those overruns are deliberately reported as lag instead of being hidden in the MAIN budget.
-export function nominalSessionBudgets(start, durationMs) {
-  const budgets = {};
-  let cursor = start; const end = start + durationMs;
-  while (cursor < end) {
-    const slot = slotAt(cursor);
-    const until = Math.min(end, slot.deadline);
-    budgets[slot.task] = (budgets[slot.task] ?? 0) + until - cursor;
-    cursor = until;
-  }
-  return budgets;
-}
-
-export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0, windowTickets = 0, requestMs }) {
-  if (![auditTickets,rouletteTickets,windowTickets,requestMs].every(Number.isFinite) || requestMs < 0) throw new Error('Invalid priority projection');
-  const windowBatch=Math.ceil(Math.max(0,windowTickets)/48);
-  const requests=Math.max(0,auditTickets)+Math.max(0,rouletteTickets)+windowBatch;
-  const elapsedMs=requests*requestMs;
-  return{requests,windowBatch,elapsedMs,lagMs:Math.max(0,elapsedMs-2*MINUTE),fitsReservedSlot:elapsedMs<=2*MINUTE};
-}
 
 export function slotAt(timestamp) {
   if (!Number.isFinite(timestamp) || timestamp < 0) throw new Error('Invalid clock');
@@ -50,7 +28,7 @@ export function slotAt(timestamp) {
 }
 
 export function freshScheduleState() {
-  return { version: 1, jobs: {}, completedMain: 0, missedFast: 0, missedPriority: 0 };
+  return { version: 1, jobs: {}, completedMain: 0, missedFast: 0 };
 }
 
 function newJob(task, id, timestamp) {
@@ -60,20 +38,14 @@ function newJob(task, id, timestamp) {
 
 export function prepareJob(state, task, timestamp) {
   const current = state.jobs[task];
-  const period = task === 'priority' ? CYCLE_MS : task === 'fast' ? 4*CYCLE_MS : task === 'main' ? MAIN_CYCLE_MS : 86400000;
+  const period = task === 'fast' ? CYCLE_MS : task === 'main' ? MAIN_CYCLE_MS : 86400000;
   const requestedId = Math.floor(timestamp / period);
   if (task === 'fast' && current && current.id !== requestedId)
     state.missedFast += Math.max(0,requestedId-current.id-(current.done?1:0));
-  if (task === 'priority' && current && current.id !== requestedId)
-    state.missedPriority += Math.max(0,requestedId-current.id-(current.done?1:0));
   // An unfinished main/tail/maintenance pass survives midnight, missed slots and
   // runner replacement. Never advance its plan date just because time advanced.
-  if (current && (current.id === requestedId || (!current.done && task !== 'fast' && task !== 'priority'))) return current;
-  const next = newJob(task, requestedId, timestamp);
-  // The daily weekend-refresh cursor lives across 30-minute priority cycles. Each cycle gets a
-  // fresh due/deadline identity while retaining the stable daily-set checkpoint.
-  if (task === 'priority' && current?.checkpoint) next.checkpoint = structuredClone(current.checkpoint);
-  return (state.jobs[task] = next);
+  if (current && (current.id === requestedId || (!current.done && task !== 'fast'))) return current;
+  return (state.jobs[task] = newJob(task, requestedId, timestamp));
 }
 
 // Whether the current main pass is behind the pace needed to finish within MAIN_CYCLE_MS.
@@ -127,26 +99,19 @@ export class SequentialSchedule {
       const cycle = slotAt(this.clock()).cycle;
       const cycleEnd = Math.min((cycle+1)*CYCLE_MS,this.stopAt);
       let working=structuredClone(this.state);
-      if(working.frame?.cycle!==cycle)working.frame={cycle,phase:0,spentMs:0,prioritySpentMs:0};
+      if(working.frame?.cycle!==cycle)working.frame={cycle,phase:0,spentMs:0};
       // Track useful time, not a sleeping/deallocated runner. A five-minute
       // GitHub handover must not consume the fast refresh's ten-minute budget.
       while(working.frame.phase<SLOTS.length){
       const phase=SLOTS[working.frame.phase];
       const reserve=phase.task==='reserve';
       const remaining=reserve?Infinity:(phase.to-phase.from)*MINUTE-working.frame.spentMs;
-      // A due priority cycle (audit -> cheapest -> saved windows) drains before every lower task.
-      // This is one owner using one provider/lease; it cannot overlap MAIN or a second refresh.
-      const priority = prepareJob(working, 'priority', this.clock());
-      const priorityMaxUnit=typeof this.handlers.priority?.maxUnitMs==='function'
-        ? this.handlers.priority.maxUnitMs(priority):this.handlers.priority?.maxUnitMs;
-      const priorityDue = Boolean(this.handlers.priority) && !priority.done && priority.retryAt <= this.clock()
-        && (working.frame.prioritySpentMs??0)+(Number(priorityMaxUnit)||Infinity)<=PRIORITY_MAX_CYCLE_MS;
       // A tail slot yields to main while the current main pass is at risk of missing its 24h
       // deadline (only when guaranteeDailyMain is on). Main is tried first; tail stays the fallback,
       // so an already-safe or done main lets tail keep its own cursor and run normally.
       const tailYieldsToMain = phase.task==='tail' && this.guaranteeDailyMain
         && mainAtRisk(working, this.clock(), { margin: this.mainDeadlineReserve });
-      const candidates=priorityDue?['priority']:(reserve?['fast','main','tail','maintenance']:(tailYieldsToMain?['main','tail']:[phase.task]));
+      const candidates=reserve?['fast','main','tail','maintenance']:(tailYieldsToMain?['main','tail']:[phase.task]);
       for(const task of candidates){
         const adapter = this.handlers[task];
         if (!adapter) continue;
@@ -156,9 +121,7 @@ export class SequentialSchedule {
         const maxUnitMs = typeof adapter.maxUnitMs==='function' ? adapter.maxUnitMs(job) : adapter.maxUnitMs;
         if (!Number.isFinite(maxUnitMs) || maxUnitMs <= 0) throw new Error('Unbounded collection adapter');
         const taskBudget=task==='fast'?600000-(job.activeMs??0):Infinity;
-        const priorityRemaining=task==='priority'?PRIORITY_MAX_CYCLE_MS-(working.frame.prioritySpentMs??0):Infinity;
-        const taskCycleEnd=task==='main'&&phase.task==='main'?cycleEnd-LOWER_PHASE_RESERVE_MS:cycleEnd;
-        const deadline=Math.min(taskCycleEnd,this.clock()+remaining,this.clock()+taskBudget,this.clock()+priorityRemaining);
+        const deadline=Math.min(cycleEnd,this.clock()+remaining,this.clock()+taskBudget);
         if (this.clock() + maxUnitMs > deadline) continue;
         const unitStarted=this.clock();
         // Persist the selected plan BEFORE provider work so retries use exactly
@@ -172,7 +135,6 @@ export class SequentialSchedule {
         const after = structuredClone(this.state);
         const spent=Math.max(0,this.clock()-unitStarted);
         after.frame.spentMs+=spent;
-        if(task==='priority')after.frame.prioritySpentMs=(after.frame.prioritySpentMs??0)+spent;
         after.jobs[task].activeMs=(after.jobs[task].activeMs??0)+spent;
         if (Object.hasOwn(result, 'checkpoint')) after.jobs[task].checkpoint = result.checkpoint;
         if (result.status === 'empty' || result.status === 'yield') {
@@ -188,7 +150,7 @@ export class SequentialSchedule {
               activeMs:after.jobs[task].activeMs}].slice(-16);
           }
         }
-        if(!reserve&&task===phase.task&&['done','empty','yield'].includes(result.status))after.frame={cycle,phase:after.frame.phase+1,spentMs:0,prioritySpentMs:after.frame.prioritySpentMs??0};
+        if(!reserve&&['done','empty','yield'].includes(result.status))after.frame={cycle,phase:after.frame.phase+1,spentMs:0};
         await this.save(after);
         this.state = after;
         // Budget overruns are observable failures, not silent claims of on-time
@@ -201,7 +163,7 @@ export class SequentialSchedule {
       if(reserve)break;
       // A completed/empty/unavailable task lends the rest of its budget to the
       // later phases. An unfinished job's checkpoint stays intact.
-      if(working.frame.phase===SLOTS.indexOf(phase))working.frame={cycle,phase:working.frame.phase+1,spentMs:0,prioritySpentMs:working.frame.prioritySpentMs??0};
+      if(working.frame.phase===SLOTS.indexOf(phase))working.frame={cycle,phase:working.frame.phase+1,spentMs:0};
       }
       await this.save(working);this.state=working;
       return { task: null, status: 'idle', cycle, deadline:cycleEnd };

@@ -9,27 +9,12 @@ import { CollectionYield } from './collection-provider.mjs';
 import { withSupabaseRetry } from './supabase-retry.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
-import { expansionTargets } from '../src/data/expansion-targets.js';
+import { main as publishSnapshot } from './snapshot-daily-origin-cheapest.mjs';
 import { gzipSync } from 'node:zlib';
-import { createHash } from 'node:crypto';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
 const DAY = 86400000;
-export const PRIORITY_AUDIT_BATCH = 10;
-export const MAIN_REQUIRED_PROVIDER_CALLS = 4;
-export function projectMainCellMs({requestMs,dbMs=0,calendarFallback=false,retryCalls=0}){
-  if(![requestMs,dbMs,retryCalls].every(Number.isFinite)||requestMs<0||dbMs<0||retryCalls<0)throw new Error('Invalid MAIN projection');
-  return(MAIN_REQUIRED_PROVIDER_CALLS+Number(calendarFallback)+retryCalls)*requestMs+dbMs;
-}
-function addIsoDays(day,n){const d=new Date(day+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
-function addIsoMonths(day,n){const d=new Date(day+'T00:00:00Z');d.setUTCMonth(d.getUTCMonth()+n);return d.toISOString().slice(0,10);}
-// Mirrors the read-only app consumer: breakWindows uses lead=10 days, horizon=4 months and only
-// factual `weekend`/`holiday` windows. Both exact variants remain separate rows; no top-N cap.
-export function selectWindowConsumerSet(rows,day){const min=addIsoDays(day,10),max=addIsoMonths(day,4);return rows.filter(t=>
-  t.departure_at>=min&&t.departure_at<=max&&t.return_at>t.departure_at&&['weekend','holiday'].includes(t.window_kind));}
-export function windowConsumerSetId(rows,day){return`window-consumer:${day}:`+createHash('sha256').update(rows.map(t=>
-  [t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|')).join('\n')).digest('hex').slice(0,20);}
 
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
@@ -81,76 +66,63 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   }
 
   const main = {
-    // Main no longer publishes the roulette pool. Selection is owned exclusively by the
-    // nightly `Nightly cheapest offers selection` workflow (scripts/snapshot-daily-origin-cheapest.mjs);
-    // the main pass only refreshes source offers and completes. No 480s snapshot unit needed.
-    // Four mandatory upstream calls (two return windows × direct/any) need more than the former
-    // 30s unit at the 8s timeout. 75s work / 90s admission preserves the boundary guard.
-    maxUnitMs: 90_000,
+    maxUnitMs: job => job.checkpoint?.stage==='snapshot' ? 480_000 : 45_000,
     async step({ job, deadline }) {
-      const unitEnd = Math.min(deadline, clock() + 75_000);
+      const unitEnd = Math.min(deadline, clock() + 30_000);
       let cp = job.checkpoint ?? { cursor: 0, errors: 0, wave };
       const pinnedWave=cp.wave??wave;
       cp={...cp,wave:pinnedWave};
       try {
+        if (cp.stage === 'snapshot') {
+          setDbDeadline(Math.min(deadline,clock()+470000));
+          try {
+            await publishSnapshot({db,snapshotAt:cp.snapshotAt,expansionWave:cp.snapshotWave??0});
+            const rows=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').eq('snapshot_at',cp.snapshotAt).limit(1),deadline,{retry:true});
+            if(!rows.length)throw new Error('Main pass snapshot was not published');
+          } finally { setDbDeadline(Infinity); }
+          return {status:'done',checkpoint:{...cp,stage:'complete'}};
+        }
         const plan = await durablePlan('main',{...job,checkpoint:cp},async () => {
           const months = horizon(job.planDate);
           const prices = await load('prices','origin,dest,month,direct,any_stops',PRICE_ORDER,q=>q.in('month',months),unitEnd);
-          const routeHealth = await load('route_price_health','origin,dest,status',['origin','dest'],undefined,unitEnd);
           const watchRows = await watches(unitEnd);
           const holidays = await load('public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date'],q=>q.gte('date',months[0]+'-01').lt('date',nextMonth(months.at(-1))+'-01'),unitEnd);
           const regions = await load('origin_regions','airport,calendar_subdivision_code',['airport'],undefined,unitEnd);
           const codes = new Set(regions.map(r=>r.calendar_subdivision_code));
           const days = new Set(holidays.filter(h=>codes.has(h.subdivision_code) || (h.level==='country' && [...codes].some(c=>c.startsWith(h.country+'-')))).map(h=>h.date));
           const trancheDests = resolveTrancheDests(process.env.EXPANSION_TRANCHE_DESTS);
-          return { ...mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows,routeHealth,trancheDests}),
+          return { ...mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows,trancheDests}),
             breakKeys:[...buildBreakWindows(days,months[0]+'-01',nextMonth(months.at(-1))+'-01').keySet] };
         });
         // cellOrder (when present) front-loads the bounded expansion tranche, then keeps every
         // remaining cell in the original month-major order. It is a permutation of the same cell ids,
         // so `total` and cursor/resume semantics are identical to the legacy identity ordering.
         const total = plan.cellOrder ? plan.cellOrder.length : plan.routes.length * plan.months.length;
-        const expansion = new Set(expansionTargets(pinnedWave).map(item => item.iata));
         // A cursor is advanced only after the complete cell has been committed.
         while (cp.cursor < total && clock() + 15000 < unitEnd) {
           const cellId = plan.cellOrder ? plan.cellOrder[cp.cursor] : cp.cursor;
           const route = plan.routes[cellId % plan.routes.length];
           const month = plan.months[Math.floor(cellId / plan.routes.length)];
+          const natural = route.stops !== 1; let usedType = natural ? 'direct' : 'any';
           const request = url => provider.request(url, unitEnd - 9000);
-          // Owner invariant: BOTH variants are mandatory for every cell. `any` is the provider's
-          // actual direct=false result and may legitimately be cheaper than (or include) direct.
-          // A boundary/restart between probes leaves cp.cursor unchanged, so both replay safely.
-          const directResult = await probeType(route.origin,route.dest,month,nextMonth(month),true,request);
-          const anyResult = await probeType(route.origin,route.dest,month,nextMonth(month),false,request);
-          let calendarResult = null;
-          // Calendar is positive-only supplemental evidence after TWO confirmed-empty required
-          // probes. It never masks a failed required probe and never supplies no-price evidence.
-          if(directResult.ok&&directResult.min==null&&anyResult.ok&&anyResult.min==null)
-            calendarResult=await fetchCalendarMonth(route.origin,route.dest,month,request);
-          const direct = directResult.min ?? (calendarResult?.ok&&calendarResult.type==='direct'?calendarResult.min:null);
-          const any = anyResult.min ?? (calendarResult?.ok&&calendarResult.type==='any'?calendarResult.min:null);
-          const hasPrice=direct!=null||any!=null;
-          if (hasPrice) {
-            const directSource=directResult.min!=null?monthlyQuoteProvenance(directResult.offers,directResult.min)
-              : calendarResult?.type==='direct'?{...monthlyQuoteProvenance(calendarResult.offers,calendarResult.min),source:'calendar'}:null;
-            const anySource=anyResult.min!=null?monthlyQuoteProvenance(anyResult.offers,anyResult.min)
-              : calendarResult?.type==='any'?{...monthlyQuoteProvenance(calendarResult.offers,calendarResult.min),source:'calendar'}:null;
+          let result = await probeType(route.origin,route.dest,month,nextMonth(month),natural,request);
+          if (result.ok && result.min == null) {
+            const alt = await probeType(route.origin,route.dest,month,nextMonth(month),!natural,request);
+            if (alt.ok && alt.min != null) { result=alt; usedType=natural?'any':'direct'; }
+            else {
+              const cal = await fetchCalendarMonth(route.origin,route.dest,month,request);
+              if (cal.ok && cal.min != null) { result=cal; usedType=cal.type; }
+              else if(!alt.ok)result={ok:false,min:null,offers:[]};
+            }
+          }
+          if (result.ok) {
             const price = withPriceProvenance([{ origin:route.origin,dest:route.dest,market:marketForOrigin(route.origin),month,
-              direct,any_stops:any,direct_observed:directResult.ok,any_observed:anyResult.ok,
-              updated_at:new Date(clock()).toISOString(),price_source:{variants:{...(directSource?{direct:directSource}:{}),...(anySource?{any:anySource}:{})}} }],'prices')[0];
-            const offers = withPriceProvenance(selectCombo([...directResult.offers,...anyResult.offers,...(calendarResult?.offers??[])],
-              route.origin,route.dest,new Set(plan.breakKeys)),'offers');
+              direct:usedType==='direct'?result.min:null,any_stops:usedType==='any'?result.min:null,
+              updated_at:new Date(clock()).toISOString(),price_source:monthlyQuoteProvenance(result.offers,result.min) }],'prices')[0];
+            const offers = withPriceProvenance(selectCombo(result.offers,route.origin,route.dest,new Set(plan.breakKeys)),'offers');
             await commit('collection_commit_main',{ p_price:price,p_offers:offers },unitEnd);
           }
-          // Positive evidence revives immediately even if the other required probe failed. Empty
-          // evidence is recorded only when BOTH required variants completed successfully empty.
-          if (hasPrice || (directResult.ok&&anyResult.ok&&direct==null&&any==null)) {
-            const recorded = await query(()=>db.rpc('collection_record_route_observation',{...store.args(),p_pass_id:job.id,
-              p_origin:route.origin,p_dest:route.dest,p_month:month,p_horizon:plan.months,
-              p_has_price:hasPrice,p_is_expansion:expansion.has(route.dest)}),unitEnd,{retry:true});
-            if(recorded!==true)throw new Error('Route price-health observation was not acknowledged');
-          }
-          cp = { ...cp, cursor:cp.cursor+1, errors:cp.errors+Number(!directResult.ok)+Number(!anyResult.ok), total };
+          cp = { ...cp, cursor:cp.cursor+1, errors:cp.errors+(result.ok?0:1), total };
         }
         if (cp.cursor===total) {
           // Preserve a private CSV of actual confirmed observations. Failed
@@ -165,9 +137,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const path=`snapshots/${date.slice(0,4)}/${date.slice(5,7)}/${date}_${hhmm}_coordinator-${job.id}.csv.gz`;
           const body=gzipSync(csv);
           await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true});
-          // The pass is complete once its private CSV is preserved. Selection (roulette pool
-          // membership/order/rank) is NOT done here — it is the nightly selection owner's job.
-          return {status:'done',checkpoint:{...cp,stage:'complete',snapshotPath:path}};
+          return {status:'progress',checkpoint:{...cp,stage:'snapshot',snapshotAt:new Date(clock()).toISOString(),snapshotPath:path,
+            snapshotWave:Number(process.env.SNAPSHOT_EXPANSION_WAVE||0)}};
         }
         return { status:'progress',checkpoint:cp };
       } catch (error) {
@@ -197,16 +168,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         outcome:outcome.status==='no_result'?'empty':'http_error',detail:outcome.detail,checked_at:now };
     }
     await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
-    if(fare){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
-      p_observed_at:now}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
     return outcome.status!=='error';
-  }
-
-  async function windowWasRefreshedRecently(ticket,deadline){
-    const rows=await query(()=>db.from('window_prices').select('updated_at').eq('origin',ticket.origin).eq('dest',ticket.dest)
-      .eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at)
-      .gte('updated_at',new Date(clock()-30*60*1000).toISOString()).limit(1),deadline,{retry:true});
-    return rows?.length>0;
   }
 
   function windowAdapter(task) {
@@ -233,12 +195,6 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             ticket={...route,departure_at:window.start,return_at:window.end,nights:window.nights,
               window_kind:window.kind,flight_type:cp.cursor%2===0?'direct':'any'};
           }
-          // Priority owns 30-minute freshness for every existing consumer row. FAST and TAIL keep
-          // discovery/watch duties but do not issue a duplicate TP request for an exact key that
-          // priority (or another exact writer) already refreshed inside the cadence window.
-          if(await windowWasRefreshedRecently(ticket,unitEnd)){
-            cp={...cp,cursor:cp.cursor+1,total,reusedPriority:(cp.reusedPriority??0)+1};continue;
-          }
           const recent=getState()?.jobs?.fast;
           if(task==='tail'&&recent&&clock()-recent.startedAt<7200000&&recent.checkpoint?.confirmed?.includes(exactKey(ticket))){
             cp={...cp,cursor:cp.cursor+1,total,reusedFast:(cp.reusedFast??0)+1};continue;
@@ -252,119 +208,86 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     }};
   }
 
-  const berlinDay = now => new Date(now).toLocaleDateString('en-CA',{timeZone:'Europe/Berlin'});
-
-  // The only owner of TP priority work. A checkpointed 30-minute cycle always executes in this
-  // order: one exact feedback claim, the complete saved roulette pool, then one 1/48 tranche of
-  // the stable daily saved-window set. Every request uses the same provider and fenced lease.
-  const priority={maxUnitMs:45000,async step({job,deadline}){
-    const previous=structuredClone(job.checkpoint??{});const now=clock();const today=berlinDay(now);
-    const pendingRoulette=previous.roulette&&!previous.roulette.done?previous.roulette:null;
-    const cp=previous.cycle===job.id?previous:{...previous,cycle:job.id,dueAt:job.id*30*60*1000,
-      phase:'audit',auditDone:false,auditProcessed:0,
-      roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id}:{cycle:job.id,cursor:0,errors:0,done:false}};
-    deadline=Math.min(deadline,clock()+35000);
-    try {
-      if(cp.phase==='audit'){
-        const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline);
-        const row=rows?.[0];
-        if(row){
-          const queuedAt=Date.parse(row.created_at??row.feedback?.created_at);
-          if(Number.isFinite(queuedAt))cp.auditOldestWaitMs=Math.max(cp.auditOldestWaitMs??0,now-queuedAt);
-          const ticket=ticketFromFeedback(row.feedback,today);let outcome={status:'not_requested',detail:'missing_exact_context'};
-          if(ticket){
-            const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.depart,return_at:ticket.ret,
-              direct:String(ticket.mode==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
-            const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-            outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
-          }
-          const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
-            p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline);
-          if(result!==true)throw new Error('Audit claim expired before completion');
-          cp.auditProcessed=(cp.auditProcessed??0)+1;
-          if(cp.auditProcessed>=PRIORITY_AUDIT_BATCH){cp.auditDone=true;cp.phase='roulette';}
-          return{status:'progress',checkpoint:cp};
-        }
-        cp.auditDone=true;cp.phase='roulette';
-      }
-      if(cp.phase==='roulette'){
-        const r=cp.roulette;
-        const plan=await store.plan(`coordinator/roulette-${r.cycle}-0.json`,async()=>{
-          const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
-          if(!latest.length)return{tickets:[]};
-          const tickets=await load('daily_origin_cheapest_pool','origin,dest,flight_type,departure_at,return_at,rank',
-            ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latest[0].snapshot_at),deadline);
-          if(tickets.length>220)throw new Error(`Roulette pool exceeds 22 origins × 10 tickets (${tickets.length}>220)`);
-          return{tickets:tickets.filter(t=>t.departure_at>=today&&t.return_at>t.departure_at)};
-        });
-        const ticket=plan.tickets[r.cursor];
-        if(ticket){
-          const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
-            direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
-          const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-          const result=response.kind==='ok'?classifyResponse(response.json,{origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}):{status:'error'};
-          const source=Array.isArray(response.json?.data)?response.json.data.find(row=>classifyResponse({success:true,data:[row]},
-            {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
-          const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
-            transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          await commit('collection_commit_roulette',{p_ticket:{...ticket,month:ticket.departure_at.slice(0,7)},p_result:patch},deadline);
-          if(result.status==='found'){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
-            p_observed_at:patch.updated_at}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
-          r.cursor++;r.errors+=result.status==='error'?1:0;
-        }
-        r.total=plan.tickets.length;r.done=r.cursor>=r.total;
-        if(r.done)cp.phase='weekend';
-        return{status:'progress',checkpoint:cp};
-      }
-      if(cp.phase==='weekend'){
-        let w=cp.weekend;
-        if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,passStartedAt:clock()};}
-        const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-0.json`,async()=>{
-          const tickets=await load('window_prices','origin,dest,flight_type,departure_at,return_at,nights,window_kind,updated_at',WINDOW_ORDER,
-            q=>q.gte('departure_at',w.day),deadline);
-          const eligible=selectWindowConsumerSet(tickets,w.day);
-          return{day:w.day,setId:windowConsumerSetId(eligible,w.day),selectedAt:new Date(clock()).toISOString(),tickets:eligible};
-        });
-        w.setId=plan.setId;w.total=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
-        const ticket=plan.tickets[w.cursor];
-        if(ticket){
-          if(ticket.departure_at<today){w.cursor++;w.expired=(w.expired??0)+1;}
-          else{const age=Math.max(0,clock()-Date.parse(ticket.updated_at));const ok=await exact(ticket,deadline);w.cursor++;w.errors+=ok?0:1;
-            w.oldestAgeMs=Math.max(w.oldestAgeMs??0,Number.isFinite(age)?age:0);w.lastRefreshedAt=clock();}
-        }
-        w.done=w.cursor>=w.total;cp.weekend=w;
-        if(w.done){w.passCompletedAt=clock();w.fullCycleMs=w.passCompletedAt-w.passStartedAt;cp.phase='done';cp.completedAt=clock();cp.lagMs=Math.max(0,cp.completedAt-cp.dueAt);return{status:'done',checkpoint:cp};}
-        return{status:'progress',checkpoint:cp};
-      }
-      return{status:'done',checkpoint:cp};
-    }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
-  }};
-
-  // Retention/metrics are kept separate and always run after priority, MAIN and TAIL.
+  // Small bounded batches alternate with audit work, so neither a busy feedback
+  // queue nor large retention backlog can monopolize the five-minute windows.
   const maintenance={maxUnitMs:45000,async step({job,deadline}){
-    const cp=structuredClone(job.checkpoint??{turn:0,metricsDay:null,checked:{}});cp.checked??={};
-    deadline=Math.min(deadline,clock()+35000);const now=clock();const today=berlinDay(now);
-    try{for(let scan=0;scan<5;scan++){
-      const turn=cp.turn%5;cp.turn++;
-      if(turn<3){
-        if(cp.checked[turn]===today)continue;
-        const table=['app_errors','flight_price_feedback','destination_requests'][turn];
-        const cutoff=turn===2?calendarMonthsAgoIso(new Date(now)):new Date(now-(turn===0?90:365)*DAY).toISOString();
-        const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true});
-        if(rows.length){await query(()=>db.from(table).delete().in('id',rows.map(r=>r.id)),deadline,{retry:true});return{status:'progress',checkpoint:cp};}
-        cp.checked[turn]=today;
-      }else if(turn===3&&cp.metricsDay!==today){await query(()=>db.rpc('collect_storage_metrics'),deadline);cp.metricsDay=today;return{status:'progress',checkpoint:cp};
-      }else if(turn===4&&cp.checked.plans!==today){
-        const bucket=db.storage.from('price-snapshots');
-        const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true});
-        const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
-        const p=state?.jobs?.priority?.checkpoint;if(p?.roulette)protectedNames.add(`roulette-${p.roulette.cycle}-0.json`);if(p?.weekend)protectedNames.add(`windowrefresh-${p.weekend.dayId}-0.json`);
-        const expired=rows.filter(r=>/^(main|tail|fast|roulette|windowrefresh)-\d+-\d+\.json$/.test(r.name)&&!protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
-        if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true});return{status:'progress',checkpoint:cp};}
-        cp.checked.plans=today;
+    const cp=structuredClone(job.checkpoint??{turn:0,metricsDay:null,checked:{}});
+    cp.checked??={};deadline=Math.min(deadline,clock()+35000);
+    try { for(let scan=0;scan<7;scan++) {
+    const turn=cp.turn%7;cp.turn++;
+    const now=clock();const today=new Date(now).toISOString().slice(0,10);let didWork=false;
+    if(turn===0){
+      if(cp.auditRetryAt>now)continue;
+      // NOT retried: claim increments attempts and mints a fresh claim_token per call
+      // (non-idempotent); a retry would burn an attempt or claim a second row.
+      const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline);
+      const row=rows?.[0];
+      if(row){
+        const ticket=ticketFromFeedback(row.feedback,new Date(now).toISOString().slice(0,10));
+        let outcome={status:'not_requested',detail:'missing_exact_context'};
+        if(ticket){
+          const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.depart,return_at:ticket.ret,
+            direct:String(ticket.mode==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
+          try{const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
+            outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
+          }catch(error){if(error instanceof CollectionYield)outcome={status:'pending',detail:'scheduler_pause'};else throw error;}
+        }
+        // NOT retried: finalize consumes the claim_token; a retry after success would
+        // report a spurious 'claim expired' failure (non-idempotent).
+        const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
+          p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline);
+        if(result!==true)throw new Error('Audit claim expired before completion');didWork=true;
+      }else cp.auditRetryAt=now+30000;
+    }else if(turn===1){
+      const desiredCycle=Math.floor(now/1800000);
+      let r=cp.roulette;
+      if(!r||(r.done&&r.cycle!==desiredCycle))r={cycle:desiredCycle,cursor:0,done:false,errors:0};
+      if(r.done)continue;
+      const plan=await store.plan(`coordinator/roulette-${r.cycle}-0.json`,async()=>{
+        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+        if(!latest.length)return{tickets:[]};
+        const tickets=await load('daily_origin_cheapest_pool','origin,dest,flight_type,departure_at,return_at,rank',
+          ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latest[0].snapshot_at),deadline);
+        return{tickets:tickets.filter(t=>t.departure_at>=today&&t.return_at>t.departure_at)};
+      });
+      const ticket=plan.tickets[r.cursor];
+      if(ticket){
+        const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
+          direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
+        const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
+        const result=response.kind==='ok'?classifyResponse(response.json,{origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}):{status:'error'};
+        const source=Array.isArray(response.json?.data)?response.json.data.find(row=>classifyResponse({success:true,data:[row]},
+          {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
+        const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
+          transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
+        await commit('collection_commit_roulette',{p_ticket:{...ticket,month:ticket.departure_at.slice(0,7)},p_result:patch},deadline);
+        r.cursor++;r.errors+=result.status==='error'?1:0;didWork=true;
       }
-    }return{status:'empty',checkpoint:cp};
+      r.done=r.cursor>=plan.tickets.length;cp.roulette=r;
+    }else if(turn<5){
+      if(cp.checked[turn]===today)continue;
+      const table=['','','app_errors','flight_price_feedback','destination_requests'][turn];
+      const cutoff=turn===4?calendarMonthsAgoIso(new Date(now)):new Date(now-(turn===2?90:365)*DAY).toISOString();
+      const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true});
+      if(rows.length){const ids=rows.map(r=>r.id);await query(()=>db.from(table).delete().in('id',ids),deadline,{retry:true});didWork=true;}
+      if(rows.length<100)cp.checked[turn]=today;
+    }else if(turn===5&&cp.metricsDay!==today){
+      // NOT retried: metrics collection may append a snapshot row per call (non-idempotent).
+      await query(()=>db.rpc('collect_storage_metrics'),deadline);cp.metricsDay=today;didWork=true;
+    }else if(turn===6&&cp.checked.plans!==today){
+      const bucket=db.storage.from('price-snapshots');
+      const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true});
+      const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
+      if(cp.roulette)protectedNames.add(`roulette-${cp.roulette.cycle}-0.json`);
+      const expired=rows.filter(r=>/^(main|tail|fast|roulette)-\d+-\d+\.json$/.test(r.name)&&
+        !protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
+      if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true});didWork=true;}
+      if(expired.length<100)cp.checked.plans=today;
+    }
+    if(didWork)return{status:'progress',checkpoint:cp};
+    }
+    return{status:'empty',checkpoint:cp};
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
   }};
-  return{priority,main,fast:windowAdapter('fast'),tail:windowAdapter('tail'),maintenance};
+  return{main,fast:windowAdapter('fast'),tail:windowAdapter('tail'),maintenance};
 }
