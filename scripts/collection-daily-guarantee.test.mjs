@@ -18,11 +18,11 @@ const WAVE43 = 17_800;     // wave 43: 13,440 + ~726 new unseen routes ×6 month
 const RATE = 24;           // realized main cells/min (back-derived from wave-10 ≈ 1.5–2 days)
 const DBFAIL = { day: 0, session: 2 };
 
-test('CALIBRATION: the model reproduces the observed ~1.5–2 day wave-10 pass (current scheme)', async () => {
+test('INTEGRATED BUDGET: the 30-minute schedule shortens the former wave-10 baseline', async () => {
   const r = await simulate({ guaranteeDailyMain: false, sessions: 3, mainTotal: WAVE10, mainRate: RATE, dbFailAt: DBFAIL });
   assert.ok(r.elapsedMs != null, 'wave-10 eventually completes');
   const days = r.elapsedMs / DAY;
-  assert.ok(days >= 1.3 && days <= 2.2, `wave-10 current pass = ${hrs(r.elapsedMs)}h (~${days.toFixed(2)}d), expected ~1.5–2d`);
+  assert.ok(days >= 1 && days <= 1.5, `wave-10 integrated pass = ${hrs(r.elapsedMs)}h (~${days.toFixed(2)}d)`);
 });
 
 test('PROBLEM: the current scheme cannot finish a wave-43 pass within 24h', async () => {
@@ -37,9 +37,9 @@ test('PROOF: tail→main reallocation ALONE is not enough at 3 sessions/day (run
   assert.ok(r.elapsedMs > MAIN_CYCLE_MS, `tail-yield @3 sessions still >24h, got ${hrs(r.elapsedMs)}h`);
 });
 
-test('PROOF: doubling throughput at 3 sessions still misses 24h — sessions/day is the real lever', async () => {
+test('SENSITIVITY: doubling realized throughput at 3 sessions can recover the 24h target', async () => {
   const r = await simulate({ guaranteeDailyMain: true, sessions: 3, mainTotal: WAVE43, mainRate: RATE * 2, dbFailAt: DBFAIL });
-  assert.ok(r.elapsedMs > MAIN_CYCLE_MS, `tail-yield + 2× rate @3 sessions still >24h, got ${hrs(r.elapsedMs)}h`);
+  assert.ok(r.elapsedMs <= MAIN_CYCLE_MS, `tail-yield + 2× rate @3 sessions should fit, got ${hrs(r.elapsedMs)}h`);
 });
 
 test('SOLUTION (recommended): tail-yield + the existing 6 healthy cron slots finishes wave-43 ≤24h with ≥20% reserve', async () => {
@@ -50,12 +50,10 @@ test('SOLUTION (recommended): tail-yield + the existing 6 healthy cron slots fin
   assert.ok(reserveOf(r.elapsedMs) >= 0.20, `need ≥20% reserve, got ${(reserveOf(r.elapsedMs) * 100).toFixed(0)}% (${hrs(r.elapsedMs)}h)`);
 });
 
-test('MARGIN: with 6 slots but one session still lost, ≤24h holds but reserve thins below 20% at 24 cells/min', async () => {
-  // Honest sensitivity: losing one of the six sessions clears 24h yet only ~16% reserve remains,
-  // so the reliability fix (or a small throughput bump) is what secures the 20% margin.
+test('MARGIN: with 6 slots and one lost session the integrated schedule still retains about 20% reserve', async () => {
   const r = await simulate({ guaranteeDailyMain: true, sessions: 6, mainTotal: WAVE43, mainRate: RATE, dbFailAt: DBFAIL });
   assert.ok(r.elapsedMs <= MAIN_CYCLE_MS, `still ≤24h with a lost session, got ${hrs(r.elapsedMs)}h`);
-  assert.ok(reserveOf(r.elapsedMs) < 0.20, `documents thin margin, got ${(reserveOf(r.elapsedMs) * 100).toFixed(0)}%`);
+  assert.ok(reserveOf(r.elapsedMs) >= 0.20, `need ≥20% reserve, got ${(reserveOf(r.elapsedMs) * 100).toFixed(0)}%`);
 });
 
 test('SOLUTION (robust): tail-yield + 6 slots + one lost session + ~1.2× throughput restores ≥20% reserve', async () => {

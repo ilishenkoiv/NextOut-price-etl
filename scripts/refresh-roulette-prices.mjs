@@ -19,10 +19,22 @@ const TIMEOUT_MS = 8000;
 const INTERVAL_MS = 125; // 80% of the documented 600 requests/minute limit.
 const PAGE = 1000;
 export const ROULETTE_REFRESH_WORKFLOW = 'Daily cheapest offers snapshot';
+// The dedicated refresh workflow passes its own name so the priority-0 idle gate excludes
+// itself correctly; the legacy manual workflow keeps the historical default.
+const REFRESH_WORKFLOW_NAME = process.env.REFRESH_WORKFLOW_NAME || ROULETTE_REFRESH_WORKFLOW;
+// Safety bound: the roulette pool is at most 10 ranks × the configured origins (~22 ⇒ 220).
+// Never revalidate more than one full pool per run, whatever a future read returns.
+export const MAX_REFRESH_TICKETS = 220;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function ticketKey(row) {
   return [row.origin, row.dest, row.flight_type, row.departure_at, row.return_at || ''].join('|');
+}
+
+// Hard cap on how many saved tickets one refresh run may touch. It only ever trims — it never
+// adds a ticket — so it cannot change pool membership; it just bounds work per run.
+export function capRefreshTickets(tickets, max = MAX_REFRESH_TICKETS) {
+  return Array.isArray(tickets) ? tickets.slice(0, max) : [];
 }
 
 export function selectExactFare(data, ticket) {
@@ -157,7 +169,7 @@ async function clearCheckpoint(supabase) {
 async function main() {
   if (!TP_TOKEN || !SUPABASE_SERVICE_KEY) throw new Error('Missing TP_TOKEN or SUPABASE_SERVICE_KEY.');
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false }, global:{fetch:retryMetadataFetch} });
-  const tickets = await latestPool(supabase);
+  const tickets = capRefreshTickets(await latestPool(supabase));
   if (!tickets.length) {
     console.log('No roulette pool exists yet — targeted refresh skipped.');
     return;
@@ -165,7 +177,7 @@ async function main() {
 
   const idle = process.env.GITHUB_TOKEN
     ? () => githubIsIdle({ token:process.env.GITHUB_TOKEN, repository:process.env.GITHUB_REPOSITORY,
-      runId:process.env.GITHUB_RUN_ID, ownWorkflowName:ROULETTE_REFRESH_WORKFLOW })
+      runId:process.env.GITHUB_RUN_ID, ownWorkflowName:REFRESH_WORKFLOW_NAME })
     : null;
   // Missing/unknown GitHub state is deliberately treated as busy. Local manual execution has no
   // GITHUB_TOKEN and is explicit owner work, so it may still run without this background gate.

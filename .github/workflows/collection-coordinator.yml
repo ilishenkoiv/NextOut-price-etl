@@ -4,6 +4,11 @@ on:
     - cron: '7 */4 * * *'
   workflow_dispatch:
     inputs:
+      rollout_action:
+        description: 'Owner-authorized rollout control (manual only)'
+        type: choice
+        options: [none, probe, backup]
+        default: none
       validate_only:
         description: 'Read-only schema/bucket validation; no collection'
         type: boolean
@@ -30,13 +35,13 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Verify applied SQL without writing data
-        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
+        if: github.event_name == 'workflow_dispatch' && inputs.rollout_action == 'none' && inputs.validate_only
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/check-collection-ready.mjs
       - name: Resume one sequential collector
-        if: github.event_name != 'workflow_dispatch' || !inputs.validate_only
+        if: github.event_name != 'workflow_dispatch' || (inputs.rollout_action == 'none' && !inputs.validate_only)
         env:
           COLLECTION_MODE: ${{ vars.COLLECTION_MODE }}
           COLLECTION_SESSION_MINUTES: '235'
@@ -48,3 +53,32 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/run-collection.mjs
+  rollout-control:
+    if: github.event_name == 'workflow_dispatch' && inputs.rollout_action != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Production baseline / backup control
+        env:
+          ROLLOUT_ACTION: ${{ inputs.rollout_action }}
+          ROLLOUT_RUN_ID: ${{ github.run_id }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/production-rollout-control.mjs
+      - uses: actions/upload-artifact@v6
+        with:
+          name: etl-rollout-${{ inputs.rollout_action }}-${{ github.run_id }}
+          path: rollout-output/**
+          if-no-files-found: error
+          retention-days: 30

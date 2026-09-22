@@ -3,10 +3,12 @@ import { pathToFileURL } from 'node:url';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { ORIGINS_ALL } from '../src/data/origins.js';
 
 export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
 }
+export function publishedSnapshotOrigins(){return new Set(ORIGINS_ALL);}
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -40,6 +42,30 @@ export function selectDailyCheapest(offers, today) {
     || String(a.flight_type).localeCompare(String(b.flight_type)));
 }
 
+// Single selection-owner, once per observed day. Selection is the ONLY step allowed to
+// define pool membership/order/rank. A cheap existence probe of the current day's pool
+// decides whether selection already ran, so a second same-day trigger (an end-of-session
+// republish, a resumed/late main completion, or a manual rerun) leaves the immutable pool
+// untouched. This uses the existing observed_on column — no new table or migration.
+export function poolExistsForObservedOn(rows, observedOn) {
+  if (!Array.isArray(rows)) return false;
+  return rows.some((row) => (row?.observed_on ?? observedOn) === observedOn);
+}
+
+export function berlinObservedOn(value = Date.now()) {
+  const timestamp = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error('Invalid snapshot timestamp');
+  return new Date(timestamp).toLocaleDateString('en-CA',{timeZone:'Europe/Berlin'});
+}
+
+export function nightlySelectionDue(value = Date.now()) {
+  const timestamp=typeof value==='number'?value:Date.parse(value);
+  if(!Number.isFinite(timestamp))throw new Error('Invalid selection timestamp');
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Berlin',hour:'2-digit',minute:'2-digit',hourCycle:'h23'})
+    .formatToParts(new Date(timestamp)).filter(p=>p.type!=='literal').map(p=>[p.type,p.value]));
+  return Number(parts.hour)*60+Number(parts.minute)>=3*60+30;
+}
+
 export function selectDailyCheapestPool(offers, today, limit = 10) {
   const groups = new Map();
   for (const row of offers) {
@@ -59,13 +85,17 @@ export function selectDailyCheapestPool(offers, today, limit = 10) {
     .sort((a, b) => String(a.origin).localeCompare(String(b.origin)) || a.rank - b.rank);
 }
 
-export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0) } = {}) {
+export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
+  force=process.env.SNAPSHOT_FORCE_REBUILD==='true' } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
+  const instant=requestedSnapshotAt??Date.now();const observedOn = berlinObservedOn(instant);
+  if(!force&&!nightlySelectionDue(instant))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
   const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
-  const observedOn = (requestedSnapshotAt ?? new Date().toISOString()).slice(0, 10);
+
   const freshSince = new Date(Date.now() - MAX_SOURCE_AGE_MS).toISOString();
   const offers = [];
-  const published=publishedSnapshotDestinations(expansionWave);
+  const publishedDestinations=publishedSnapshotDestinations(expansionWave);
+  const origins=publishedSnapshotOrigins();
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase.from('offers')
     .select('origin,market,dest,flight_type,price,departure_at,return_at,transfers,updated_at,price_source')
@@ -74,7 +104,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     if (error) throw error;
     // Collection can warm new airports before their app metadata/weather/photos
     // are ready. Do not let an unknown destination displace the published pool.
-    offers.push(...data.filter(row=>published.has(row.dest)));
+    offers.push(...data.filter(row=>origins.has(row.origin)&&publishedDestinations.has(row.dest)));
     if (data.length < PAGE) break;
   }
 
@@ -115,27 +145,13 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');
 
-const { error: writeError } = await supabase.from('daily_origin_cheapest')
-  .upsert(chosen, { onConflict: 'observed_on,origin,flight_type' });
-  if (writeError) {
-    if (tableMissing(writeError)) {
-      console.log('daily_origin_cheapest table does not exist yet — snapshot skipped safely.');
-      return;
-    }
-    throw writeError;
-  }
-
-  const { error: poolError } = requestedSnapshotAt
-    ? await supabase.from('daily_origin_cheapest_pool').upsert(pool,{onConflict:'snapshot_at,origin,flight_type,rank'})
-    : await supabase.from('daily_origin_cheapest_pool').insert(pool);
-  if (poolError && !tableMissing(poolError)) throw poolError;
-  if (poolError) console.log('daily_origin_cheapest_pool table does not exist yet — rank-1 compatibility snapshot saved.');
-  else {
-    const retentionCutoff = new Date(Date.now() - 31 * 86400_000).toISOString();
-    const { error: cleanupError } = await supabase.from('daily_origin_cheapest_pool').delete().lt('snapshot_at', retentionCutoff);
-    if (cleanupError) console.warn(`Pool retention cleanup skipped: ${cleanupError.message || cleanupError}`);
-  }
+  const {data:didPublish,error:publishError}=await supabase.rpc('publish_daily_cheapest_selection',{
+    p_observed_on:observedOn,p_snapshot_at:snapshotAt,p_rank1:chosen,p_pool:pool,p_force:force});
+  if(publishError)throw publishError;
+  if(didPublish!==true){console.log(`daily_origin_cheapest_pool already selected for ${observedOn}; membership/order/rank left untouched.`);
+    return{rebuilt:false,observedOn,snapshotAt:null,reason:'already_published'};}
   console.log(`Saved ${chosen.length} rank-1 rows and ${pool.length} pool rows for ${observedOn} from ${offers.length} future offers.`);
+  return { rebuilt: true, observedOn, snapshotAt };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
