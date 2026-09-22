@@ -9,9 +9,12 @@ function chain(data){return new Proxy({}, {get:(_,key)=>key==='then'
 test('weekend refresh snapshots one stable daily consumer set and resumes its full cursor without reselection',async()=>{
   const now=Date.parse('2026-09-22T10:00:00Z');
   let source=Array.from({length:96},(_,i)=>({origin:'BER',dest:`D${String(i).padStart(3,'0')}`,flight_type:'any',
-    departure_at:'2026-10-10',return_at:'2026-10-17',nights:7,window_kind:i%2?'weekend':'holiday',updated_at:'2026-09-22T09:00:00Z'}));
+    destination_id:`fixture-${i}`,position:i+1,snapshot_at:'2026-09-22T03:30:00Z',departure_at:'2026-10-10',return_at:'2026-10-17',
+    window_kind:i%2?'weekend':'holiday',exact_observed_at:'2026-09-22T09:00:00Z',refresh_status:'fresh'}));
   const commits=[];const planKeys=[];const cache=new Map();
-  const db={from:table=>chain(table==='window_prices'?source:[]),rpc:(name,args)=>{commits.push({name,args});return Promise.resolve({data:true,error:null});},
+  const db={from:table=>chain(table==='daily_window_candidate_epochs'?[{observed_on:'2026-09-22',snapshot_at:'2026-09-22T03:30:00Z',contract_version:1,
+      candidate_rows:96,exact_request_groups:96}]:table==='daily_window_candidates'?source:[]),
+    rpc:(name,args)=>{commits.push({name,args});return Promise.resolve({data:true,error:null});},
     storage:{from:()=>({})}};
   const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async(key,build)=>{
     planKeys.push(key);if(!cache.has(key))cache.set(key,await build());return cache.get(key);
@@ -25,7 +28,7 @@ test('weekend refresh snapshots one stable daily consumer set and resumes its fu
   const r1=await adapters.priority.step({job,deadline:now+200000});
   const r2=await adapters.priority.step({job:{...job,checkpoint:r1.checkpoint},deadline:now+200000});
   assert.equal(r2.status,'progress');assert.equal(r2.checkpoint.weekend.cursor,2);assert.equal(r2.checkpoint.weekend.total,96);
-  assert.equal(requested.length,2);assert.equal(commits.filter(c=>c.name==='collection_commit_window').length,2);
+  assert.equal(requested.length,2);assert.equal(commits.filter(c=>c.name==='collection_commit_window_candidate').length,2);
   assert.equal(new Set(planKeys).size,1,'one durable daily plan key; refresh does not re-select');
 
   source=[{...source[0],dest:'CHANGED'}];
@@ -63,18 +66,18 @@ test('roulette replacement seeds preserve mode and exclude every city already in
   assert.equal(Object.values(result).flat().some(row=>row.dest==='BCN'),false);
 });
 
-test('empty and expired selected sets finish without provider calls',async()=>{
+test('missing daily epoch fails closed without treating cache rows as selected',async()=>{
   const now=Date.parse('2026-09-23T10:00:00Z');let requests=0;
   const db={from:()=>chain([]),rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
-  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async()=>({day:'2026-09-23',setId:'window-consumer:empty',selectedAt:new Date(now).toISOString(),tickets:[],groups:[]})};
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async()=>{throw new Error('must not build a plan without epoch');}};
   const adapters=createAdapters({db,store,provider:{request:async()=>{requests++;}},clock:()=>now});
   const result=await adapters.priority.step({job:{id:2,planDate:'2026-09-23',checkpoint:{cycle:2,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000});
-  assert.equal(result.status,'done');assert.equal(result.checkpoint.weekend.total,0);assert.equal(requests,0);
+  assert.equal(result.status,'done');assert.equal(result.checkpoint.weekend.blockedReason,'no_daily_window_candidate_epoch');assert.equal(requests,0);
 });
 
 test('priority writes are fenced: lease loss prevents weekend fare commit',async()=>{
   const now=Date.parse('2026-09-22T10:00:00Z');
-  const db={from:()=>chain([{origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',nights:7,window_kind:'weekend'}]),
+  const db={from:()=>chain([{observed_on:'2026-09-22',snapshot_at:'2026-09-22T03:30:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]),
     rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
   const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>false,runId:'r',plan:async(_key,build)=>build()};
   const adapters=createAdapters({db,store,provider:{request:async()=>{throw new Error('must not request');}},clock:()=>now});

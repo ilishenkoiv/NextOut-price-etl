@@ -61,6 +61,8 @@ test('selection owner rebuilds the pool when today has no snapshot yet', async (
   assert.deepEqual(result, { rebuilt: true, observedOn: '2027-01-05', snapshotAt: '2027-01-05T12:00:00.000Z' });
   assert.equal(db.writes.length,1);assert.equal(db.writes[0].name,'publish_daily_cheapest_selection');
   assert.equal(db.writes[0].args.p_pool.length,1);assert.equal(db.writes[0].args.p_rank1.length,1);
+  assert.equal(db.writes[0].args.p_pool[0].destination_id,'barcelona');
+  assert.equal(db.writes[0].args.p_rank1[0].destination_id,'barcelona');
 });
 
 test('selection owner runs at most once per day: a second same-day trigger writes nothing', async () => {

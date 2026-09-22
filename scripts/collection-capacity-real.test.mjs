@@ -10,13 +10,15 @@ function chain(data,advance){return new Proxy({}, {get:(_,key)=>{if(key==='then'
 
 function harness({latencyMs,roulette=220,windows=1205}){
   let now=7*60000;const dbMs=20;const advanceDb=()=>{now+=dbMs;};const cache=new Map();
-  const db={from:()=>chain([],advanceDb),rpc:(name)=>{advanceDb();return Promise.resolve({data:name==='claim_flight_price_audit'?[]:true,error:null});},
+  const db={from:table=>chain(table==='daily_window_candidate_epochs'?[{observed_on:'1970-01-01',snapshot_at:'1970-01-01T03:30:00Z',contract_version:1,
+      candidate_rows:windows,exact_request_groups:windows}]:[],advanceDb),rpc:(name)=>{advanceDb();return Promise.resolve({data:name==='claim_flight_price_audit'?[]:true,error:null});},
     storage:{from:()=>({upload:async()=>{advanceDb();return{data:{},error:null};},list:async()=>({data:[],error:null}),remove:async()=>({data:{},error:null})})}};
   const store={owner:'o',token:1,runId:'r',args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,
     save:async()=>{advanceDb();},plan:async(key,build)=>{
       if(cache.has(key))return cache.get(key);let value;
       if(key.includes('/roulette-'))value={tickets:Array.from({length:roulette},(_,i)=>ticket(i))};
-      else if(key.includes('/windowrefresh-')){const tickets=Array.from({length:windows},(_,i)=>ticket(i+500));value={day:'1970-01-01',setId:'window-consumer:test',selectedAt:new Date(now).toISOString(),tickets,groups:tickets.map(t=>[t])};}
+      else if(key.includes('/windowrefresh-')){const tickets=Array.from({length:windows},(_,i)=>({...ticket(i+500),snapshot_at:'1970-01-01T03:30:00Z',
+        destination_id:`fixture-${i}`,position:i+1}));value={day:'1970-01-01',setId:'daily-window:test',selectedAt:new Date(now).toISOString(),tickets,groups:tickets.map(t=>[t])};}
       else if(key.includes('/main-'))value={months:['2027-01'],routes:Array.from({length:50},(_,i)=>({origin:'FRA',dest:`M${i}`,stops:0,key:`FRA|M${i}`})),breakKeys:[]};
       else if(key.includes('/fast-'))value={tickets:[]};else if(key.includes('/tail-'))value={routes:[],windows:[]};else value=await build();
       cache.set(key,value);return value;

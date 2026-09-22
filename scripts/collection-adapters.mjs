@@ -197,7 +197,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         departure_at:ticket.departure_at,return_at:ticket.return_at,window_kind:ticket.window_kind,
         outcome:outcome.status==='no_result'?'empty':'http_error',detail:outcome.detail,checked_at:now };
     }
-    await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
+    if(ticket.snapshot_at&&ticket.position&&ticket.destination_id){const candidateResult=fare?{status:'found',price:fare.price,
+      transfers:fare.transfers,airline:fare.airline,updated_at:fare.updated_at,checked_at:fare.updated_at,price_source:fare.price_source}
+      :{status:outcome.status,detail:outcome.detail};
+      await commit('collection_commit_window_candidate',{p_ticket:ticket,p_result:candidateResult},deadline);
+    }else await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
     if(fare){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
       p_observed_at:now}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
     return outcome.status!=='error';
@@ -384,12 +388,18 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.phase==='weekend'){
         let w=cp.weekend;
         if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,passStartedAt:clock()};}
-        const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-0.json`,async()=>{
-          const tickets=await load('window_prices','origin,dest,flight_type,departure_at,return_at,nights,window_kind,updated_at',WINDOW_ORDER,
-            q=>q.gte('departure_at',w.day),deadline);
-          const eligible=selectWindowConsumerSet(tickets,w.day);
-          return{day:w.day,setId:windowConsumerSetId(eligible,w.day),selectedAt:new Date(clock()).toISOString(),tickets:eligible,
-            groups:groupWindowConsumerTickets(eligible)};
+        const epochs=await load('daily_window_candidate_epochs','observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups',
+          ['snapshot_at'],q=>q,deadline);
+        if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
+          return{status:'done',checkpoint:cp};}
+        const epoch=epochs.at(-1),epochId=String(epoch.snapshot_at).replace(/[^0-9A-Za-z]/g,'');
+        const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
+          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
+            ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
+          const selected=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
+            updated_at:t.exact_observed_at}));
+          return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selected,
+            groups:groupWindowConsumerTickets(selected)};
         });
         w.setId=plan.setId;w.total=plan.groups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
         const group=plan.groups[w.cursor];
