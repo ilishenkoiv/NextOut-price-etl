@@ -83,3 +83,24 @@ test('priority writes are fenced: lease loss prevents weekend fare commit',async
   const adapters=createAdapters({db,store,provider:{request:async()=>{throw new Error('must not request');}},clock:()=>now});
   await assert.rejects(()=>adapters.priority.step({job:{id:1,planDate:'2026-09-22',checkpoint:{cycle:1,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000}),/lease lost/);
 });
+
+test('roulette and persisted window refresh alternate so neither saved set can starve',async()=>{
+  const now=Date.parse('2026-09-22T10:00:00Z'),snapshot='2026-09-22T03:30:00Z',calls=[];
+  const roulette={origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',rank:1,snapshot_at:snapshot};
+  const window={observed_on:'2026-09-22',snapshot_at:snapshot,origin:'BER',market:'de',dest:'FCO',destination_id:'rome',flight_type:'any',
+    departure_at:'2026-10-10',return_at:'2026-10-17',position:1,window_kind:'weekend',exact_observed_at:'2026-09-22T09:00:00Z',refresh_status:'fresh'};
+  const db={from:table=>chain(table==='daily_origin_cheapest_pool'?[{snapshot_at:snapshot}]:table==='daily_window_candidate_epochs'?
+      [{observed_on:'2026-09-22',snapshot_at:snapshot,contract_version:1,candidate_rows:1,exact_request_groups:1}]:[]),
+    rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},storage:{from:()=>({})}};
+  const plans=new Map(),store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async(key,build)=>{
+    if(plans.has(key))return plans.get(key);const value=key.includes('/roulette-')?{tickets:[roulette],allowedDests:['BCN'],replacements:{},snapshotAt:snapshot}:
+      key.includes('/windowrefresh-')?{tickets:[window],groups:[[window]],setId:'daily-window:test',selectedAt:snapshot}:await build();plans.set(key,value);return value;}};
+  const provider={request:async url=>{const u=new URL(url);return{kind:'ok',json:{success:true,data:[{origin:'BER',destination:u.searchParams.get('destination'),
+    departure_at:'2026-10-10T06:00:00Z',return_at:'2026-10-17T20:00:00Z',price:100,transfers:1}]}};}};
+  const adapters=createAdapters({db,store,provider,clock:()=>now});const base={cycle:1,dueAt:now,phase:'roulette',auditDone:true,
+    roulette:{cycle:1,cursor:0,done:false,errors:0,snapshotAt:snapshot}};
+  const a=await adapters.priority.step({job:{id:1,planDate:'2026-09-22',checkpoint:base},deadline:now+200000});
+  assert.equal(a.checkpoint.phase,'weekend');
+  const b=await adapters.priority.step({job:{id:1,planDate:'2026-09-22',checkpoint:a.checkpoint},deadline:now+200000});
+  assert.equal(b.checkpoint.weekend.cursor,1);assert.ok(calls.some(c=>c.name==='collection_commit_window_candidate'));
+});

@@ -91,6 +91,7 @@ test('6. roulette cursor persists across maintenance windows', async () => {
   const cp0 = onlyFeedbackAndRoulette();
   const r1 = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp0 }, deadline: DEADLINE });
   assert.equal(r1.checkpoint.roulette.cursor, 1);
+  r1.checkpoint.phase='roulette'; // a persisted-window turn sits between roulette units in production
   const r2 = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: r1.checkpoint }, deadline: DEADLINE });
   assert.equal(r2.checkpoint.roulette.cursor, 2, 'resumes from the persisted cursor, not from 0');
   assert.equal(r2.checkpoint.roulette.done, true, 'both tickets checked exactly once');

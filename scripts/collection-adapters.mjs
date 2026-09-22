@@ -365,7 +365,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
             }
           }
-          r.total=plan.tickets.length;r.done=r.cursor>=r.total;if(r.done)cp.phase='weekend';
+          r.total=plan.tickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
           return{status:'progress',checkpoint:cp};
         }
         const ticket=plan.tickets[r.cursor];
@@ -386,7 +386,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           if(result.status==='found')r.cursor++;
         }
         r.total=plan.tickets.length;r.done=r.cursor>=r.total;
-        if(r.done)cp.phase='weekend';
+        cp.phase='weekend';
         return{status:'progress',checkpoint:cp};
       }
       if(cp.phase==='weekend'){
@@ -397,6 +397,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
         const epoch=epochs.at(-1),epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
+        if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at};
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
           const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
             ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
@@ -415,7 +416,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         }
         w.done=w.cursor>=w.total;cp.weekend=w;
         if(w.done){w.passCompletedAt=clock();w.fullCycleMs=w.passCompletedAt-w.passStartedAt;cp.phase='done';cp.completedAt=clock();cp.lagMs=Math.max(0,cp.completedAt-cp.dueAt);return{status:'done',checkpoint:cp};}
-        return{status:'progress',checkpoint:cp};
+        cp.phase=cp.roulette?.done?'weekend':'roulette';return{status:'progress',checkpoint:cp};
       }
       return{status:'done',checkpoint:cp};
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
