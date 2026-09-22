@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { gzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'node:zlib';
 
 const action=process.env.ROLLOUT_ACTION;
 const url=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
@@ -42,6 +42,19 @@ probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recent
   routeHealthRows:health.length,routeHealthDead:health.filter(r=>r.status==='dead').length,routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
   poolRows:pool.length,poolSnapshots:Object.keys(poolGroups).length,latestPoolSnapshot:Object.keys(poolGroups).sort().at(-1)??null,
   latestPoolRows:Object.keys(poolGroups).length?poolGroups[Object.keys(poolGroups).sort().at(-1)]:0,schedulerRow:schedulerRows[0]??null};
+if(process.env.BACKUP_PREFIX){
+  const object=`${process.env.BACKUP_PREFIX}/daily_origin_cheapest_pool.json.gz`;
+  const response=await fetch(`${url}/storage/v1/object/authenticated/price-snapshots/${object}`,{headers,signal:AbortSignal.timeout(120000)});
+  if(!response.ok)throw new Error(`backup pool download failed (${response.status})`);
+  const backup=JSON.parse(gunzipSync(Buffer.from(await response.arrayBuffer())).toString('utf8')).rows;
+  const pk=row=>[row.snapshot_at,row.origin,row.flight_type,row.rank].join('|');const currentKeys=new Set(pool.map(pk)),backupKeys=new Set(backup.map(pk));
+  const missing=backup.filter(row=>!currentKeys.has(pk(row)));const added=pool.filter(row=>!backupKeys.has(pk(row)));
+  const latestBackupSnapshot=backup.map(r=>r.snapshot_at).sort().at(-1)??null;const missingLatest=missing.filter(r=>r.snapshot_at===latestBackupSnapshot);
+  const offers=await loadRows('offers','origin,dest,flight_type,departure_at,return_at','origin.asc,dest.asc,month.asc,flight_type.asc,departure_at.asc,return_at.asc');
+  const offerKeys=new Set(offers.map(r=>[r.origin,r.dest,r.flight_type,r.departure_at,r.return_at].join('|')));
+  probe.liveMetrics.poolBackupComparison={backupRows:backup.length,missingRows:missing.length,addedRows:added.length,
+    latestBackupSnapshot,missingLatestRows:missingLatest.length,missingLatestWithoutOffer:missingLatest.filter(r=>!offerKeys.has([r.origin,r.dest,r.flight_type,r.departure_at,r.return_at].join('|'))).length};
+}
 await writeFile(`${outputDir}/probe.json`,JSON.stringify(probe,null,2));
 console.log(JSON.stringify({event:'production_probe',counts,schedulerOwner:scheduler?.owner??null,
   schedulerLeaseUntil:scheduler?.lease_until??null,privateSnapshotBucket:probe.privateSnapshotBucket,

@@ -77,6 +77,7 @@ jobs:
         env:
           ROLLOUT_ACTION: ${{ inputs.rollout_action }}
           ROLLOUT_RUN_ID: ${{ github.run_id }}
+          BACKUP_PREFIX: rollout-backups/2026-09-22T10-07-21-570Z-35714198385
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/production-rollout-control.mjs
