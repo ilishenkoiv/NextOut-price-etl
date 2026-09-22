@@ -107,19 +107,17 @@ function expansionCellOrder({ date, wave, prices, months, routes, maxDests }) {
   return { order, tranche };
 }
 
-export function mainPlan({ date, wave, prices, watches, trancheDests = EXPANSION_TRANCHE_MAX_DESTS }) {
+export function mainPlan({ date, wave, prices, watches, routeHealth = [], trancheDests = EXPANSION_TRANCHE_MAX_DESTS }) {
   const months = horizon(date); const set = new Set(months);
-  const seen = new Set(); const alive = new Set();
-  for (const row of prices) if (set.has(row.month)) {
-    const key = `${row.origin}|${row.dest}`; seen.add(key);
-    if (Number(row.direct) > 0 || Number(row.any_stops) > 0) alive.add(key);
-  }
+  // Only the durable 30-day registry may suppress a route. Missing price rows, an incomplete
+  // history, network/429 failures and a single empty month are never dead evidence.
+  const deadKeys = new Set(routeHealth.filter(row => row.status === 'dead').map(row => `${row.origin}|${row.dest}`));
   const priority = new Set(watchKeys(watches,wave));
   const live = []; const dead = [];
   for (const origin of ORIGINS_ALL) for (const d of catalogue(wave)) {
     if (origin === d.iata) continue;
     const route = { origin, dest: d.iata, stops: d.stops, key: `${origin}|${d.iata}` };
-    (seen.has(route.key) && !alive.has(route.key) ? dead : live).push(route);
+    (deadKeys.has(route.key) ? dead : live).push(route);
   }
   dead.sort((a,b) => a.key.localeCompare(b.key));
   const day = Math.floor(Date.parse(date) / 86400000);

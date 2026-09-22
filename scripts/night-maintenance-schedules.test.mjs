@@ -47,11 +47,11 @@ test('the 90-minute monthly refresh must start before 01:00', () => {
   assert.match(workflow, /minute_of_day < 60 && busy == 0/);
 });
 
-test('roulette price refresh stays every 30 minutes in Berlin and yields to every other workflow', () => {
+test('published legacy roulette schedule remains unchanged and is excluded by coordinated mode', () => {
   const workflow = fs.readFileSync(new URL('snapshot-daily-origin-cheapest.yml', workflowDir), 'utf8');
   assert.match(workflow, /cron: '7,37 \* \* \* \*'/);
-  assert.match(workflow, /timezone: 'Europe\/Berlin'/);
-  assert.match(workflow, /githubIsIdle/);
+  assert.match(workflow, /^\s*schedule:/m);
+  assert.match(workflow, /vars.COLLECTION_MODE != 'coordinated'/);
 });
 
 test('quarterly storage retention runs at the start of the protected night gap', () => {

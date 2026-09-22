@@ -1,0 +1,56 @@
+name: Refresh cheapest carousel prices
+
+# Manual rollback/fallback owner only. In coordinated mode the SINGLE price-refresh owner is
+# the priority adapter inside Sequential data collection; keeping a second scheduled workflow
+# would reintroduce the 235-minute lock and idle-gate conflict. This fallback revalidates tickets
+# already in the latest roulette pool: one Travelpayouts request per saved ticket, updating the
+# matching offer's price/timestamp/provenance in place, or deleting that offer when the fare is
+# confirmed gone (the existing retention rule). It NEVER selects: it does not rebuild pool
+# membership/order/rank, never runs snapshot-daily-origin-cheapest.mjs, MAIN/TAIL/FAST, weekend
+# selection or the feedback audit. Its mode guard makes it mutually exclusive with coordinator.
+on:
+  workflow_dispatch:
+
+# Shared lock with the coordinator, nightly selection and every other data job. queue:max +
+# cancel-in-progress:false serialize them, so a refresh can never run in parallel with the
+# collector, the nightly selection, or another refresh. A queued refresh waits for the current
+# holder of the lock.
+concurrency:
+  group: nextout-data-collection
+  queue: max
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  refresh:
+    if: vars.COLLECTION_MODE != 'coordinated' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - id: idle-gate
+        name: Run only when the rest of the ETL is idle (priority 0)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e "import {githubIsIdle} from './scripts/check-flight-price-feedback.mjs'; import fs from 'node:fs'; const idle=await githubIsIdle({token:process.env.GITHUB_TOKEN,repository:process.env.GITHUB_REPOSITORY,runId:process.env.GITHUB_RUN_ID,ownWorkflowName:'Refresh cheapest carousel prices'}); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'idle='+idle+'\\n');"
+      - name: Install dependencies
+        if: steps.idle-gate.outputs.idle == 'true'
+        run: npm ci
+      - name: Revalidate current roulette tickets without rebuilding the pool
+        if: steps.idle-gate.outputs.idle == 'true'
+        env:
+          # The script's own priority-0 gate must recognise THIS workflow as itself.
+          REFRESH_WORKFLOW_NAME: 'Refresh cheapest carousel prices'
+          GITHUB_TOKEN: ${{ github.token }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/refresh-roulette-prices.mjs

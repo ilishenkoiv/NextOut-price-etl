@@ -1,0 +1,64 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createAdapters, selectWindowConsumerSet, windowConsumerSetId } from './collection-adapters.mjs';
+
+function chain(data){return new Proxy({}, {get:(_,key)=>key==='then'
+  ? Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null}))
+  : ()=>chain(data)});}
+
+test('weekend refresh snapshots one stable daily consumer set and resumes its full cursor without reselection',async()=>{
+  const now=Date.parse('2026-09-22T10:00:00Z');
+  let source=Array.from({length:96},(_,i)=>({origin:'BER',dest:`D${String(i).padStart(3,'0')}`,flight_type:'any',
+    departure_at:'2026-10-10',return_at:'2026-10-17',nights:7,window_kind:i%2?'weekend':'holiday',updated_at:'2026-09-22T09:00:00Z'}));
+  const commits=[];const planKeys=[];const cache=new Map();
+  const db={from:table=>chain(table==='window_prices'?source:[]),rpc:(name,args)=>{commits.push({name,args});return Promise.resolve({data:true,error:null});},
+    storage:{from:()=>({})}};
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async(key,build)=>{
+    planKeys.push(key);if(!cache.has(key))cache.set(key,await build());return cache.get(key);
+  }};
+  const requested=[];const provider={request:async url=>{requested.push(url);const u=new URL(url);return{kind:'ok',json:{success:true,data:[{
+    origin:u.searchParams.get('origin'),destination:u.searchParams.get('destination'),departure_at:'2026-10-10T06:00:00Z',
+    return_at:'2026-10-17T20:00:00Z',price:111,transfers:1}]}};}};
+  const adapters=createAdapters({db,store,provider,clock:()=>now,wave:0});
+  const job={id:1,planDate:'2026-09-22',startedAt:now,checkpoint:{cycle:1,dueAt:now,phase:'weekend',auditDone:true,
+    roulette:{cycle:1,cursor:0,done:true,errors:0}}};
+  const r1=await adapters.priority.step({job,deadline:now+200000});
+  const r2=await adapters.priority.step({job:{...job,checkpoint:r1.checkpoint},deadline:now+200000});
+  assert.equal(r2.status,'progress');assert.equal(r2.checkpoint.weekend.cursor,2);assert.equal(r2.checkpoint.weekend.total,96);
+  assert.equal(requested.length,2);assert.equal(commits.filter(c=>c.name==='collection_commit_window').length,2);
+  assert.equal(new Set(planKeys).size,1,'one durable daily plan key; refresh does not re-select');
+
+  source=[{...source[0],dest:'CHANGED'}];
+  const next={...r2.checkpoint,cycle:2,phase:'weekend'};
+  const r3=await adapters.priority.step({job:{...job,id:2,checkpoint:next},deadline:now+200000});
+  assert.equal(r3.checkpoint.weekend.cursor,3);
+  assert.match(requested[2],/destination=D002/,'resume uses the saved set/order, not changed live membership');
+  assert.equal(r3.checkpoint.weekend.setId,r2.checkpoint.weekend.setId,'daily set identity remains frozen');
+});
+
+test('consumer set has no top-N or /48 shortcut and preserves >1000 exact variant/date rows',()=>{
+  const rows=Array.from({length:1205},(_,i)=>({origin:'BER',dest:`D${i}`,flight_type:i%2?'direct':'any',
+    departure_at:'2026-10-10',return_at:'2026-10-17',window_kind:'weekend'}));
+  const selected=selectWindowConsumerSet(rows,'2026-09-22');
+  assert.equal(selected.length,1205);assert.match(windowConsumerSetId(selected,'2026-09-22'),/^window-consumer:2026-09-22:[a-f0-9]{20}$/);
+  assert.equal(selectWindowConsumerSet([{...rows[0],departure_at:'2026-09-25'},{...rows[1],departure_at:'2027-02-01'},
+    {...rows[2],window_kind:'weekend_around'}],'2026-09-22').length,0,'matches app lead/horizon/kind eligibility');
+});
+
+test('empty and expired selected sets finish without provider calls',async()=>{
+  const now=Date.parse('2026-09-23T10:00:00Z');let requests=0;
+  const db={from:()=>chain([]),rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async()=>({day:'2026-09-23',setId:'window-consumer:empty',selectedAt:new Date(now).toISOString(),tickets:[]})};
+  const adapters=createAdapters({db,store,provider:{request:async()=>{requests++;}},clock:()=>now});
+  const result=await adapters.priority.step({job:{id:2,planDate:'2026-09-23',checkpoint:{cycle:2,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000});
+  assert.equal(result.status,'done');assert.equal(result.checkpoint.weekend.total,0);assert.equal(requests,0);
+});
+
+test('priority writes are fenced: lease loss prevents weekend fare commit',async()=>{
+  const now=Date.parse('2026-09-22T10:00:00Z');
+  const db={from:()=>chain([{origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',nights:7,window_kind:'weekend'}]),
+    rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>false,runId:'r',plan:async(_key,build)=>build()};
+  const adapters=createAdapters({db,store,provider:{request:async()=>{throw new Error('must not request');}},clock:()=>now});
+  await assert.rejects(()=>adapters.priority.step({job:{id:1,planDate:'2026-09-22',checkpoint:{cycle:1,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000}),/lease lost/);
+});
