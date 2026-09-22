@@ -317,3 +317,9 @@ test('standalone legacy refresh remains price-only and never rebuilds the pool',
   assert.match(source, /from\('offers'\)\.update/, 'legacy refresh updates offers in place');
   assert.match(source, /roulette_price_refresh_checkpoint/, 'legacy refresh keeps its own checkpoint/lease');
 });
+
+test('manual nightly selection can publish the guarded rollout epoch while global mode stays paused',()=>{
+  const workflow=readFileSync(new URL('../.github/workflows/nightly-cheapest-selection.yml',import.meta.url),'utf8');
+  assert.match(workflow,/vars\.COLLECTION_MODE == 'coordinated' \|\| github\.event_name == 'workflow_dispatch'/);
+  assert.match(workflow,/snapshot-daily-window-candidates\.mjs/);
+});
