@@ -84,7 +84,8 @@ test('5+10. maintenance turn 1 rechecks exact roulette tickets and never republi
 
 // ── 6. Roulette keeps its cursor between maintenance windows ────────────────────────────────────
 test('6. roulette cursor persists across maintenance windows', async () => {
-  const script = { from: { [POOL]: [{ data: [{ snapshot_at: 'S1' }], error: null }, { data: [TICKET, { ...TICKET, dest: 'BCN' }], error: null }] },
+  const latest={ data: [{ snapshot_at: 'S1' }], error: null };
+  const script = { from: { [POOL]: [latest, { data: [TICKET, { ...TICKET, dest: 'BCN' }], error: null },latest] },
     rpc: { collection_commit_roulette: [{ data: true, error: null }], collection_revive_route: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters } = maintenanceAdapters({ script });
   const cp0 = onlyFeedbackAndRoulette();

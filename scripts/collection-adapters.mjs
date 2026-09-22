@@ -316,11 +316,15 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       }
       if(cp.phase==='roulette'){
         const r=cp.roulette;
-        const plan=await store.plan(`coordinator/roulette-${r.cycle}-0.json`,async()=>{
-          const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
-          if(!latest.length)return{tickets:[]};
+        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+        const latestSnapshot=latest[0]?.snapshot_at??null;
+        if(r.snapshotAt!==latestSnapshot){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;
+          delete r.pendingReplacement;delete r.technicalDeferred;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
+        const snapshotId=String(latestSnapshot??'empty').replace(/[^0-9A-Za-z]/g,'');
+        const plan=await store.plan(`coordinator/roulette-${r.cycle}-${snapshotId}.json`,async()=>{
+          if(!latestSnapshot)return{tickets:[],snapshotAt:null,allowedDests:[],replacements:{}};
           const tickets=await load('daily_origin_cheapest_pool','observed_on,snapshot_at,origin,dest,flight_type,departure_at,return_at,rank,price,transfers,market,source_updated_at,price_source',
-            ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latest[0].snapshot_at),deadline);
+            ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latestSnapshot),deadline);
           if(tickets.length>220)throw new Error(`Roulette pool exceeds 22 origins × 10 tickets (${tickets.length}>220)`);
           const eligible=tickets.filter(t=>t.departure_at>=today&&t.return_at>t.departure_at);
           const allowedDests=catalogue(Number(process.env.SNAPSHOT_EXPANSION_WAVE??0)).map(item=>item.iata);
@@ -328,7 +332,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const offers=origins.length?await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
             ['origin','dest','month','flight_type','departure_at','return_at'],q=>q.in('origin',origins).in('dest',allowedDests)
               .gte('departure_at',today).gte('updated_at',new Date(clock()-36*60*60*1000).toISOString()).gt('price',0),deadline):[];
-          return{tickets:eligible,allowedDests,replacements:buildRouletteReplacementCandidates(offers,eligible,allowedDests,today)};
+          return{tickets:eligible,snapshotAt:latestSnapshot,allowedDests,replacements:buildRouletteReplacementCandidates(offers,eligible,allowedDests,today)};
         });
         const ticketPayload=ticket=>({...ticket,month:ticket.departure_at.slice(0,7),allowed_dests:plan.allowedDests,run_id:store.runId});
         const deferTechnical=(ticket,stage)=>{const key=[ticket.origin,ticket.dest,ticket.flight_type,ticket.departure_at,ticket.return_at].join('|');

@@ -128,14 +128,14 @@ test('atomic publication failure leaves no completion write and a later catch-up
 
 // Recording double for the maintenance adapter: rpc() and a chainable from() that flags
 // any pool-table write. store.plan short-circuits to the supplied tickets.
-function maintenanceHarness(tickets, response, { lease = async () => true, replacements = {}, allowedDests = ['BCN','ATH','FCO'] } = {}) {
+function maintenanceHarness(tickets, response, { lease = async () => true, replacements = {}, allowedDests = ['BCN','ATH','FCO'], latestSnapshot='2027-01-05T03:30:00Z' } = {}) {
   const calls = [];
   const poolWrites = [];
   const db = {
     rpc: (name, args) => { calls.push({ name, args }); return settle({ data: true, error: null }); },
     from(table) {
       const chain = new Proxy({}, { get: (_, key) => {
-        if (key === 'then') { const p = Promise.resolve({ data: [], error: null }); return p.then.bind(p); }
+        if (key === 'then') { const p = Promise.resolve({ data: table==='daily_origin_cheapest_pool'?[{snapshot_at:latestSnapshot}]:[], error: null }); return p.then.bind(p); }
         if (['insert', 'upsert', 'update', 'delete'].includes(key) && table === 'daily_origin_cheapest_pool') {
           return (...a) => { poolWrites.push({ key, a }); return chain; };
         }
@@ -145,16 +145,16 @@ function maintenanceHarness(tickets, response, { lease = async () => true, repla
     },
     storage: { from: () => ({ list: async () => ({ data: [], error: null }), remove: async () => ({ data: {}, error: null }) }) },
   };
-  const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, plan: async () => ({ tickets,replacements,allowedDests }), runId: '1' };
+  const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, plan: async () => ({ tickets,replacements,allowedDests,snapshotAt:latestSnapshot }), runId: '1' };
   let requests = 0;
   const provider = { request: async url => { requests += 1; return response(requests,url); } };
   const adapters = createAdapters({ db, store, provider, clock: () => 1_700_000_000_000, wave: 0 });
   return { adapters, calls, poolWrites, get requests() { return requests; } };
 }
 
-const rouletteTicket = (dest, rank) => ({ origin: 'BER', dest, flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17', rank });
+const rouletteTicket = (dest, rank) => ({ origin: 'BER', dest, flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17', rank, snapshot_at:'2027-01-05T03:30:00Z' });
 const foundResponse = (_n,url) => {const destination=new URL(url).searchParams.get('destination');return { kind: 'ok', json: { success: true, data: [{ origin: 'BER', destination, departure_at: '2027-01-10T06:00:00Z', return_at: '2027-01-17T20:00:00Z', price: 111, transfers: 1, currency: 'EUR' }] } };};
-const priorityCp = (cursor=0) => ({cycle:1,dueAt:0,phase:'roulette',auditDone:true,roulette:{cycle:1,cursor,done:false,errors:0}});
+const priorityCp = (cursor=0) => ({cycle:1,dueAt:0,phase:'roulette',auditDone:true,roulette:{cycle:1,cursor,done:false,errors:0,snapshotAt:'2027-01-05T03:30:00Z'}});
 
 test('refresh owner updates only fare/timestamp/provenance and never writes the pool', async () => {
   const h = maintenanceHarness([rouletteTicket('BCN', 1)], foundResponse);
@@ -236,6 +236,15 @@ test('refresh owner resumes from its saved cursor', async () => {
   });
   assert.equal(h.calls[0].args.p_ticket.dest, 'ATH', 'resumed at the second ticket, not the first');
   assert.equal(result.checkpoint.roulette.cursor, 2);
+});
+
+test('a new daily snapshot invalidates only the stale roulette cursor and pending target',async()=>{
+  const latest='2027-01-06T03:30:00Z';const tickets=[rouletteTicket('BCN',1),rouletteTicket('ATH',2)].map(t=>({...t,snapshot_at:latest}));
+  const h=maintenanceHarness(tickets,foundResponse,{latestSnapshot:latest});const checkpoint=priorityCp(1);
+  checkpoint.roulette.pendingReplacement={ticket:rouletteTicket('OLD',1),candidateCursor:0};
+  const result=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-06',checkpoint},deadline:1_700_000_200_000});
+  assert.equal(h.calls[0].args.p_ticket.dest,'BCN');assert.equal(result.checkpoint.roulette.snapshotAt,latest);
+  assert.equal(result.checkpoint.roulette.cursor,1);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);
 });
 
 test('refresh owner aborts its write when the single collection lease is lost (no parallel refresh)', async () => {
