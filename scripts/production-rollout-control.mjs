@@ -4,7 +4,7 @@ import { gzipSync, gunzipSync } from 'node:zlib';
 const action=process.env.ROLLOUT_ACTION;
 const url=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
 const key=process.env.SUPABASE_SERVICE_KEY;
-if(!['probe','backup'].includes(action)||!url||!key)throw new Error('Invalid rollout control configuration');
+if(!['probe','backup','restore'].includes(action)||!url||!key)throw new Error('Invalid rollout control configuration');
 const headers={apikey:key,Authorization:`Bearer ${key}`,Accept:'application/json'};
 const outputDir='rollout-output';await mkdir(outputDir,{recursive:true});
 async function jsonFetch(path,init={}){const response=await fetch(url+path,{...init,headers:{...headers,...init.headers},signal:AbortSignal.timeout(30000)});
@@ -82,4 +82,23 @@ if(action==='backup'){
   await writeFile(`${outputDir}/backup-manifest.json`,JSON.stringify(manifest,null,2));
   await writeFile(`${outputDir}/restore-procedure.txt`,`Restore requires coordinator stopped and migration-compatible code. Read manifest, load each private gzip object, and upsert by the table primary key; never truncate. Restore scheduler singleton last only after confirming no live lease. Code/config rollback target is recorded separately. Prefix: ${prefix}\n`);
   console.log(JSON.stringify({event:'production_backup_complete',prefix,tables:Object.fromEntries(Object.entries(backed).map(([t,v])=>[t,v.rows]))}));
+}
+if(action==='restore'){
+  if(!process.env.BACKUP_PREFIX)throw new Error('Missing backup prefix');
+  const conflicts={prices:'origin,dest,month',offers:'origin,dest,month,flight_type,departure_at,return_at',
+    window_prices:'origin,dest,flight_type,departure_at,return_at',window_price_misses:'origin,dest,flight_type,departure_at,return_at',
+    daily_origin_cheapest:'observed_on,origin,flight_type',daily_origin_cheapest_pool:'snapshot_at,origin,flight_type,rank'};
+  const restored={};
+  for(const [table,onConflict] of Object.entries(conflicts)){
+    const object=`${process.env.BACKUP_PREFIX}/${table}.json.gz`;const download=await fetch(`${url}/storage/v1/object/authenticated/price-snapshots/${object}`,{headers,signal:AbortSignal.timeout(120000)});
+    if(!download.ok)throw new Error(`restore download failed for ${table} (${download.status})`);
+    const rows=JSON.parse(gunzipSync(Buffer.from(await download.arrayBuffer())).toString('utf8')).rows;
+    for(let from=0;from<rows.length;from+=250){const response=await fetch(`${url}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`,{
+      method:'POST',headers:{...headers,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows.slice(from,from+250)),signal:AbortSignal.timeout(120000)});
+      if(!response.ok)throw new Error(`restore upsert failed for ${table} at ${from} (${response.status})`);}
+    restored[table]=rows.length;
+  }
+  await writeFile(`${outputDir}/restore-result.json`,JSON.stringify({backupPrefix:process.env.BACKUP_PREFIX,restored,completedAt:new Date().toISOString()},null,2));
+  console.log(JSON.stringify({event:'production_restore_upsert_complete',backupPrefix:process.env.BACKUP_PREFIX,restored,
+    schedulerRestored:false,rowsDeleted:false}));
 }

@@ -7,7 +7,7 @@ on:
       rollout_action:
         description: 'Owner-authorized rollout control (manual only)'
         type: choice
-        options: [none, probe, backup]
+        options: [none, probe, backup, restore]
         default: none
       validate_only:
         description: 'Read-only schema/bucket validation; no collection'
