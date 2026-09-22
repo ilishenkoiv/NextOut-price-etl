@@ -40,9 +40,9 @@ export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0,
   return{requests,windowBatch,elapsedMs,lagMs:Math.max(0,elapsedMs-2*MINUTE),fitsReservedSlot:elapsedMs<=2*MINUTE};
 }
 
-// Capacity proof from production-measured sequential throughput. Unlike the older /48 planning
-// projection above, this models the actual recurring 30-minute cycle: audit and roulette freshness
-// are paid again every cycle before any selected-window group can advance.
+// Capacity calculator for a supplied workload. The former 2,591-group input is now explicitly a
+// cache-inventory scenario, not an approved daily selection: app-selected server membership remains
+// a product/interface gate. Audit and roulette costs recur before whichever window set is supplied.
 export function measuredPriorityCapacity({windowGroups,rouletteTickets=220,auditTickets=10,requestsPerMinute,
   priorityMinutes=5,targetMinutes=30}){
   if(![windowGroups,rouletteTickets,auditTickets,requestsPerMinute,priorityMinutes,targetMinutes].every(Number.isFinite)

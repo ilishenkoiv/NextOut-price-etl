@@ -191,7 +191,28 @@ test('technical roulette failure mutates neither pool nor offer and never starts
   const h=maintenanceHarness([rouletteTicket('BCN',1)],()=>({kind:'refused',refusal:'tooMany'}));
   const result=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
   assert.equal(h.calls.length,0);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);assert.equal(result.checkpoint.roulette.errors,1);
-  assert.equal(result.checkpoint.roulette.cursor,0,'technical failure remains checkpointed for retry');
+  assert.equal(result.checkpoint.roulette.cursor,1,'technical failure defers to the next 30-minute pass without blocking later candidates');
+  assert.deepEqual(result.checkpoint.roulette.technicalDeferred,[{key:'BER|BCN|any|2027-01-10|2027-01-17',stage:'ticket',cycle:1}]);
+});
+
+test('a technical failure skips to the next saved refresh candidate without any storage mutation',async()=>{
+  const response=(n,url)=>n===1?{kind:'refused',refusal:'network'}:foundResponse(n,url);
+  const h=maintenanceHarness([rouletteTicket('BCN',1),rouletteTicket('ATH',2)],response);
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  assert.equal(h.calls.length,0);assert.equal(first.checkpoint.roulette.cursor,1);
+  const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(h.calls[0].name,'collection_commit_roulette');assert.equal(h.calls[0].args.p_ticket.dest,'ATH');
+  assert.equal(second.checkpoint.roulette.cursor,2);
+});
+
+test('a technical error while checking a replacement preserves the target and defers it without exhausting',async()=>{
+  const target=rouletteTicket('BCN',1),candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const response=n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'timeout'};
+  const h=maintenanceHarness([target],response,{replacements:{'BER|any':[candidate]}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(h.calls.length,0);assert.equal(second.checkpoint.roulette.cursor,1);assert.equal(second.checkpoint.roulette.exhausted,undefined);
+  assert.equal(second.checkpoint.roulette.technicalDeferred[0].stage,'replacement');
 });
 
 test('refresh owner issues exactly one provider request per saved ticket', async () => {

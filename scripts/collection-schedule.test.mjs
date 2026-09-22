@@ -25,7 +25,7 @@ test('priority capacity is honest at maximum backlog: realistic latency fits, ti
   assert.equal(timeout.fitsReservedSlot,false);assert.ok(timeout.elapsedMs>30*60000);
 });
 
-test('measured production capacity includes recurring roulette/audit cost before window progress',()=>{
+test('measured cache-inventory scenario includes recurring roulette/audit cost before window progress',()=>{
   const measured=measuredPriorityCapacity({windowGroups:2591,rouletteTickets:220,auditTickets:10,requestsPerMinute:67.1,priorityMinutes:5});
   assert.deepEqual({recurring:measured.recurringRequests,cap:measured.priorityCapacity,windows:measured.windowCapacity,cycles:measured.cycles},
     {recurring:230,cap:335,windows:105,cycles:25});
