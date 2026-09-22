@@ -32,7 +32,7 @@ if(action==='backup'){
   const order={prices:'origin.asc,dest.asc,month.asc',offers:'origin.asc,dest.asc,month.asc,flight_type.asc,departure_at.asc,return_at.asc',
     window_prices:'origin.asc,dest.asc,flight_type.asc,departure_at.asc,return_at.asc',window_price_misses:'origin.asc,dest.asc,flight_type.asc,departure_at.asc,return_at.asc',
     daily_origin_cheapest:'observed_on.asc,origin.asc,flight_type.asc',daily_origin_cheapest_pool:'snapshot_at.asc,origin.asc,flight_type.asc,rank.asc',
-    collection_scheduler_state:'singleton.asc',flight_price_feedback:'id.asc',flight_price_audits:'id.asc',route_price_health:'origin.asc,dest.asc',
+    collection_scheduler_state:'singleton.asc',flight_price_feedback:'id.asc',flight_price_audits:'feedback_id.asc',route_price_health:'origin.asc,dest.asc',
     daily_cheapest_selection_runs:'observed_on.asc'};
   for(const table of tables.filter(t=>!counts[t]?.missing)){
     const rows=[];for(let from=0;;from+=1000){const {body}=await jsonFetch(`/rest/v1/${table}?select=*&order=${order[table]}&offset=${from}&limit=1000`);
