@@ -320,7 +320,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         const latestSnapshot=latest[0]?.snapshot_at??null;
         if(r.snapshotAt!==latestSnapshot){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;
           delete r.pendingReplacement;delete r.technicalDeferred;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
-        const snapshotId=String(latestSnapshot??'empty').replace(/[^0-9A-Za-z]/g,'');
+        const snapshotId=String(Math.max(0,Date.parse(latestSnapshot??'')||0));
         const plan=await store.plan(`coordinator/roulette-${r.cycle}-${snapshotId}.json`,async()=>{
           if(!latestSnapshot)return{tickets:[],snapshotAt:null,allowedDests:[],replacements:{}};
           const tickets=await load('daily_origin_cheapest_pool','observed_on,snapshot_at,origin,dest,flight_type,departure_at,return_at,rank,price,transfers,market,source_updated_at,price_source',
@@ -396,7 +396,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           ['snapshot_at'],q=>q,deadline);
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
-        const epoch=epochs.at(-1),epochId=String(epoch.snapshot_at).replace(/[^0-9A-Za-z]/g,'');
+        const epoch=epochs.at(-1),epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
           const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
             ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);

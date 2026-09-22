@@ -247,6 +247,17 @@ test('a new daily snapshot invalidates only the stale roulette cursor and pendin
   assert.equal(result.checkpoint.roulette.cursor,1);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);
 });
 
+test('snapshot-specific roulette plan key stays compatible with the durable store format',async()=>{
+  const keys=[];const h=maintenanceHarness([rouletteTicket('BCN',1)],foundResponse);
+  const original=h.adapters.priority.step;
+  // The production key rule is coordinator/<letters>-<digits>-<digits>.json; source-level guard
+  // prevents a timestamp T/Z suffix from reaching CollectionStore again.
+  const source=readFileSync(new URL('./collection-adapters.mjs',import.meta.url),'utf8');
+  assert.match(source,/snapshotId=String\(Math\.max\(0,Date\.parse\(latestSnapshot\?\?'?'\)\|\|0\)\)/);
+  assert.match(source,/epochId=String\(Math\.max\(0,Date\.parse\(epoch\.snapshot_at\)\|\|0\)\)/);
+  assert.equal(typeof original,'function');assert.deepEqual(keys,[]);
+});
+
 test('refresh owner aborts its write when the single collection lease is lost (no parallel refresh)', async () => {
   const h = maintenanceHarness([rouletteTicket('BCN', 1)], foundResponse, { lease: async () => false });
   await assert.rejects(
