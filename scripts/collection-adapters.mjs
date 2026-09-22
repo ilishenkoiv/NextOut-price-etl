@@ -2,7 +2,7 @@ import { probeType, fetchCalendarMonth, selectCombo } from './fetch-prices.mjs';
 import { monthlyQuoteProvenance } from './quote-integrity.mjs';
 import { withPriceProvenance } from './price-provenance.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
-import { mainPlan, tailPlan, fastPlan, nextMonth, horizon, resolveTrancheDests } from './collection-planning.mjs';
+import { mainPlan, tailPlan, fastPlan, nextMonth, horizon, resolveTrancheDests, catalogue } from './collection-planning.mjs';
 import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
@@ -308,7 +308,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         const plan=await store.plan(`coordinator/roulette-${r.cycle}-0.json`,async()=>{
           const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
           if(!latest.length)return{tickets:[]};
-          const tickets=await load('daily_origin_cheapest_pool','origin,dest,flight_type,departure_at,return_at,rank',
+          const tickets=await load('daily_origin_cheapest_pool','observed_on,snapshot_at,origin,dest,flight_type,departure_at,return_at,rank,price,transfers,market,source_updated_at,price_source',
             ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latest[0].snapshot_at),deadline);
           if(tickets.length>220)throw new Error(`Roulette pool exceeds 22 origins × 10 tickets (${tickets.length}>220)`);
           return{tickets:tickets.filter(t=>t.departure_at>=today&&t.return_at>t.departure_at)};
@@ -323,7 +323,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
           const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
             transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          await commit('collection_commit_roulette',{p_ticket:{...ticket,month:ticket.departure_at.slice(0,7)},p_result:patch},deadline);
+          const allowedDests=catalogue(Number(process.env.SNAPSHOT_EXPANSION_WAVE??0)).map(item=>item.iata);
+          await commit('collection_commit_roulette',{p_ticket:{...ticket,month:ticket.departure_at.slice(0,7),allowed_dests:allowedDests,run_id:store.runId},p_result:patch},deadline);
           if(result.status==='found'){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
             p_observed_at:patch.updated_at}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
           r.cursor++;r.errors+=result.status==='error'?1:0;
