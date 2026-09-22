@@ -30,6 +30,8 @@ export function selectWindowConsumerSet(rows,day){const min=addIsoDays(day,10),m
   t.departure_at>=min&&t.departure_at<=max&&t.return_at>t.departure_at&&['weekend','holiday'].includes(t.window_kind));}
 export function windowConsumerSetId(rows,day){return`window-consumer:${day}:`+createHash('sha256').update(rows.map(t=>
   [t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|')).join('\n')).digest('hex').slice(0,20);}
+export function groupWindowConsumerTickets(rows){const groups=new Map();for(const row of rows){const key=[row.origin,row.dest,row.departure_at,row.return_at].join('|');
+  if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}return[...groups.values()].map(group=>group.sort((a,b)=>a.flight_type.localeCompare(b.flight_type)));}
 
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
@@ -177,14 +179,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     },
   };
 
-  async function exact(ticket, deadline) {
-    const params = new URLSearchParams({ origin:ticket.origin,destination:ticket.dest,
-      departure_at:ticket.departure_at,return_at:ticket.return_at,direct:String(ticket.flight_type==='direct'),
-      market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500' });
-    const response = await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-    const outcome = response.kind==='ok' ? classifyResponse(response.json,{
-      origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type,
-    }) : {status:'error',detail:response.kind==='refused'?'provider_refused':'provider_error'};
+  async function persistExactOutcome(ticket,response,outcome,deadline) {
     const now = new Date(clock()).toISOString(); const market = marketForOrigin(ticket.origin);
     let fare = null; let miss = null;
     if (outcome.status==='found') {
@@ -200,6 +195,27 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     if(fare){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
       p_observed_at:now}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
     return outcome.status!=='error';
+  }
+
+  async function exact(ticket, deadline) {
+    const params = new URLSearchParams({ origin:ticket.origin,destination:ticket.dest,
+      departure_at:ticket.departure_at,return_at:ticket.return_at,direct:String(ticket.flight_type==='direct'),
+      market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500' });
+    const response = await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
+    const outcome = response.kind==='ok' ? classifyResponse(response.json,{
+      origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type,
+    }) : {status:'error',detail:response.kind==='refused'?'provider_refused':'provider_error'};
+    return persistExactOutcome(ticket,response,outcome,deadline);
+  }
+
+  async function exactGroup(tickets,deadline){
+    if(!tickets.length)return true;const ticket=tickets[0];
+    const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,
+      return_at:ticket.return_at,direct:'false',market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
+    const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
+    let ok=true;for(const member of tickets){const outcome=response.kind==='ok'?classifyResponse(response.json,{origin:member.origin,dest:member.dest,
+      depart:member.departure_at,ret:member.return_at,mode:member.flight_type}):{status:'error',detail:response.kind==='refused'?'provider_refused':'provider_error'};
+      ok=(await persistExactOutcome(member,response,outcome,deadline))&&ok;}return ok;
   }
 
   async function windowWasRefreshedRecently(ticket,deadline){
@@ -323,13 +339,15 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const tickets=await load('window_prices','origin,dest,flight_type,departure_at,return_at,nights,window_kind,updated_at',WINDOW_ORDER,
             q=>q.gte('departure_at',w.day),deadline);
           const eligible=selectWindowConsumerSet(tickets,w.day);
-          return{day:w.day,setId:windowConsumerSetId(eligible,w.day),selectedAt:new Date(clock()).toISOString(),tickets:eligible};
+          return{day:w.day,setId:windowConsumerSetId(eligible,w.day),selectedAt:new Date(clock()).toISOString(),tickets:eligible,
+            groups:groupWindowConsumerTickets(eligible)};
         });
-        w.setId=plan.setId;w.total=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
-        const ticket=plan.tickets[w.cursor];
-        if(ticket){
-          if(ticket.departure_at<today){w.cursor++;w.expired=(w.expired??0)+1;}
-          else{const age=Math.max(0,clock()-Date.parse(ticket.updated_at));const ok=await exact(ticket,deadline);w.cursor++;w.errors+=ok?0:1;
+        w.setId=plan.setId;w.total=plan.groups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
+        const group=plan.groups[w.cursor];
+        if(group){
+          if(group[0].departure_at<today){w.cursor++;w.expired=(w.expired??0)+group.length;}
+          else{const age=Math.max(...group.map(ticket=>Math.max(0,clock()-Date.parse(ticket.updated_at))).filter(Number.isFinite));
+            const ok=await exactGroup(group,deadline);w.cursor++;w.errors+=ok?0:1;
             w.oldestAgeMs=Math.max(w.oldestAgeMs??0,Number.isFinite(age)?age:0);w.lastRefreshedAt=clock();}
         }
         w.done=w.cursor>=w.total;cp.weekend=w;

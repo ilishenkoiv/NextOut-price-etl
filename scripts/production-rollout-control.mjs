@@ -38,7 +38,9 @@ const consumer=allWindows.filter(row=>row.departure_at>=addDays(today,10)&&row.d
 const ages=consumer.map(row=>now-Date.parse(row.updated_at)).filter(Number.isFinite);
 probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recentPricesBothVariants:recentPrices.filter(r=>r.direct!=null&&r.any_stops!=null).length,
   recentPricesVariantProvenance:recentPrices.filter(r=>r.price_source?.variants&&(r.price_source.variants.direct||r.price_source.variants.any)).length,
-  recentWindows:recentWindows.length,consumerWindowRows:consumer.length,consumerOldestAgeMs:ages.length?Math.max(...ages):null,consumerNewestAgeMs:ages.length?Math.min(...ages):null,
+  recentWindows:recentWindows.length,consumerWindowRows:consumer.length,
+  consumerWindowGroups:new Set(consumer.map(r=>[r.origin,r.dest,r.departure_at,r.return_at].join('|'))).size,
+  consumerOldestAgeMs:ages.length?Math.max(...ages):null,consumerNewestAgeMs:ages.length?Math.min(...ages):null,
   routeHealthRows:health.length,routeHealthDead:health.filter(r=>r.status==='dead').length,routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
   poolRows:pool.length,poolSnapshots:Object.keys(poolGroups).length,latestPoolSnapshot:Object.keys(poolGroups).sort().at(-1)??null,
   latestPoolRows:Object.keys(poolGroups).length?poolGroups[Object.keys(poolGroups).sort().at(-1)]:0,schedulerRow:schedulerRows[0]??null};
