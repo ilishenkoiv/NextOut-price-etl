@@ -204,6 +204,7 @@ test('a technical failure skips to the next saved refresh candidate without any 
   const h=maintenanceHarness([rouletteTicket('BCN',1),rouletteTicket('ATH',2)],response);
   const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
   assert.equal(h.calls.length,0);assert.equal(first.checkpoint.roulette.cursor,1);
+  first.checkpoint.phase='roulette'; // after one interleaved persisted-window turn
   const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
   assert.equal(h.calls[0].name,'collection_commit_roulette');assert.equal(h.calls[0].args.p_ticket.dest,'ATH');
   assert.equal(second.checkpoint.roulette.cursor,2);
