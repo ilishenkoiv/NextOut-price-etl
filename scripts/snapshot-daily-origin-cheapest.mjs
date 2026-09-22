@@ -113,6 +113,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
   observed_on: observedOn,
   snapshot_at: snapshotAt,
+  created_at: snapshotAt,
   origin: row.origin,
   market: row.market || marketForOrigin(row.origin),
   flight_type: row.flight_type,
@@ -132,6 +133,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
     observed_on: observedOn,
     snapshot_at: snapshotAt,
+    created_at: snapshotAt,
     origin: row.origin,
     market: row.market || marketForOrigin(row.origin),
     flight_type: row.flight_type,
