@@ -150,7 +150,7 @@ $$;
 
 create or replace function public.collection_commit_window_candidate(p_owner uuid,p_token bigint,p_ticket jsonb,p_result jsonb)
 returns boolean language plpgsql security definer set search_path=public as $$
-declare t public.daily_window_candidates; status text; observed timestamptz; checked timestamptz;
+declare t public.daily_window_candidates; stored_ticket public.daily_window_candidates; status text; observed timestamptz; checked timestamptz;
 begin
   perform 1 from public.collection_scheduler_state where singleton and owner=p_owner and fence=p_token
     and lease_until>clock_timestamp() for update;
@@ -158,10 +158,12 @@ begin
   t:=jsonb_populate_record(null::public.daily_window_candidates,p_ticket);status:=p_result->>'status';
   if t.snapshot_at is null or t.origin is null or t.flight_type is null or t.departure_at is null or t.return_at is null
     or t.position is null or t.destination_id is null then raise exception 'invalid window candidate ticket';end if;
-  perform 1 from public.daily_window_candidates c where c.snapshot_at=t.snapshot_at and c.origin=t.origin
+  select c.* into stored_ticket from public.daily_window_candidates c where c.snapshot_at=t.snapshot_at and c.origin=t.origin
     and c.flight_type=t.flight_type and c.departure_at=t.departure_at and c.return_at=t.return_at
     and c.position=t.position and c.destination_id=t.destination_id for update;
   if not found then raise exception 'window candidate changed';end if;
+  -- Immutable identity comes from the locked stored row, never incomplete/spoofed caller fields.
+  t:=stored_ticket;
   if status='found' then
     observed:=(p_result->>'updated_at')::timestamptz;checked:=coalesce((p_result->>'checked_at')::timestamptz,observed);
     if coalesce((p_result->>'price')::numeric,0)<=0 or observed is null

@@ -31,7 +31,7 @@ select jsonb_pretty(jsonb_build_object(
   'bad_positions',(select count(*) from (select origin,flight_type,departure_at,return_at
     from public.daily_window_candidates where snapshot_at=(select max(snapshot_at) from public.daily_window_candidates)
     group by 1,2,3,4 having min(position)<>1 or max(position)<>count(*)) p),
-  'invalid_regions',(select count(*) from public.daily_window_candidates c,cross join lateral unnest(c.region_codes) r
+  'invalid_regions',(select count(*) from public.daily_window_candidates c cross join lateral unnest(c.region_codes) r
     where r!~'^[A-Z]{2}(-[A-Z0-9]{1,3})?$'),
   'status_counts',(select jsonb_object_agg(refresh_status,n) from (select refresh_status,count(*) n from public.daily_window_candidates
     where snapshot_at=(select max(snapshot_at) from public.daily_window_candidates) group by refresh_status) s),

@@ -36,6 +36,7 @@ test('migration exposes atomic daily publication, fenced price-only refresh, rea
   assert.match(migration,/daily_origin_cheapest_pool add column if not exists destination_id/);
   assert.match(migration,/"GVA":"chamonix"/);assert.match(migration,/"ZRH":"zermatt"/);
   assert.match(migration,/collection_scheduler_state[\s\S]*owner=p_owner[\s\S]*fence=p_token[\s\S]*for update/);
+  assert.match(migration,/select c\.\* into stored_ticket[\s\S]*for update[\s\S]*t:=stored_ticket/);
   assert.match(migration,/refresh_status='unavailable'/);assert.match(migration,/refresh_status='failed'/);
   assert.match(migration,/grant select on public\.daily_window_candidate_epochs,public\.daily_window_candidates to anon,authenticated/);
   assert.match(verify,/same-price refresh did not update observation/);assert.match(verify,/technical failure erased\/freshened saved price/);
