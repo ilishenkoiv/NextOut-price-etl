@@ -20,7 +20,7 @@ const rpcNames=Object.keys(openapi.body.paths??{}).filter(p=>p.startsWith('/rpc/
 const adminRpcCandidates=rpcNames.filter(n=>/sql|exec|query|admin|ddl|migration/i.test(n));
 const tables=['prices','offers','window_prices','window_price_misses','daily_origin_cheapest','daily_origin_cheapest_pool',
   'collection_scheduler_state','flight_price_feedback','flight_price_audits','route_price_health','daily_cheapest_selection_runs',
-  'roulette_pool_replacements'];
+  'roulette_pool_replacements','daily_window_candidate_epochs','daily_window_candidates'];
 const counts={};for(const table of tables)counts[table]=await maybeCount(table);
 let scheduler=null;try{scheduler=(await jsonFetch('/rest/v1/rpc/collection_state_inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).body;}catch(error){scheduler={error:error.message};}
 let bucket=null;try{bucket=(await jsonFetch('/storage/v1/bucket/price-snapshots')).body;}catch(error){bucket={error:error.message};}
@@ -43,6 +43,14 @@ const fingerprint=rows=>createHash('sha256').update(rows.map(tuple).join('\n')).
 const replacements=counts.roulette_pool_replacements?.missing?[]:await loadRows('roulette_pool_replacements',
   'event_key,snapshot_at,origin,rank,old_ticket,new_ticket,outcome,reason,historical_rows_removed,run_id,created_at','created_at.desc,event_key.asc');
 const cityKeys=latestPool.map(row=>`${row.origin}|${row.dest}`);const duplicateCities=[...new Set(cityKeys.filter((key,index)=>cityKeys.indexOf(key)!==index))].sort();
+const windowEpochs=counts.daily_window_candidate_epochs?.missing?[]:await loadRows('daily_window_candidate_epochs',
+  'observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups,completed_at','snapshot_at.asc');
+const latestWindowEpoch=windowEpochs.at(-1)??null;
+const windowCandidates=!latestWindowEpoch?[]:await loadRows('daily_window_candidates',
+  'observed_on,snapshot_at,origin,market,flight_type,region_codes,window_kind,departure_at,return_at,position,dest,destination_id,exact_price,exact_observed_at,refresh_status,refresh_checked_at,last_error_kind',
+  'origin.asc,flight_type.asc,departure_at.asc,return_at.asc,position.asc',`&snapshot_at=eq.${encodeURIComponent(latestWindowEpoch.snapshot_at)}`);
+const candidateAges=windowCandidates.map(r=>now-Date.parse(r.exact_observed_at)).filter(Number.isFinite).sort((a,b)=>a-b);
+const candidateStatus=Object.fromEntries([...new Set(windowCandidates.map(r=>r.refresh_status))].sort().map(status=>[status,windowCandidates.filter(r=>r.refresh_status===status).length]));
 const consumer=allWindows.filter(row=>row.departure_at>=addDays(today,10)&&row.departure_at<=addMonths(today,4)&&row.return_at>row.departure_at&&['weekend','holiday'].includes(row.window_kind));
 const ages=consumer.map(row=>now-Date.parse(row.updated_at)).filter(Number.isFinite);
 probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recentPricesBothVariants:recentPrices.filter(r=>r.direct!=null&&r.any_stops!=null).length,
@@ -54,8 +62,13 @@ probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recent
   poolRows:pool.length,poolSnapshots:Object.keys(poolGroups).length,latestPoolSnapshot,
   latestPoolRows:latestPool.length,poolFingerprint:fingerprint(pool),latestPoolFingerprint:fingerprint(latestPool),
   latestPoolDuplicateCities:duplicateCities,replacementAuditRows:replacements.length,
-  recentReplacementAuditRows:replacements.filter(row=>row.created_at>=recentIso).length,schedulerRow:schedulerRows[0]??null};
-probe.poolIntegrity={latestPool,replacements};
+  recentReplacementAuditRows:replacements.filter(row=>row.created_at>=recentIso).length,
+  dailyWindowEpoch:latestWindowEpoch,dailyWindowRows:windowCandidates.length,
+  dailyWindowRequestGroups:new Set(windowCandidates.map(r=>[r.origin,r.dest,r.departure_at,r.return_at].join('|'))).size,
+  dailyWindowStatus:candidateStatus,dailyWindowOldestAgeMs:candidateAges.at(-1)??null,
+  dailyWindowMedianAgeMs:candidateAges.length?candidateAges[Math.floor(candidateAges.length/2)]:null,
+  dailyWindowNewestAgeMs:candidateAges[0]??null,schedulerRow:schedulerRows[0]??null};
+probe.poolIntegrity={latestPool,replacements};probe.windowCandidateIntegrity={epoch:latestWindowEpoch,candidates:windowCandidates};
 if(process.env.BACKUP_PREFIX){
   const object=`${process.env.BACKUP_PREFIX}/daily_origin_cheapest_pool.json.gz`;
   const response=await fetch(`${url}/storage/v1/object/authenticated/price-snapshots/${object}`,{headers,signal:AbortSignal.timeout(120000)});
@@ -84,6 +97,7 @@ if(action==='backup'){
     daily_origin_cheapest:'observed_on.asc,origin.asc,flight_type.asc',daily_origin_cheapest_pool:'snapshot_at.asc,origin.asc,flight_type.asc,rank.asc',
     collection_scheduler_state:'singleton.asc',flight_price_feedback:'id.asc',flight_price_audits:'feedback_id.asc',route_price_health:'origin.asc,dest.asc',
     daily_cheapest_selection_runs:'observed_on.asc',roulette_pool_replacements:'created_at.asc,event_key.asc'};
+  order.daily_window_candidate_epochs='observed_on.asc';order.daily_window_candidates='snapshot_at.asc,origin.asc,flight_type.asc,departure_at.asc,return_at.asc,position.asc';
   for(const table of tables.filter(t=>!counts[t]?.missing)){
     const rows=[];for(let from=0;;from+=1000){const {body}=await jsonFetch(`/rest/v1/${table}?select=*&order=${order[table]}&offset=${from}&limit=1000`);
       if(!Array.isArray(body))throw new Error(`${table} backup is not an array`);rows.push(...body);if(body.length<1000)break;}
