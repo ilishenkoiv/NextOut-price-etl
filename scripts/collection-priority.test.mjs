@@ -36,7 +36,7 @@ test('weekend refresh snapshots one stable daily consumer set and resumes its fu
   assert.equal(r3.checkpoint.weekend.setId,r2.checkpoint.weekend.setId,'daily set identity remains frozen');
 });
 
-test('consumer set has no top-N or /48 shortcut and preserves >1000 exact variant/date rows',()=>{
+test('cache-inventory helper has no invented top-N or /48 shortcut and preserves >1000 exact rows',()=>{
   const rows=Array.from({length:1205},(_,i)=>({origin:'BER',dest:`D${i}`,flight_type:i%2?'direct':'any',
     departure_at:'2026-10-10',return_at:'2026-10-17',window_kind:'weekend'}));
   const selected=selectWindowConsumerSet(rows,'2026-09-22');

@@ -55,8 +55,11 @@ test('real SQL-path regression is transactional and asserts replacement, idempot
   const verify=readFileSync(new URL('./verify-roulette-targeted-replacement.sql',import.meta.url),'utf8');
   assert.match(verify,/scheduler is not idle/);assert.match(verify,/targeted replacement assertion failed/);
   assert.match(verify,/historical_rows_removed=2/);assert.match(verify,/targeted replacement idempotency assertion failed/);
+  assert.match(verify,/unchanged confirmed price did not refresh observation immutably/);
+  assert.match(verify,/confirmed price increase was not stored/);assert.match(verify,/confirmed price decrease changed pool or was not stored/);
   assert.match(verify,/null or missing status changed membership\/offer/);
   assert.match(verify,/missing allowed destinations accepted/);assert.match(verify,/empty allowed destinations accepted/);
   assert.match(verify,/null flight type accepted/);assert.match(verify,/null guard rejection changed membership\/offer/);
+  assert.match(verify,/confirmed unavailable exhaustion was not explicit and audited/);
   assert.match(verify,/technical error changed membership\/offer/);assert.match(verify,/rollback;\s*$/);
 });

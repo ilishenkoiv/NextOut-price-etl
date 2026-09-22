@@ -1,9 +1,9 @@
 -- Production-safe controlled proof after 20260922130000 is applied. Schedules must stay paused.
--- All synthetic QAA/QBB/QCC rows and scheduler changes roll back with this transaction.
+-- All synthetic QAA/QBB/QCC/QDD rows and scheduler changes roll back with this transaction.
 begin;
 set local lock_timeout='10s';
 do $$ declare test_owner uuid:='00000000-0000-4000-8000-000000000099'; f bigint; ok boolean;
-  before_current integer; after_current integer;
+  before_current integer; after_current integer; pool_before jsonb; observed_at timestamptz;
 begin
   select fence into f from public.collection_scheduler_state where singleton and owner is null and lease_until is null for update;
   if f is null then raise exception 'scheduler is not idle'; end if;
@@ -12,11 +12,13 @@ begin
   insert into public.offers(origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,updated_at,price_source)
     values('FRA','de','QAA','2099-01','any','2099-01-10','2099-01-17',7,999,1,clock_timestamp(),'{}'),
           ('FRA','de','QBB','2099-02','any','2099-02-10','2099-02-17',7,123,0,clock_timestamp(),'{}'),
-          ('FRA','de','QCC','2099-03','any','2099-03-10','2099-03-17',7,555,1,clock_timestamp(),'{}');
+          ('FRA','de','QCC','2099-03','any','2099-03-10','2099-03-17',7,555,1,clock_timestamp(),'{}'),
+          ('FRA','de','QDD','2099-04','any','2099-04-10','2099-04-17',7,777,1,clock_timestamp(),'{}');
   insert into public.daily_origin_cheapest_pool(observed_on,snapshot_at,origin,market,flight_type,rank,dest,price,currency,
     departure_at,return_at,transfers,source_updated_at,price_source)
     values('2099-01-01','2099-01-01T03:30:00Z','FRA','de','any',1,'QAA',999,'EUR','2099-01-10','2099-01-17',1,clock_timestamp(),'{}'),
           ('2099-01-01','2099-01-01T03:30:00Z','FRA','de','any',2,'QCC',555,'EUR','2099-03-10','2099-03-17',1,clock_timestamp(),'{}'),
+          ('2099-01-01','2099-01-01T03:30:00Z','FRA','de','any',3,'QDD',777,'EUR','2099-04-10','2099-04-17',1,clock_timestamp(),'{}'),
           ('2098-12-31','2098-12-31T03:30:00Z','FRA','de','any',3,'QAA',999,'EUR','2099-01-10','2099-01-17',1,clock_timestamp(),'{}');
   select count(*) into before_current from public.daily_origin_cheapest_pool
     where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any';
@@ -50,6 +52,34 @@ begin
   if not ok or (select count(*) from public.roulette_pool_replacements where snapshot_at='2099-01-01T03:30:00Z' and rank=1)<>1
     or not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=1 and dest='QBB')
     then raise exception 'targeted replacement idempotency assertion failed'; end if;
+  -- A successful observation always refreshes the offer timestamp, including an unchanged price;
+  -- both increases and decreases replace the old offer price while the saved pool stays fixed.
+  select to_jsonb(p) into pool_before from public.daily_origin_cheapest_pool p
+    where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2;
+  observed_at:=clock_timestamp();
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+      'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+    jsonb_build_object('status','found','price',555,'transfers',1,'updated_at',observed_at,'price_source','{}'::jsonb));
+  if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10'
+      and price=555 and updated_at=observed_at)
+    or pool_before is distinct from (select to_jsonb(p) from public.daily_origin_cheapest_pool p
+      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2)
+    then raise exception 'unchanged confirmed price did not refresh observation immutably'; end if;
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+      'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+    jsonb_build_object('status','found','price',600,'transfers',1,'updated_at',clock_timestamp(),'price_source','{}'::jsonb));
+  if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10' and price=600)
+    then raise exception 'confirmed price increase was not stored'; end if;
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+      'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+    jsonb_build_object('status','found','price',500,'transfers',1,'updated_at',clock_timestamp(),'price_source','{}'::jsonb));
+  if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10' and price=500)
+    or pool_before is distinct from (select to_jsonb(p) from public.daily_origin_cheapest_pool p
+      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2)
+    then raise exception 'confirmed price decrease changed pool or was not stored'; end if;
   -- Missing/NULL status is an inconclusive technical result and must fail closed as a no-op.
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
@@ -94,13 +124,24 @@ begin
   if not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=2 and dest='QCC')
     or not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10')
     then raise exception 'null guard rejection changed membership/offer'; end if;
+  -- A confirmed unavailable ticket with no live eligible alternative is explicitly exhausted and audited.
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA','market','de',
+      'flight_type','any','rank',3,'dest','QDD','price',777,'currency','EUR','departure_at','2099-04-10',
+      'return_at','2099-04-17','transfers',1,'allowed_dests',jsonb_build_array('QDD'),'run_id','replacement-sql-test'),
+    jsonb_build_object('status','no_result','replacement',null));
+  if exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=3 and dest='QDD')
+    or exists(select 1 from public.offers where origin='FRA' and dest='QDD' and departure_at='2099-04-10')
+    or not exists(select 1 from public.roulette_pool_replacements where snapshot_at='2099-01-01T03:30:00Z'
+      and rank=3 and outcome='exhausted' and new_ticket is null and historical_rows_removed=1)
+    then raise exception 'confirmed unavailable exhaustion was not explicit and audited'; end if;
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA','market','de',
       'flight_type','any','rank',2,'dest','QCC','price',555,'currency','EUR','departure_at','2099-03-10',
       'return_at','2099-03-17','transfers',1,'allowed_dests',jsonb_build_array('QCC'),'run_id','replacement-sql-test'),
     jsonb_build_object('status','error','detail','network'));
   if not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=2 and dest='QCC')
-    or not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10')
+    or not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10' and price=500)
     then raise exception 'technical error changed membership/offer'; end if;
 end $$;
 rollback;

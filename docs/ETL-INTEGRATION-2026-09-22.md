@@ -1,5 +1,29 @@
 # ETL integration package — 2026-09-22
 
+## Consolidated contract correction — 2026-09-22
+
+This section supersedes the earlier claim below that every qualifying `window_prices` row is the
+“stable daily selected set.” The source trace is correct (the app loads all rows and has device-local
+personalization), but the conclusion is not: current app selection is recomputed locally, capped at
+15 display slides, and is not persisted. The 4,479-row / 2,591-group production cache therefore
+cannot be used as daily membership without an explicit product interface.
+
+Independent compatible work completed/prepared:
+
+- roulette daily pool remains persisted and separate from price refresh;
+- refresh treats same/higher/lower positive prices as successful observations;
+- technical failures perform no write, are deferred, advance past the failed saved ticket and retry
+  on the next cycle instead of starving later candidates;
+- exact `no_result` alone enters the audited replacement/exhaustion RPC;
+- SQL regression exercises unchanged/increased/decreased price, technical no-op, replacement,
+  exhaustion, idempotency and NULL guards in one rolled-back transaction;
+- MAIN direct+any behavior is unchanged; direct+any grouping applies only to two rows for the same
+  exact weekend route/date provider response and never replaces MAIN's four mandatory calls.
+
+Blocked integration boundary: Window 01 must persist the actual daily carousel ticket identities,
+and PO/owner must choose how those local keys become a server refresh union. See
+`docs/WINDOW-01-APP-CONTRACT-HANDOFF-2026-09-22.md`. No arbitrary cap or SLA change is implied.
+
 Status: local package only. Nothing in this document authorizes a production run, migration,
 workflow toggle, GitHub variable/secret change, commit or push.
 

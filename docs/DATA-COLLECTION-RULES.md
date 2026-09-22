@@ -1,5 +1,35 @@
 # DATA-COLLECTION-RULES — канонический план сбора данных NextOut
 
+## 22.09.2026 — консолидированный owner contract (заменяет конфликтующие поздние трактовки)
+
+Это дополнение имеет приоритет над прежними оценками/статусами ниже; история сохранена.
+
+- Roulette и weekend/holiday используют одну архитектуру: один раз за Berlin-day сохраняется
+  конкретный набор `(origin, destination identity, dates, flight mode, order)`; 30-минутный refresh
+  меняет только фактически наблюдённую цену/доступность этих ключей и имеет отдельный checkpoint.
+- Любая положительная provider observation успешна: та же цена освежает `updated_at`, повышение и
+  снижение заменяют старую цену. Ошибка/timeout/429 не удаляет, не freshens и не доказывает
+  отсутствие. Только успешный exact `no_result` разрешает targeted replacement/exhaustion roulette.
+- Technical failure одного roulette ticket не блокирует остальные сохранённые кандидаты: он
+  записывается retryable/deferred без DB mutation, cursor идёт дальше, следующий 30-мин pass пробует
+  его снова. То же правило действует при технической ошибке проверки replacement candidate.
+- Persistent server pool mutation и device-local display fallback — разные процессы. Reveal/history
+  записываются только после фактического показа; сервер не обходит five-other-cities/4h/3-per-24h.
+- Weekend exact failure не удаляет city/window: fresh exact -> явно подписанный same-route/mode/month
+  minimum -> `Check price`. Monthly minimum не становится exact row/Total и открывает свои реальные
+  даты или monthly search. Другая city reselection остаётся IDEA ONLY.
+- MAIN сохраняет unconditional direct AND any calls, daily full-pass target, 30-day confirmed-empty
+  dead threshold, rotating ~1/7 dead set and immediate revival. Technical failures не являются
+  no-price evidence.
+- Никакие 105/115 caps, 12.5h как новый SLA, потеря coverage или concurrent provider requests не
+  утверждены.
+
+Фактический app trace 22.09: current weekend consumer локально пересчитывает до 15 персональных
+slides из всех paginated `window_prices`; selection не persisted и сервер её не знает. Поэтому
+production 4,479 rows / 2,591 groups — cache workload, не доказанная daily membership. Точный
+Window 01 handoff: `docs/WINDOW-01-APP-CONTRACT-HANDOFF-2026-09-22.md`. До определения server
+membership source schedule-policy gate остаётся закрытым; это не разрешает ослаблять требования.
+
 Статус: **Stage 0 — только документация.** Дата фиксации: 2026-09-21.
 
 Этот файл фиксирует согласованную владельцем целевую архитектуру сбора данных и отделяет её от
