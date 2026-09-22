@@ -50,6 +50,50 @@ begin
   if not ok or (select count(*) from public.roulette_pool_replacements where snapshot_at='2099-01-01T03:30:00Z' and rank=1)<>1
     or not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=1 and dest='QBB')
     then raise exception 'targeted replacement idempotency assertion failed'; end if;
+  -- Missing/NULL status is an inconclusive technical result and must fail closed as a no-op.
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+      'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+    '{}'::jsonb);
+  perform public.collection_commit_roulette(test_owner,f+1,
+    jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+      'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+    jsonb_build_object('status',null));
+  if not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=2 and dest='QCC')
+    or not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10')
+    or exists(select 1 from public.roulette_pool_replacements where snapshot_at='2099-01-01T03:30:00Z' and rank=2)
+    then raise exception 'null or missing status changed membership/offer'; end if;
+  -- A real no_result may mutate only with a canonical non-empty allowed list and a non-NULL mode.
+  begin
+    perform public.collection_commit_roulette(test_owner,f+1,
+      jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+        'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
+      jsonb_build_object('status','no_result','replacement',null));
+    raise exception 'missing allowed destinations accepted';
+  exception when others then
+    if sqlerrm='missing allowed destinations accepted' or position('missing allowed destinations' in sqlerrm)=0 then raise; end if;
+  end;
+  begin
+    perform public.collection_commit_roulette(test_owner,f+1,
+      jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+        'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17','allowed_dests','[]'::jsonb),
+      jsonb_build_object('status','no_result','replacement',null));
+    raise exception 'empty allowed destinations accepted';
+  exception when others then
+    if sqlerrm='empty allowed destinations accepted' or position('invalid allowed destinations' in sqlerrm)=0 then raise; end if;
+  end;
+  begin
+    perform public.collection_commit_roulette(test_owner,f+1,
+      jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
+        'flight_type',null,'rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17','allowed_dests',jsonb_build_array('QCC')),
+      jsonb_build_object('status','no_result','replacement',null));
+    raise exception 'null flight type accepted';
+  exception when others then
+    if sqlerrm='null flight type accepted' or position('invalid roulette ticket' in sqlerrm)=0 then raise; end if;
+  end;
+  if not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=2 and dest='QCC')
+    or not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10')
+    then raise exception 'null guard rejection changed membership/offer'; end if;
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA','market','de',
       'flight_type','any','rank',2,'dest','QCC','price',555,'currency','EUR','departure_at','2099-03-10',

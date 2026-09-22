@@ -31,7 +31,7 @@ begin
   if not found then raise exception 'collection lease lost'; end if;
   t:=jsonb_populate_record(null::public.daily_origin_cheapest_pool,p_ticket);
   if t.snapshot_at is null or t.origin is null or t.rank is null or t.dest is null
-    or t.flight_type not in ('any','direct') or t.departure_at is null or t.return_at is null
+    or t.flight_type is null or t.flight_type not in ('any','direct') or t.departure_at is null or t.return_at is null
     then raise exception 'invalid roulette ticket'; end if;
   event_id:=concat_ws('|',t.snapshot_at,t.origin,t.flight_type,t.rank,t.dest,t.departure_at,t.return_at);
   if exists(select 1 from public.roulette_pool_replacements where event_key=event_id) then return true; end if;
@@ -44,7 +44,7 @@ begin
       where origin=t.origin and dest=t.dest and month=to_char(t.departure_at,'YYYY-MM')
         and flight_type=t.flight_type and departure_at=t.departure_at and return_at=t.return_at;
     return true;
-  elsif p_result->>'status'<>'no_result' then
+  elsif (p_result->>'status') is distinct from 'no_result' then
     return true;
   end if;
 
@@ -56,10 +56,10 @@ begin
     for update;
   if not found then raise exception 'roulette target changed before replacement'; end if;
 
-  if jsonb_typeof(p_ticket->'allowed_dests')<>'array' then raise exception 'missing allowed destinations'; end if;
+  if jsonb_typeof(p_ticket->'allowed_dests') is distinct from 'array' then raise exception 'missing allowed destinations'; end if;
   select array_agg(value order by value) into allowed from jsonb_array_elements_text(p_ticket->'allowed_dests');
-  if cardinality(allowed)<1 or cardinality(allowed)>200
-    or exists(select 1 from unnest(allowed) d where d!~'^[A-Z]{3}$') then raise exception 'invalid allowed destinations'; end if;
+  if allowed is null or cardinality(allowed)<1 or cardinality(allowed)>200
+    or exists(select 1 from unnest(allowed) d where d is null or d!~'^[A-Z]{3}$') then raise exception 'invalid allowed destinations'; end if;
   old_json:=to_jsonb(t);
   if p_result->'replacement' is not null and jsonb_typeof(p_result->'replacement')<>'null' then
     candidate:=jsonb_populate_record(null::public.offers,p_result->'replacement');
