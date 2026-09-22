@@ -35,7 +35,8 @@ jobs:
   select:
     # Coordinated mode only. A workflow_run trigger fires only after a SUCCESSFUL coordinator run.
     if: >-
-      vars.COLLECTION_MODE == 'coordinated' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      (vars.COLLECTION_MODE == 'coordinated' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
