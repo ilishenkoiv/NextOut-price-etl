@@ -41,7 +41,9 @@ function maintenanceAdapters({ script, log = [], lease = async () => true, provi
   const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, runId: 'r',
     plan: async (k, build) => { if (!planCache.has(k)) planCache.set(k, await build()); return planCache.get(k); } };
   const db = makeDb(script, log);
-  const prov = provider ?? { request: async () => ({ kind: 'ok', json: { success: true, data: [] } }) };
+  const prov = provider ?? { request: async url => {const q=new URL(url).searchParams;return { kind: 'ok', json: { success: true, data: [{
+    origin:q.get('origin'),destination:q.get('destination'),departure_at:q.get('departure_at')+'T06:00:00Z',
+    return_at:q.get('return_at')+'T20:00:00Z',price:111,transfers:q.get('direct')==='true'?0:1,currency:'EUR'}] } };} };
   return { adapters: createAdapters({ db, store, provider: prov, wave: 43, clock: () => CLOCK, sleep: async () => {}, random: () => 0 }), log };
 }
 const onlyFeedbackAndRoulette = (over = {}) => ({ cycle:1,dueAt:0,phase:'audit',auditDone:false,
@@ -51,7 +53,7 @@ const POOL = 'daily_origin_cheapest_pool';
 const TICKET = { origin: 'FRA', dest: 'MAD', flight_type: 'direct', departure_at: '2027-01-10', return_at: '2027-01-17', rank: 1 };
 // Scripts a working roulette turn: latest snapshot row, then the ticket page (<1000 ⇒ one page).
 const rouletteScript = () => ({ from: { [POOL]: [{ data: [{ snapshot_at: 'S1' }], error: null }, { data: [TICKET], error: null }] },
-  rpc: { collection_commit_roulette: [{ data: true, error: null }] } });
+  rpc: { collection_commit_roulette: [{ data: true, error: null }], collection_revive_route: [{ data: true, error: null }] } });
 
 // ── 4. Maintenance turn 0 processes the flight_price_feedback queue ─────────────────────────────
 test('4. maintenance turn 0 claims and finalizes a flight_price_feedback item', async () => {
@@ -68,7 +70,9 @@ test('4. maintenance turn 0 claims and finalizes a flight_price_feedback item', 
 // ── 5 + 10. Maintenance turn 1 rechecks the roulette pool by EXACT ticket, no pool rebuild ──────
 test('5+10. maintenance turn 1 rechecks exact roulette tickets and never republishes the pool', async () => {
   const seen = [];
-  const provider = { request: async (url) => { seen.push(url); return { kind: 'ok', json: { success: true, data: [] } }; } };
+  const provider = { request: async (url) => { seen.push(url); const q=new URL(url).searchParams;return { kind: 'ok', json: { success: true, data: [{
+    origin:q.get('origin'),destination:q.get('destination'),departure_at:q.get('departure_at')+'T06:00:00Z',
+    return_at:q.get('return_at')+'T20:00:00Z',price:111,transfers:0,currency:'EUR'}] } };} };
   const script = { ...rouletteScript(), rpc: { ...rouletteScript().rpc, claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script, provider });
   const r = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
@@ -81,7 +85,7 @@ test('5+10. maintenance turn 1 rechecks exact roulette tickets and never republi
 // ── 6. Roulette keeps its cursor between maintenance windows ────────────────────────────────────
 test('6. roulette cursor persists across maintenance windows', async () => {
   const script = { from: { [POOL]: [{ data: [{ snapshot_at: 'S1' }], error: null }, { data: [TICKET, { ...TICKET, dest: 'BCN' }], error: null }] },
-    rpc: { collection_commit_roulette: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
+    rpc: { collection_commit_roulette: [{ data: true, error: null }], collection_revive_route: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters } = maintenanceAdapters({ script });
   const cp0 = onlyFeedbackAndRoulette();
   const r1 = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: cp0 }, deadline: DEADLINE });
@@ -97,7 +101,8 @@ test('6. roulette cursor persists across maintenance windows', async () => {
 test('7+8. a busy feedback queue is bounded to ten claims, then roulette runs (no starvation)', async () => {
   const script = { from: rouletteScript().from,
     rpc: { claim_flight_price_audit: [{ data: [{ feedback_id: 'f1', claim_token: 't1', feedback: {} }], error: null }],   // always busy (last repeats)
-      finish_flight_price_audit: [{ data: true, error: null }], collection_commit_roulette: [{ data: true, error: null }] } };
+      finish_flight_price_audit: [{ data: true, error: null }], collection_commit_roulette: [{ data: true, error: null }],
+      collection_revive_route: [{ data: true, error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
   let cp=onlyFeedbackAndRoulette();let result;
   for(let i=0;i<11;i++){result=await adapters.priority.step({job:{id:1,planDate:TODAY,startedAt:CLOCK,checkpoint:cp},deadline:DEADLINE});cp=result.checkpoint;}
@@ -120,7 +125,8 @@ test('9. a busy feedback queue is processed in bounded portions (≤1 claim per 
 test('11. transient DB failure during the roulette recheck is retried without losing progress', async () => {
   const T = { status: 503, error: { code: '', message: 'fetch failed' } };
   const script = { from: { [POOL]: [T, { data: [{ snapshot_at: 'S1' }], error: null }, { data: [TICKET], error: null }] }, // first pool read transient, then ok
-    rpc: { collection_commit_roulette: [{ data: true, error: null }], claim_flight_price_audit: [{ data: [], error: null }] } };
+    rpc: { collection_commit_roulette: [{ data: true, error: null }], collection_revive_route: [{ data: true, error: null }],
+      claim_flight_price_audit: [{ data: [], error: null }] } };
   const { adapters, log } = maintenanceAdapters({ script });
   const r = await adapters.priority.step({ job: { id: 1, planDate: TODAY, startedAt: CLOCK, checkpoint: onlyFeedbackAndRoulette() }, deadline: DEADLINE });
   assert.ok(cnt(log, 'from:' + POOL) >= 3, 'the transient pool read was retried (extra builder)');

@@ -16,7 +16,7 @@ function harness({latencyMs,roulette=220,windows=1205}){
     save:async()=>{advanceDb();},plan:async(key,build)=>{
       if(cache.has(key))return cache.get(key);let value;
       if(key.includes('/roulette-'))value={tickets:Array.from({length:roulette},(_,i)=>ticket(i))};
-      else if(key.includes('/windowrefresh-'))value={day:'1970-01-01',setId:'window-consumer:test',selectedAt:new Date(now).toISOString(),tickets:Array.from({length:windows},(_,i)=>ticket(i+500))};
+      else if(key.includes('/windowrefresh-')){const tickets=Array.from({length:windows},(_,i)=>ticket(i+500));value={day:'1970-01-01',setId:'window-consumer:test',selectedAt:new Date(now).toISOString(),tickets,groups:tickets.map(t=>[t])};}
       else if(key.includes('/main-'))value={months:['2027-01'],routes:Array.from({length:50},(_,i)=>({origin:'FRA',dest:`M${i}`,stops:0,key:`FRA|M${i}`})),breakKeys:[]};
       else if(key.includes('/fast-'))value={tickets:[]};else if(key.includes('/tail-'))value={routes:[],windows:[]};else value=await build();
       cache.set(key,value);return value;
