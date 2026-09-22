@@ -5,5 +5,6 @@ drop function if exists public.collection_commit_window_candidate(uuid,bigint,js
 drop function if exists public.publish_daily_window_candidates(date,timestamptz,jsonb);
 alter table if exists public.daily_window_candidates rename to daily_window_candidates_rollback_20260922;
 alter table if exists public.daily_window_candidate_epochs rename to daily_window_candidate_epochs_rollback_20260922;
+alter table if exists public.destination_identity_map rename to destination_identity_map_rollback_20260922;
 commit;
 notify pgrst,'reload schema';

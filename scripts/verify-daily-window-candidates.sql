@@ -4,6 +4,10 @@ set local lock_timeout='10s';
 do $$ declare test_owner uuid:='00000000-0000-4000-8000-000000000098'; f bigint; published boolean;
   pool_before jsonb; observed timestamptz:=clock_timestamp();
 begin
+  if (select count(*) from public.destination_identity_map)<>139
+    or (select destination_id from public.destination_identity_map where dest='GVA') is distinct from 'chamonix'
+    or (select destination_id from public.destination_identity_map where dest='ZRH') is distinct from 'zermatt'
+    then raise exception 'canonical destination identity mapping mismatch';end if;
   select fence into f from public.collection_scheduler_state where singleton and owner is null and lease_until is null for update;
   if f is null then raise exception 'scheduler is not idle';end if;
   update public.collection_scheduler_state set owner=test_owner,fence=f+1,run_id='window-candidate-sql-test',

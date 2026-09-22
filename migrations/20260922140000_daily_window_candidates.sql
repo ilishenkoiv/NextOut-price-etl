@@ -3,6 +3,45 @@
 begin;
 set local lock_timeout='10s';
 
+-- Canonical app identity for the currently published legacy flight catalogue. This is additive and
+-- nullable on roulette rows: unknown/future shared-airport identities stay NULL rather than guessed.
+create table if not exists public.destination_identity_map(
+  dest text primary key check(dest~'^[A-Z]{3}$'),
+  destination_id text not null unique check(length(btrim(destination_id)) between 1 and 120)
+);
+insert into public.destination_identity_map(dest,destination_id)
+select key,value from jsonb_each_text($mapping${
+  "ACE":"lanzarote","ADB":"izmir","AGA":"agadir","AGP":"malaga","ALA":"almaty","ALC":"alicante","AMS":"amsterdam","AQJ":"aqaba",
+  "ARN":"stockholm","ATH":"athens","AUH":"abudhabi","AYT":"antalya","BCN":"barcelona","BEG":"belgrade","BER":"berlin","BJV":"bodrum",
+  "BKK":"bangkok","BOJ":"burgas","BRN":"interlaken","BUD":"budapest","CAG":"sardinia","CAI":"cairo","CAN":"guangzhou","CDG":"paris",
+  "CFU":"corfu","CGN":"cologne","CHQ":"chania","CJU":"jeju","CMB":"colombo","CMN":"casablanca","CNX":"chiangmai","CPH":"copenhagen",
+  "CPT":"capetown","CTA":"catania","CTG":"cartagena","CTS":"sapporo","CUN":"cancun","DAD":"danang","DBV":"dubrovnik","DEL":"delhi",
+  "DJE":"djerba","DLM":"dalaman","DOH":"doha","DPS":"bali","DUB":"dublin","DUS":"dusseldorf","DXB":"dubai","EDI":"edinburgh",
+  "EZE":"buenosaires","FAO":"algarve","FCO":"rome","FLR":"florence","FNC":"madeira","FRA":"frankfurt","FUE":"fuerteventura","FUK":"fukuoka",
+  "GIG":"rio","GOI":"goa","GVA":"chamonix","HAM":"hamburg","HAN":"hanoi","HAV":"havana","HER":"crete","HKT":"phuket","HND":"tokyo",
+  "HNL":"hawaii","HRG":"hurghada","IBZ":"ibiza","ICN":"seoul","IST":"istanbul","JFK":"newyork","JTR":"santorini","KBV":"krabi",
+  "KEF":"reykjavik","KGS":"kos","KIX":"osaka","KRK":"krakow","KUL":"kualalumpur","LAX":"losangeles","LCA":"cyprus","LGK":"langkawi",
+  "LHR":"london","LIM":"lima","LIS":"lisbon","LJU":"ljubljana","LPA":"grancanaria","MCT":"muscat","MEX":"mexicocity","MIA":"miami",
+  "MLA":"malta","MLE":"maldives","MRS":"marseille","MRU":"mauritius","MUC":"munich","NAP":"naples","NBE":"hammamet","NBO":"nairobi",
+  "NCE":"nice","OPO":"porto","OTP":"bucharest","PEK":"beijing","PMI":"mallorca","PMO":"palermo","PRG":"prague","PUJ":"puntacana",
+  "PUS":"busan","PVG":"shanghai","RAK":"marrakech","RHO":"rhodes","RMF":"marsaalam","SCL":"santiago","SEZ":"seychelles","SFO":"sanfrancisco",
+  "SGN":"hochiminh","SIN":"singapore","SJJ":"sarajevo","SKG":"thessaloniki","SKP":"skopje","SOF":"sofia","SPU":"split","SSH":"sharm",
+  "STR":"stuttgart","SVQ":"seville","TAS":"tashkent","TBS":"tbilisi","TFS":"canaries","TFU":"chengdu","TIA":"tirana","TIV":"kotor",
+  "TLV":"telaviv","TNG":"tangier","VAR":"varna","VCE":"venice","VIE":"vienna","VLC":"valencia","YYZ":"toronto","ZAG":"zagreb",
+  "ZNZ":"zanzibar","ZRH":"zermatt"
+}$mapping$::jsonb) on conflict(dest) do update set destination_id=excluded.destination_id;
+alter table public.destination_identity_map enable row level security;
+revoke all on public.destination_identity_map from public,anon,authenticated;
+grant select,insert,update on public.destination_identity_map to service_role;
+
+alter table public.daily_origin_cheapest_pool add column if not exists destination_id text;
+alter table public.daily_origin_cheapest add column if not exists destination_id text;
+update public.daily_origin_cheapest_pool p set destination_id=m.destination_id from public.destination_identity_map m
+  where p.dest=m.dest and p.destination_id is distinct from m.destination_id;
+update public.daily_origin_cheapest p set destination_id=m.destination_id from public.destination_identity_map m
+  where p.dest=m.dest and p.destination_id is distinct from m.destination_id;
+grant select on public.daily_origin_cheapest_pool,public.daily_origin_cheapest to anon,authenticated;
+
 create table if not exists public.daily_window_candidate_epochs(
   observed_on date primary key,
   snapshot_at timestamptz not null unique,

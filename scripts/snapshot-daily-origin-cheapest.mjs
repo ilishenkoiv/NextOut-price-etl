@@ -4,6 +4,7 @@ import { marketForOrigin } from '../src/data/origin-markets.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { ORIGINS_ALL } from '../src/data/origins.js';
+import { destinationIdForIata } from '../src/data/destination-identities.js';
 
 export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
@@ -117,6 +118,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   flight_type: row.flight_type,
   rank: row.rank,
   dest: row.dest,
+  destination_id: destinationIdForIata(row.dest),
   price: Number(row.price),
   currency: 'EUR',
   departure_at: row.departure_at,
@@ -134,6 +136,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     market: row.market || marketForOrigin(row.origin),
     flight_type: row.flight_type,
     dest: row.dest,
+    destination_id: destinationIdForIata(row.dest),
     price: Number(row.price),
     currency: 'EUR',
     departure_at: row.departure_at,
