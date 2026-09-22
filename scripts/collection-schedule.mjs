@@ -40,6 +40,25 @@ export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0,
   return{requests,windowBatch,elapsedMs,lagMs:Math.max(0,elapsedMs-2*MINUTE),fitsReservedSlot:elapsedMs<=2*MINUTE};
 }
 
+// Capacity proof from production-measured sequential throughput. Unlike the older /48 planning
+// projection above, this models the actual recurring 30-minute cycle: audit and roulette freshness
+// are paid again every cycle before any selected-window group can advance.
+export function measuredPriorityCapacity({windowGroups,rouletteTickets=220,auditTickets=10,requestsPerMinute,
+  priorityMinutes=5,targetMinutes=30}){
+  if(![windowGroups,rouletteTickets,auditTickets,requestsPerMinute,priorityMinutes,targetMinutes].every(Number.isFinite)
+    ||windowGroups<0||rouletteTickets<0||auditTickets<0||requestsPerMinute<=0||priorityMinutes<=0||targetMinutes<=0)
+    throw new Error('Invalid measured capacity');
+  const recurringRequests=rouletteTickets+auditTickets;
+  const totalRequests=windowGroups+recurringRequests;
+  const priorityCapacity=Math.floor(requestsPerMinute*priorityMinutes);
+  const windowCapacity=Math.max(0,priorityCapacity-recurringRequests);
+  const cycles=windowGroups===0?1:windowCapacity===0?Infinity:Math.ceil(windowGroups/windowCapacity);
+  return{recurringRequests,totalRequests,priorityCapacity,windowCapacity,cycles,
+    fullRefreshMinutes:cycles*targetMinutes,exclusiveMinutes:totalRequests/requestsPerMinute,
+    requiredExclusiveRequestsPerMinute:totalRequests/targetMinutes,
+    requiredBudgetRequestsPerMinute:totalRequests/priorityMinutes};
+}
+
 export function slotAt(timestamp) {
   if (!Number.isFinite(timestamp) || timestamp < 0) throw new Error('Invalid clock');
   const cycle = Math.floor(timestamp / CYCLE_MS);

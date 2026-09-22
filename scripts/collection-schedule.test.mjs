@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, mainAtRisk, nominalSessionBudgets, priorityCycleProjection } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, mainAtRisk, nominalSessionBudgets, priorityCycleProjection, measuredPriorityCapacity } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -23,6 +23,19 @@ test('priority capacity is honest at maximum backlog: realistic latency fits, ti
   assert.deepEqual({requests:realistic.requests,windowBatch:realistic.windowBatch,fits:realistic.fitsReservedSlot},{requests:240,windowBatch:10,fits:true});
   const timeout=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:480,requestMs:8000});
   assert.equal(timeout.fitsReservedSlot,false);assert.ok(timeout.elapsedMs>30*60000);
+});
+
+test('measured production capacity includes recurring roulette/audit cost before window progress',()=>{
+  const measured=measuredPriorityCapacity({windowGroups:2591,rouletteTickets:220,auditTickets:10,requestsPerMinute:67.1,priorityMinutes:5});
+  assert.deepEqual({recurring:measured.recurringRequests,cap:measured.priorityCapacity,windows:measured.windowCapacity,cycles:measured.cycles},
+    {recurring:230,cap:335,windows:105,cycles:25});
+  assert.equal(measured.fullRefreshMinutes,750);
+  assert.ok(measured.exclusiveMinutes>42&&measured.exclusiveMinutes<42.1);
+  assert.ok(measured.requiredExclusiveRequestsPerMinute>94);
+  assert.ok(measured.requiredBudgetRequestsPerMinute>562);
+  const preserveMain=measuredPriorityCapacity({windowGroups:2591,requestsPerMinute:67.1,priorityMinutes:2});
+  assert.equal(preserveMain.windowCapacity,0,'two-minute priority allowance cannot even pay recurring roulette+audit');
+  assert.equal(preserveMain.cycles,Infinity);
 });
 
 test('unfinished main retains its date and cursor across midnight and a new runner', () => {

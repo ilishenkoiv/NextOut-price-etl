@@ -124,7 +124,7 @@ test('atomic publication failure leaves no completion write and a later catch-up
 
 // Recording double for the maintenance adapter: rpc() and a chainable from() that flags
 // any pool-table write. store.plan short-circuits to the supplied tickets.
-function maintenanceHarness(tickets, response, { lease = async () => true } = {}) {
+function maintenanceHarness(tickets, response, { lease = async () => true, replacements = {}, allowedDests = ['BCN','ATH','FCO'] } = {}) {
   const calls = [];
   const poolWrites = [];
   const db = {
@@ -141,15 +141,15 @@ function maintenanceHarness(tickets, response, { lease = async () => true } = {}
     },
     storage: { from: () => ({ list: async () => ({ data: [], error: null }), remove: async () => ({ data: {}, error: null }) }) },
   };
-  const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, plan: async () => ({ tickets }), runId: '1' };
+  const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, plan: async () => ({ tickets,replacements,allowedDests }), runId: '1' };
   let requests = 0;
-  const provider = { request: async () => { requests += 1; return response(requests); } };
+  const provider = { request: async url => { requests += 1; return response(requests,url); } };
   const adapters = createAdapters({ db, store, provider, clock: () => 1_700_000_000_000, wave: 0 });
   return { adapters, calls, poolWrites, get requests() { return requests; } };
 }
 
 const rouletteTicket = (dest, rank) => ({ origin: 'BER', dest, flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17', rank });
-const foundResponse = () => ({ kind: 'ok', json: { success: true, data: [{ origin: 'BER', destination: 'BCN', departure_at: '2027-01-10T06:00:00Z', return_at: '2027-01-17T20:00:00Z', price: 111, transfers: 1, currency: 'EUR' }] } });
+const foundResponse = (_n,url) => {const destination=new URL(url).searchParams.get('destination');return { kind: 'ok', json: { success: true, data: [{ origin: 'BER', destination, departure_at: '2027-01-10T06:00:00Z', return_at: '2027-01-17T20:00:00Z', price: 111, transfers: 1, currency: 'EUR' }] } };};
 const priorityCp = (cursor=0) => ({cycle:1,dueAt:0,phase:'roulette',auditDone:true,roulette:{cycle:1,cursor,done:false,errors:0}});
 
 test('refresh owner updates only fare/timestamp/provenance and never writes the pool', async () => {
@@ -165,13 +165,33 @@ test('refresh owner updates only fare/timestamp/provenance and never writes the 
   assert.equal(result.checkpoint.roulette.cursor, 1);
 });
 
-test('refresh owner does not recreate an unavailable ticket', async () => {
+test('confirmed unavailable target becomes explicitly exhausted only after replacement candidates are exhausted', async () => {
   const emptyResponse = () => ({ kind: 'ok', json: { success: true, data: [] } });
   const h = maintenanceHarness([rouletteTicket('BCN', 1)], emptyResponse);
-  await h.adapters.priority.step({ job: { id: 1, planDate: '2027-01-05', checkpoint: priorityCp() }, deadline: 1_700_000_200_000 });
+  const first=await h.adapters.priority.step({ job: { id: 1, planDate: '2027-01-05', checkpoint: priorityCp() }, deadline: 1_700_000_200_000 });
+  assert.equal(h.calls.length,0);assert.equal(first.checkpoint.roulette.pendingReplacement.ticket.dest,'BCN');
+  await h.adapters.priority.step({ job: { id: 1, planDate: '2027-01-05', checkpoint: first.checkpoint }, deadline: 1_700_000_200_000 });
   assert.equal(h.calls[0].name, 'collection_commit_roulette');
-  assert.equal(h.calls[0].args.p_result.status, 'no_result', 'unavailable fare is reported for deletion, not re-inserted');
-  assert.equal(h.poolWrites.length, 0, 'no pool row is created for an unavailable ticket');
+  assert.equal(h.calls[0].args.p_result.status, 'no_result');assert.equal(h.calls[0].args.p_result.replacement,null);
+});
+
+test('confirmed unavailable target is replaced only after the next city is live-verified',async()=>{
+  const target=rouletteTicket('BCN',1),candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const response=n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'ok',json:{success:true,data:[{origin:'BER',destination:'ATH',departure_at:'2027-01-10T06:00:00Z',return_at:'2027-01-17T20:00:00Z',price:135,transfers:1,currency:'EUR'}]}};
+  const h=maintenanceHarness([target],response,{replacements:{'BER|any':[candidate]}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  const call=h.calls.find(c=>c.name==='collection_commit_roulette');assert.equal(h.requests,2);
+  assert.equal(call.args.p_ticket.dest,'BCN');assert.equal(call.args.p_ticket.rank,1);
+  assert.equal(call.args.p_result.replacement.dest,'ATH');assert.equal(call.args.p_result.replacement.price,135);
+  assert.equal(second.checkpoint.roulette.cursor,1);assert.deepEqual(second.checkpoint.roulette.usedReplacementDests,['BER|ATH']);
+});
+
+test('technical roulette failure mutates neither pool nor offer and never starts replacement',async()=>{
+  const h=maintenanceHarness([rouletteTicket('BCN',1)],()=>({kind:'refused',refusal:'tooMany'}));
+  const result=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  assert.equal(h.calls.length,0);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);assert.equal(result.checkpoint.roulette.errors,1);
+  assert.equal(result.checkpoint.roulette.cursor,0,'technical failure remains checkpointed for retry');
 });
 
 test('refresh owner issues exactly one provider request per saved ticket', async () => {

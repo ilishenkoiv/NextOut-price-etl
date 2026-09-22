@@ -40,7 +40,9 @@ test('disposable SQL verification script exists and rolls fixture changes back',
 test('confirmed no-result follows one fenced audited replacement path; technical errors do not write',()=>{
   assert.match(replacementSql,/owner=p_owner[\s\S]*fence=p_token[\s\S]*lease_until>clock_timestamp\(\)[\s\S]*for update/);
   assert.match(replacementSql,/p_result->>'status'<>'no_result'[\s\S]*return true/);
-  assert.match(replacementSql,/not exists\(select 1 from public\.daily_origin_cheapest_pool[\s\S]*p\.dest=o\.dest\)/);
+  assert.match(replacementSql,/candidate\.flight_type is distinct from t\.flight_type/);
+  assert.match(replacementSql,/candidate\.updated_at<clock_timestamp\(\)-interval '30 minutes'/);
+  assert.match(replacementSql,/p\.dest=candidate\.dest/);
   assert.match(replacementSql,/delete from public\.daily_origin_cheapest_pool[\s\S]*insert into public\.daily_origin_cheapest_pool/);
   assert.match(replacementSql,/delete from public\.offers[\s\S]*insert into public\.roulette_pool_replacements/);
   assert.match(replacementSql,/outcome in \('replaced','exhausted'\)/);
@@ -49,5 +51,6 @@ test('confirmed no-result follows one fenced audited replacement path; technical
 test('real SQL-path regression is transactional and asserts replacement, idempotency boundary and error no-op',()=>{
   const verify=readFileSync(new URL('./verify-roulette-targeted-replacement.sql',import.meta.url),'utf8');
   assert.match(verify,/scheduler is not idle/);assert.match(verify,/targeted replacement assertion failed/);
+  assert.match(verify,/historical_rows_removed=2/);assert.match(verify,/targeted replacement idempotency assertion failed/);
   assert.match(verify,/technical error changed membership\/offer/);assert.match(verify,/rollback;\s*$/);
 });

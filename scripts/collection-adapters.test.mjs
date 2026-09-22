@@ -112,12 +112,12 @@ test('a saved wave is retained when the next runner has a different rollout sett
   const result=await f.adapters.main.step({job:{...job,checkpoint:{cursor:0,errors:0,wave:0}},deadline:200000});
   assert.equal(result.checkpoint.wave,0);
 });
-test('malformed roulette data preserves the existing offer and advances diagnostic progress',async()=>{
+test('malformed roulette data preserves the existing offer and checkpoints the same ticket for retry',async()=>{
   const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
   const f=fixture({tickets:[ticket]},()=>({kind:'ok',json:{success:true,data:{}}}));
   const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
   const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:200000});
-  assert.equal(f.calls[0].name,'collection_commit_roulette');
-  assert.equal(f.calls[0].args.p_result.status,'error');
+  assert.equal(f.calls.length,0,'technical/malformed results never mutate offers or pool');
   assert.equal(result.checkpoint.roulette.errors,1);
+  assert.equal(result.checkpoint.roulette.cursor,0);
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAdapters, selectWindowConsumerSet, windowConsumerSetId, groupWindowConsumerTickets } from './collection-adapters.mjs';
+import { createAdapters, selectWindowConsumerSet, windowConsumerSetId, groupWindowConsumerTickets, buildRouletteReplacementCandidates } from './collection-adapters.mjs';
 
 function chain(data){return new Proxy({}, {get:(_,key)=>key==='then'
   ? Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null}))
@@ -50,6 +50,17 @@ test('direct+any rows for one exact route/date use one provider request group wi
     {origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',window_kind:'weekend'}];
   const groups=groupWindowConsumerTickets(rows);assert.equal(groups.length,1);assert.deepEqual(groups[0].map(r=>r.flight_type),['any','direct']);
   assert.equal(groups[0].length,rows.length);
+});
+
+test('roulette replacement seeds preserve mode and exclude every city already in the pool',()=>{
+  const pool=[{origin:'BER',dest:'BCN',flight_type:'any'}];
+  const common={origin:'BER',market:'de',departure_at:'2026-10-10',return_at:'2026-10-17',price:100,updated_at:'2026-09-22T10:00:00Z'};
+  const offers=[{...common,dest:'ATH',flight_type:'direct',transfers:0},{...common,dest:'ATH',flight_type:'any',transfers:1,price:110},
+    {...common,dest:'BCN',flight_type:'any',transfers:1,price:90}];
+  const result=buildRouletteReplacementCandidates(offers,pool,['BCN','ATH'],'2026-09-22');
+  assert.deepEqual(result['BER|direct'].map(row=>row.dest),['ATH']);
+  assert.deepEqual(result['BER|any'].map(row=>row.dest),['ATH']);
+  assert.equal(Object.values(result).flat().some(row=>row.dest==='BCN'),false);
 });
 
 test('empty and expired selected sets finish without provider calls',async()=>{
