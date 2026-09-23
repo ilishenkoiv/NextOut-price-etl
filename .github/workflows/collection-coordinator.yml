@@ -19,6 +19,11 @@ on:
         description: 'Manual bounded collection duration; ignored by schedules'
         type: string
         default: '15'
+      trigger_source:
+        description: 'Dispatch provenance only; does not change collection behavior'
+        type: choice
+        options: [manual, supabase-cron]
+        default: manual
 concurrency:
   group: nextout-data-collection
   queue: max
@@ -32,26 +37,39 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Record trigger provenance
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TRIGGER_SOURCE: ${{ inputs.trigger_source || 'manual' }}
+        run: echo "Collection trigger source=${TRIGGER_SOURCE}"
       - uses: actions/checkout@v7
+        if: inputs.trigger_source != 'supabase-cron' || vars.COLLECTION_MODE == 'coordinated'
         with:
           persist-credentials: false
       - uses: actions/setup-node@v6
+        if: inputs.trigger_source != 'supabase-cron' || vars.COLLECTION_MODE == 'coordinated'
         with:
           node-version: '22'
           cache: npm
-      - run: npm ci
+      - if: inputs.trigger_source != 'supabase-cron' || vars.COLLECTION_MODE == 'coordinated'
+        run: npm ci
       - name: Verify applied SQL without writing data
-        if: github.event_name == 'workflow_dispatch' && inputs.rollout_action == 'none' && inputs.validate_only
+        if: github.event_name == 'workflow_dispatch' && inputs.trigger_source != 'supabase-cron' && inputs.rollout_action == 'none' && inputs.validate_only
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/check-collection-ready.mjs
       - name: Resume one sequential collector
-        if: github.event_name != 'workflow_dispatch' || (inputs.rollout_action == 'none' && !inputs.validate_only)
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          (inputs.rollout_action == 'none' &&
+            ((inputs.trigger_source == 'supabase-cron' && vars.COLLECTION_MODE == 'coordinated') ||
+             (inputs.trigger_source != 'supabase-cron' && !inputs.validate_only)))
         env:
-          COLLECTION_MODE: ${{ github.event_name == 'workflow_dispatch' && 'coordinated' || vars.COLLECTION_MODE }}
-          COLLECTION_SESSION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '25' }}
+          COLLECTION_MODE: ${{ inputs.trigger_source == 'supabase-cron' && vars.COLLECTION_MODE || (github.event_name == 'workflow_dispatch' && 'coordinated' || vars.COLLECTION_MODE) }}
+          COLLECTION_SESSION_MINUTES: ${{ inputs.trigger_source == 'supabase-cron' && '25' || (github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '25') }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          COLLECTION_TRIGGER_SOURCE: ${{ inputs.trigger_source || github.event_name }}
           EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
           GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}

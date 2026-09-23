@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection } from './run-collection.mjs';
+import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger } from './run-collection.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
 
 const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'utf8');
@@ -20,6 +20,13 @@ test('scheduled same-cycle work exits as not due, but a new priority cycle or da
   assert.equal(scheduledCollectionDue(state,instant),false);
   assert.equal(scheduledCollectionDue({...state,jobs:{priority:{id:cycle-1,done:true}}},instant),true);
   assert.equal(scheduledCollectionDue({...state,dailySelection:{day:'2026-09-22',rouletteDone:true,windowDone:true}},instant),true);
+});
+
+test('Supabase dispatch records narrow provenance and uses the same automated due gate',()=>{
+  const env={GITHUB_EVENT_NAME:'workflow_dispatch',COLLECTION_TRIGGER_SOURCE:'supabase-cron'};
+  assert.equal(collectionTriggerSource(env),'supabase-cron');assert.equal(isAutomatedTrigger(env),true);
+  assert.equal(isAutomatedTrigger({GITHUB_EVENT_NAME:'workflow_dispatch',COLLECTION_TRIGGER_SOURCE:'manual'}),false);
+  assert.throws(()=>collectionTriggerSource({COLLECTION_TRIGGER_SOURCE:'unsafe source'}),/Invalid collection trigger source/);
 });
 
 test('due daily selection is serialized by the lease and fenced after each checkpoint phase',async()=>{
