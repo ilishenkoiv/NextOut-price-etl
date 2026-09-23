@@ -1,9 +1,5 @@
 name: Sequential data collection
 on:
-  schedule:
-    # Six dispatch opportunities per 30-minute SLA window. The coordinator itself admits at
-    # most one due cycle; same-cycle triggers claim/release and exit immediately.
-    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
   workflow_dispatch:
     inputs:
       rollout_action:
