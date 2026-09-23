@@ -73,7 +73,12 @@ export async function main(env=process.env){
         console.log(JSON.stringify({task:result.task,status:result.status,cycle:result.cycle,providerRequests:provider.requests,
           completedMain:engine.state.completedMain,missedFast:engine.state.missedFast,missedPriority:engine.state.missedPriority,
           priorityLagMs:engine.state.jobs.priority?.checkpoint?.lagMs,
-          progress:Object.fromEntries(Object.entries(engine.state.jobs).map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
+          progress:Object.fromEntries(Object.entries(engine.state.jobs).map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,
+            errors:j.checkpoint?.errors,...(k==='priority'?{phase:j.checkpoint?.phase,
+              roulette:{cursor:j.checkpoint?.roulette?.cursor,total:j.checkpoint?.roulette?.total,done:j.checkpoint?.roulette?.done,
+                snapshotAt:j.checkpoint?.roulette?.snapshotAt},
+              window:{cursor:j.checkpoint?.weekend?.cursor,total:j.checkpoint?.weekend?.total,done:j.checkpoint?.weekend?.done,
+                snapshotAt:j.checkpoint?.weekend?.snapshotAt}}:{})}]))}));
         lastReport=Date.now();
       }
       if(result.status==='idle')await new Promise(resolve=>setTimeout(resolve,Math.min(15000,Math.max(1000,result.deadline-Date.now()))));
