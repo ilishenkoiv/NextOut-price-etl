@@ -55,6 +55,14 @@ test('real adapters with normal latency complete priority and advance MAIN with 
   assert.ok(p.checkpoint.weekend.fullCycleMs>0);assert.ok(h.engine.state.jobs.main.activeMs>0);assert.ok(h.provider.requests>=40);
 });
 
+test('live 220 + 459 priority workload finishes inside the 15-minute ceiling and leaves MAIN/FAST/TAIL schedulable',async()=>{
+  const h=harness({latencyMs:674,roulette:220,windows:459});await driveCycle(h);
+  const state=h.engine.state,p=state.jobs.priority;
+  assert.equal(p.done,true);assert.equal(p.checkpoint.roulette.cursor,220);assert.equal(p.checkpoint.weekend.cursor,459);
+  assert.ok((state.frame.prioritySpentMs??0)<=PRIORITY_MAX_CYCLE_MS+1000);
+  assert.ok(state.jobs.main?.activeMs>0);assert.ok(state.jobs.fast);assert.ok(state.jobs.tail);
+});
+
 test('429/backoff-style boundary yield checkpoints priority and lets lower work run instead of waiting forever',async()=>{
   const h=harness({latencyMs:250,roulette:5,windows:5});
   h.provider.request=async()=>{h.setNow(h.now+65000);throw new CollectionYield('429 Retry-After exceeds boundary');};

@@ -103,22 +103,14 @@ test('legacy standalone workflow is preserved unchanged behind COLLECTION_MODE',
   assert.match(workflow, /node scripts\/refresh-roulette-prices\.mjs/, 'legacy refresh code is retained for manual fallback');
 });
 
-test('Stage 3: the nightly selection workflow is the single, once-per-day selection owner', () => {
-  const workflow = readFileSync(
+test('single coordinator owns scheduled daily selection; standalone selector is manual recovery only', () => {
+  const recovery = readFileSync(
     new URL('../.github/workflows/nightly-cheapest-selection.yml', import.meta.url),
     'utf8',
   );
-  assert.match(workflow, /name: Nightly cheapest offers selection/);
-  // One daily selection at ~03:30 Europe/Berlin.
-  assert.match(workflow, /cron: '30 3 \* \* \*'/);
-  assert.match(workflow, /timezone: 'Europe\/Berlin'/);
-  // Same-day catch-up after a completed coordinator run (guarded → at most once/day).
-  assert.match(workflow, /workflow_run:\s*\n\s+workflows: \['Sequential data collection'\]\s*\n\s+types: \[completed\]/);
-  // Serialized with every other data job so two selections can never run at once.
-  assert.match(workflow, /group: nextout-data-collection/);
-  assert.match(workflow, /queue: max/);
-  assert.match(workflow, /vars.COLLECTION_MODE == 'coordinated'/);
-  // It runs the selection owner, and issues no provider requests (not a refresh workflow).
-  assert.match(workflow, /node scripts\/snapshot-daily-origin-cheapest\.mjs/);
-  assert.doesNotMatch(workflow, /refresh-roulette-prices/);
+  const coordinator=readFileSync(new URL('./run-collection.mjs',import.meta.url),'utf8');
+  assert.match(recovery,/name: Nightly cheapest offers selection/);assert.match(recovery,/workflow_dispatch:/);
+  assert.doesNotMatch(recovery,/^\s*schedule:/m);assert.doesNotMatch(recovery,/^\s*workflow_run:/m);
+  assert.match(coordinator,/runDueDailySelection/);assert.match(coordinator,/nightlySelectionDue/);
+  assert.match(coordinator,/store\.lease\(\)/);assert.match(coordinator,/store\.save\(state\)/);
 });

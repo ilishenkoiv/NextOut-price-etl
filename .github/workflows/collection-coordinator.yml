@@ -1,7 +1,9 @@
 name: Sequential data collection
 on:
   schedule:
-    - cron: '7 */4 * * *'
+    # Six dispatch opportunities per 30-minute SLA window. The coordinator itself admits at
+    # most one due cycle; same-cycle triggers claim/release and exit immediately.
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
   workflow_dispatch:
     inputs:
       rollout_action:
@@ -28,7 +30,7 @@ jobs:
   collect:
     if: vars.COLLECTION_MODE == 'coordinated' || (github.event_name == 'workflow_dispatch' && inputs.rollout_action == 'none')
     runs-on: ubuntu-latest
-    timeout-minutes: 250
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,7 +50,8 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || (inputs.rollout_action == 'none' && !inputs.validate_only)
         env:
           COLLECTION_MODE: ${{ github.event_name == 'workflow_dispatch' && 'coordinated' || vars.COLLECTION_MODE }}
-          COLLECTION_SESSION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '235' }}
+          COLLECTION_SESSION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '25' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
           EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
           GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}
@@ -86,4 +89,4 @@ jobs:
           name: etl-rollout-${{ inputs.rollout_action }}-${{ github.run_id }}
           path: rollout-output/**
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ inputs.rollout_action == 'probe' && 7 || 30 }}

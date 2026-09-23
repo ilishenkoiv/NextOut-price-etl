@@ -92,9 +92,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   }
 
   const main = {
-    // Main no longer publishes the roulette pool. Selection is owned exclusively by the
-    // nightly `Nightly cheapest offers selection` workflow (scripts/snapshot-daily-origin-cheapest.mjs);
-    // the main pass only refreshes source offers and completes. No 480s snapshot unit needed.
+    // Main does not publish the roulette pool. The coordinator's checkpointed daily-selection
+    // phase owns membership before the schedule engine starts; MAIN only refreshes source offers.
     // Four mandatory upstream calls (two return windows × direct/any) need more than the former
     // 30s unit at the 8s timeout. 75s work / 90s admission preserves the boundary guard.
     maxUnitMs: 90_000,
@@ -176,8 +175,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const path=`snapshots/${date.slice(0,4)}/${date.slice(5,7)}/${date}_${hhmm}_coordinator-${job.id}.csv.gz`;
           const body=gzipSync(csv);
           await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true});
-          // The pass is complete once its private CSV is preserved. Selection (roulette pool
-          // membership/order/rank) is NOT done here — it is the nightly selection owner's job.
+          // The pass is complete once its private CSV is preserved. Daily selection remains the
+          // coordinator pre-phase and is never coupled to MAIN completion.
           return {status:'done',checkpoint:{...cp,stage:'complete',snapshotPath:path}};
         }
         return { status:'progress',checkpoint:cp };

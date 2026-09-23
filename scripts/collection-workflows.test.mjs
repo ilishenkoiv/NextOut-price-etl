@@ -16,13 +16,22 @@ test('every old main/window/audit/snapshot job is disabled in coordinated mode',
     assert.equal(gates,jobs,file);
   }
 });
-test('new worker remains opt-in and leaves time to save before the Actions timeout',()=>{
+test('single coordinator uses frequent triggers, a bounded due session and no scheduled artifacts',()=>{
   const text=fs.readFileSync(new URL('collection-coordinator.yml',dir),'utf8');
   assert.match(text,/if: vars.COLLECTION_MODE == 'coordinated'/);
   assert.match(text,/smoke_minutes:[\s\S]*default: '15'/);
-  assert.match(text,/COLLECTION_SESSION_MINUTES:.*inputs\.smoke_minutes \|\| '235'/);
-  assert.match(text,/timeout-minutes: 250/);
+  assert.match(text,/cron: '3,8,13,18,23,28,33,38,43,48,53,58 \* \* \* \*'/);
+  assert.match(text,/COLLECTION_SESSION_MINUTES:.*inputs\.smoke_minutes \|\| '25'/);
+  assert.match(text,/GITHUB_EVENT_NAME:.*github\.event_name/);
+  assert.match(text,/timeout-minutes: 30/);
   assert.match(text,/EXPANSION_WAVE:.*\|\| '0'/);
+  assert.equal((text.match(/actions\/upload-artifact/g)??[]).length,1,'only manual rollout-control creates an artifact');
+  assert.match(text,/retention-days:.*rollout_action == 'probe'.*7.*30/);
+});
+
+test('nightly selector is retained as manual recovery only',()=>{
+  const text=fs.readFileSync(new URL('nightly-cheapest-selection.yml',dir),'utf8');
+  assert.match(text,/workflow_dispatch:/);assert.doesNotMatch(text,/^\s*schedule:/m);assert.doesNotMatch(text,/^\s*workflow_run:/m);
 });
 test('coordinator wires GUARANTEE_DAILY_MAIN into the collector whenever the script honors it',()=>{
   // Contract test: run-collection.mjs gates the daily-main guarantee on env.GUARANTEE_DAILY_MAIN.

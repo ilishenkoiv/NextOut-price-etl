@@ -10,8 +10,8 @@ on:
     types: [completed]
   workflow_dispatch:
 
-# Coordinated mode moves exact refresh into the worker's priority cycle and selection into the
-# guarded nightly workflow. The
+# Coordinated mode moves exact refresh and checkpointed daily selection into the single worker.
+# The
 # shared queue:max lock also serializes the preserved legacy/manual fallback.
 concurrency:
   group: nextout-data-collection

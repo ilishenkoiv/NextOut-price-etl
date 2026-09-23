@@ -2,7 +2,7 @@ name: Refresh cheapest carousel prices
 
 # Manual rollback/fallback owner only. In coordinated mode the SINGLE price-refresh owner is
 # the priority adapter inside Sequential data collection; keeping a second scheduled workflow
-# would reintroduce the 235-minute lock and idle-gate conflict. This fallback revalidates tickets
+# would reintroduce a second writer and idle-gate conflict. This fallback revalidates tickets
 # already in the latest roulette pool: one Travelpayouts request per saved ticket, updating the
 # matching offer's price/timestamp/provenance in place, or deleting that offer when the fare is
 # confirmed gone (the existing retention rule). It NEVER selects: it does not rebuild pool

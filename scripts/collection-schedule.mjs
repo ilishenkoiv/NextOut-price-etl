@@ -7,7 +7,11 @@ export const MAIN_CYCLE_MS = 24 * 60 * MINUTE;    // one main pass/day
 // Reserve kept when judging whether the current main pass can still finish within MAIN_CYCLE_MS.
 // A pass is "at risk" once its realized pace can no longer reach the end with this much slack.
 export const MAIN_DEADLINE_RESERVE = 0.2;
-export const PRIORITY_MAX_CYCLE_MS = 5 * MINUTE;
+// Live 2026-09-23 throughput sustained ~89 sequential requests/minute. The current complete
+// priority workload (220 roulette tickets + 459 saved-window groups + observed replacement
+// overhead) projects to ~10.6 minutes, so 15 minutes preserves a measured ~29% reserve while
+// leaving the other half of every cycle to FAST, MAIN, TAIL and maintenance.
+export const PRIORITY_MAX_CYCLE_MS = 15 * MINUTE;
 export const LOWER_PHASE_RESERVE_MS = 2 * MINUTE;
 export const SLOTS = Object.freeze([
   { from: 0, to: 2, task: 'priority' },
@@ -32,19 +36,29 @@ export function nominalSessionBudgets(start, durationMs) {
   return budgets;
 }
 
-export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0, windowTickets = 0, requestMs }) {
-  if (![auditTickets,rouletteTickets,windowTickets,requestMs].every(Number.isFinite) || requestMs < 0) throw new Error('Invalid priority projection');
-  const windowBatch=Math.ceil(Math.max(0,windowTickets)/48);
-  const requests=Math.max(0,auditTickets)+Math.max(0,rouletteTickets)+windowBatch;
+export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0, windowTickets = 0, replacementRequests = 0, requestMs }) {
+  if (![auditTickets,rouletteTickets,windowTickets,replacementRequests,requestMs].every(Number.isFinite) || requestMs < 0) throw new Error('Invalid priority projection');
+  const windowRequests=Math.max(0,windowTickets);
+  const requests=Math.max(0,auditTickets)+Math.max(0,rouletteTickets)+windowRequests+Math.max(0,replacementRequests);
   const elapsedMs=requests*requestMs;
-  return{requests,windowBatch,elapsedMs,lagMs:Math.max(0,elapsedMs-2*MINUTE),fitsReservedSlot:elapsedMs<=2*MINUTE};
+  return{requests,windowRequests,elapsedMs,lagMs:Math.max(0,elapsedMs-PRIORITY_MAX_CYCLE_MS),fitsReservedSlot:elapsedMs<=PRIORITY_MAX_CYCLE_MS};
+}
+
+export function projectMonthlyRunnerUsage({triggerMinutes,dueSessionMinutes=25,dueEveryMinutes=30,noDueSeconds=10,days=30}){
+  if(![triggerMinutes,dueSessionMinutes,dueEveryMinutes,noDueSeconds,days].every(Number.isFinite)||triggerMinutes<=0||dueSessionMinutes<=0
+    ||dueEveryMinutes<=0||noDueSeconds<0||days<=0)throw new Error('Invalid runner usage projection');
+  const totalMinutes=days*24*60,triggers=Math.ceil(totalMinutes/triggerMinutes),dueRuns=Math.ceil(totalMinutes/dueEveryMinutes);
+  const noDueRuns=Math.max(0,triggers-dueRuns);
+  return{triggerMinutes,triggers,dueRuns,noDueRuns,
+    rawRunnerMinutes:dueRuns*dueSessionMinutes+noDueRuns*noDueSeconds/60,
+    roundedJobMinutes:dueRuns*Math.ceil(dueSessionMinutes)+noDueRuns*Math.max(1,Math.ceil(noDueSeconds/60))};
 }
 
 // Capacity calculator for a supplied workload. The former 2,591-group input is now explicitly a
 // cache-inventory scenario, not an approved daily selection: app-selected server membership remains
 // a product/interface gate. Audit and roulette costs recur before whichever window set is supplied.
 export function measuredPriorityCapacity({windowGroups,rouletteTickets=220,auditTickets=10,requestsPerMinute,
-  priorityMinutes=5,targetMinutes=30}){
+  priorityMinutes=15,targetMinutes=30}){
   if(![windowGroups,rouletteTickets,auditTickets,requestsPerMinute,priorityMinutes,targetMinutes].every(Number.isFinite)
     ||windowGroups<0||rouletteTickets<0||auditTickets<0||requestsPerMinute<=0||priorityMinutes<=0||targetMinutes<=0)
     throw new Error('Invalid measured capacity');
