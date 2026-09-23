@@ -35,6 +35,17 @@ export function scheduledCollectionDue(state, instant=Date.now()) {
   return priorityDue||selectionDue;
 }
 
+export function collectionTriggerSource(env={}){
+  const source=String(env.COLLECTION_TRIGGER_SOURCE||env.GITHUB_EVENT_NAME||'manual');
+  if(!/^[a-z0-9-]{1,32}$/.test(source))throw new Error('Invalid collection trigger source');
+  return source;
+}
+
+export function isAutomatedTrigger(env={}){
+  const source=collectionTriggerSource(env);
+  return env.GITHUB_EVENT_NAME==='schedule'||source==='supabase-cron';
+}
+
 // Daily membership publication is now a checkpointed coordinator phase. It runs after the
 // single database claim, verifies the lease before each idempotent once/day publication and
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
@@ -71,6 +82,8 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
 export async function main(env=process.env){
   if(env.COLLECTION_MODE!=='coordinated')throw new Error('Coordinated mode has not been enabled');
   for(const key of ['TP_TOKEN','SUPABASE_SERVICE_KEY','GITHUB_TOKEN'])if(!env[key])throw new Error(`Missing required ${key}`);
+  const triggerSource=collectionTriggerSource(env),automated=isAutomatedTrigger(env);
+  console.log(JSON.stringify({event:'collection_trigger',source:triggerSource,githubEvent:env.GITHUB_EVENT_NAME||null}));
   const wave=Number(env.EXPANSION_WAVE??0);expansionTargets(wave);
   const minutes=Number(env.COLLECTION_SESSION_MINUTES??25);
   if(!Number.isInteger(minutes)||minutes<1||minutes>240)throw new Error('Session must be 1–240 minutes');
@@ -92,8 +105,8 @@ export async function main(env=process.env){
     if(!await oldRunnerHasStopped(previous,{repository:env.GITHUB_REPOSITORY,token:env.GITHUB_TOKEN}))throw new Error('Old runner not confirmed stopped; refusing overlap');
     const state=await store.claim(previous?.owner??null)??freshScheduleState();claimed=true;
     if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
-    if(env.GITHUB_EVENT_NAME==='schedule'&&!scheduledCollectionDue(state)){
-      console.log(JSON.stringify({event:'collection_not_due',cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
+    if(automated&&!scheduledCollectionDue(state)){
+      console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
     }
     await runDueDailySelection({state,store,db,wave});
     const end=Date.now()+minutes*60000;
@@ -118,7 +131,7 @@ export async function main(env=process.env){
         lastReport=Date.now();
       }
       if(result.status==='idle'){
-        if(env.GITHUB_EVENT_NAME==='schedule')break;
+        if(automated)break;
         await new Promise(resolve=>setTimeout(resolve,Math.min(15000,Math.max(1000,result.deadline-Date.now()))));
       }
     }

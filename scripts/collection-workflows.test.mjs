@@ -21,7 +21,11 @@ test('single coordinator uses frequent triggers, a bounded due session and no sc
   assert.match(text,/if: vars.COLLECTION_MODE == 'coordinated'/);
   assert.match(text,/smoke_minutes:[\s\S]*default: '15'/);
   assert.match(text,/cron: '3,8,13,18,23,28,33,38,43,48,53,58 \* \* \* \*'/);
-  assert.match(text,/COLLECTION_SESSION_MINUTES:.*inputs\.smoke_minutes \|\| '25'/);
+  assert.match(text,/trigger_source:[\s\S]*options: \[manual, supabase-cron\]/);
+  assert.match(text,/Collection trigger source=\$\{TRIGGER_SOURCE\}/);
+  assert.match(text,/COLLECTION_SESSION_MINUTES:.*trigger_source == 'supabase-cron'.*'25'/);
+  assert.match(text,/COLLECTION_TRIGGER_SOURCE:.*inputs\.trigger_source/);
+  assert.match(text,/inputs\.trigger_source == 'supabase-cron' && vars\.COLLECTION_MODE == 'coordinated'/);
   assert.match(text,/GITHUB_EVENT_NAME:.*github\.event_name/);
   assert.match(text,/timeout-minutes: 30/);
   assert.match(text,/EXPANSION_WAVE:.*\|\| '0'/);
