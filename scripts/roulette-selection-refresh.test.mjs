@@ -321,17 +321,16 @@ test('published legacy selection/refresh workflow remains preserved behind the m
 
 // ---- Source invariants: only the owner mutates pool membership ------------------------
 
-test('no coordinator path performs selection — the nightly owner is the only selector', () => {
+test('selection is owned by the coordinator pre-phase, not by a collector adapter or end-of-session hook', () => {
   const adapters = readFileSync(new URL('./collection-adapters.mjs', import.meta.url), 'utf8');
   const runCollection = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'utf8');
   const poolWrite = /daily_origin_cheapest_pool'\)\s*\.\s*(?:insert|upsert|update|delete)/;
-  // Stage 3: neither coordinator file may write the pool NOR import/call the selection script.
   assert.doesNotMatch(adapters, poolWrite, 'adapters never write pool membership');
-  assert.doesNotMatch(runCollection, poolWrite, 'the coordinator session never writes the pool');
+  assert.doesNotMatch(runCollection, poolWrite, 'the coordinator uses guarded publication RPCs, not table writes');
   assert.doesNotMatch(adapters, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m, 'main does not import the selection module');
-  assert.doesNotMatch(adapters, /publishSnapshot\s*\(/, 'main no longer calls selection');
-  assert.doesNotMatch(runCollection, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m, 'the coordinator does not import the selection module');
-  assert.doesNotMatch(runCollection, /publishSnapshot\s*\(/, 'end-of-session no longer calls selection');
+  assert.match(runCollection, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
+  assert.match(runCollection, /runDueDailySelection\(\{state,store,db,wave\}\)/);
+  assert.doesNotMatch(runCollection, /publishEndOfSessionPool|shouldPublishEndOfSession/);
 });
 
 test('standalone legacy refresh remains price-only and never rebuilds the pool', () => {
@@ -343,6 +342,6 @@ test('standalone legacy refresh remains price-only and never rebuilds the pool',
 
 test('manual nightly selection can publish the guarded rollout epoch while global mode stays paused',()=>{
   const workflow=readFileSync(new URL('../.github/workflows/nightly-cheapest-selection.yml',import.meta.url),'utf8');
-  assert.match(workflow,/vars\.COLLECTION_MODE == 'coordinated' \|\| github\.event_name == 'workflow_dispatch'/);
+  assert.match(workflow,/workflow_dispatch:/);assert.doesNotMatch(workflow,/^\s*schedule:/m);
   assert.match(workflow,/snapshot-daily-window-candidates\.mjs/);
 });

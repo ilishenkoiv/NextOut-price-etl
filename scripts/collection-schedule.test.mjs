@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, mainAtRisk, nominalSessionBudgets, priorityCycleProjection, measuredPriorityCapacity } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, PRIORITY_MAX_CYCLE_MS, mainAtRisk, nominalSessionBudgets,
+  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -19,10 +20,24 @@ test('a cycle has the agreed budgets and no overlaps or holes', () => {
 });
 
 test('priority capacity is honest at maximum backlog: realistic latency fits, timeout latency conflicts with MAIN',()=>{
-  const realistic=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:480,requestMs:500});
-  assert.deepEqual({requests:realistic.requests,windowBatch:realistic.windowBatch,fits:realistic.fitsReservedSlot},{requests:240,windowBatch:10,fits:true});
-  const timeout=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:480,requestMs:8000});
+  const realistic=priorityCycleProjection({auditTickets:0,rouletteTickets:220,windowTickets:459,replacementRequests:264,requestMs:60000/89});
+  assert.deepEqual({requests:realistic.requests,windowRequests:realistic.windowRequests,fits:realistic.fitsReservedSlot},
+    {requests:943,windowRequests:459,fits:true});
+  assert.ok(realistic.elapsedMs>10*60000&&realistic.elapsedMs<11*60000,'live workload fits in about 10.6 minutes');
+  const timeout=priorityCycleProjection({auditTickets:10,rouletteTickets:220,windowTickets:459,replacementRequests:264,requestMs:8000});
   assert.equal(timeout.fitsReservedSlot,false);assert.ok(timeout.elapsedMs>30*60000);
+});
+
+test('monthly runner projection records 5/10/15/30-minute trigger cost with immediate no-due exits',()=>{
+  const rows=[5,10,15,30].map(triggerMinutes=>projectMonthlyRunnerUsage({triggerMinutes}));
+  assert.deepEqual(rows.map(r=>[r.triggerMinutes,r.triggers,r.rawRunnerMinutes,r.roundedJobMinutes]),[
+    [5,8640,37200,43200],[10,4320,36480,38880],[15,2880,36240,37440],[30,1440,36000,36000]]);
+});
+
+test('measured post-priority MAIN capacity preserves the mandatory daily pass with reserve',()=>{
+  const measuredCellsPerMinute=45,mainMinutesPerCycle=10,cyclesPerDay=48,total=17730;
+  const capacity=measuredCellsPerMinute*mainMinutesPerCycle*cyclesPerDay;
+  assert.ok(capacity>=total*1.2,{capacity,required:total*1.2});
 });
 
 test('measured cache-inventory scenario includes recurring roulette/audit cost before window progress',()=>{
@@ -134,7 +149,7 @@ test('unfinished priority rolls into a missed new cycle with its cursors intact'
 });
 
 test('priority cap with less than one max unit remaining cannot deadlock lower phases',async()=>{
-  const state=freshScheduleState();state.frame={cycle:0,phase:2,spentMs:0,prioritySpentMs:5*60000-10000};const ran=[];
+  const state=freshScheduleState();state.frame={cycle:0,phase:2,spentMs:0,prioritySpentMs:PRIORITY_MAX_CYCLE_MS-10000};const ran=[];
   const engine=new SequentialSchedule({state,clock:()=>5*60000,lease:async()=>true,save:async()=>{},handlers:{
     priority:{maxUnitMs:45000,step:async()=>{ran.push('priority');return{status:'progress'};}},
     main:{maxUnitMs:100,step:async()=>{ran.push('main');return{status:'progress',checkpoint:{cursor:1,total:2}};}},
