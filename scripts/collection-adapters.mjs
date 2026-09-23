@@ -17,6 +17,9 @@ const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
 const DAY = 86400000;
 export const PRIORITY_AUDIT_BATCH = 10;
+// Keep the scheduler's admission bound identical to the adapter's own hard deadline.
+// A larger advertised unit strands usable time at the end of the five-minute priority budget.
+export const PRIORITY_UNIT_MAX_MS = 35_000;
 export const MAIN_REQUIRED_PROVIDER_CALLS = 4;
 export function projectMainCellMs({requestMs,dbMs=0,calendarFallback=false,retryCalls=0}){
   if(![requestMs,dbMs,retryCalls].every(Number.isFinite)||requestMs<0||dbMs<0||retryCalls<0)throw new Error('Invalid MAIN projection');
@@ -284,13 +287,13 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // order: one exact feedback claim, the complete saved roulette pool, then the durable saved-window
   // cursor. Every request uses the same provider and fenced lease. Window membership remains a
   // separately blocked product/app contract; the scheduler never invents a top-N cap.
-  const priority={maxUnitMs:45000,async step({job,deadline}){
+  const priority={maxUnitMs:PRIORITY_UNIT_MAX_MS,async step({job,deadline}){
     const previous=structuredClone(job.checkpoint??{});const now=clock();const today=berlinDay(now);
     const pendingRoulette=previous.roulette&&!previous.roulette.done?previous.roulette:null;
     const cp=previous.cycle===job.id?previous:{...previous,cycle:job.id,dueAt:job.id*30*60*1000,
       phase:'audit',auditDone:false,auditProcessed:0,
       roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id}:{cycle:job.id,cursor:0,errors:0,done:false}};
-    deadline=Math.min(deadline,clock()+35000);
+    deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
     try {
       if(cp.phase==='audit'){
         const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline);
