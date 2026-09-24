@@ -29,6 +29,21 @@
 //    cascading the whole tick() to `status:'idle'` well before MAIN's nominal 23-minute budget (or
 //    even the 25-minute session budget) is exhausted.
 //
+// SECOND OBSERVATION (2026-09-24T18:30Z, cycle 994597, run 36041653012, GUARANTEE_DAILY_MAIN=true,
+// wave 43, OFF_CYCLE_MAIN_MINUTES/PRIORITY_MARKET_SCHEDULE both unset — same flags-off production
+// as run 35885635003 above): priority overran almost the entire 25-minute due session
+// (priorityLagMs reported 568,628-1,306,860ms of backlog across the session; priority did not
+// report status:'done' until 18:39:28, ~9 minutes before session end) and MAIN's checkpoint only
+// moved once, from cursor 1906 to 1985 (+79 cells) in the ~68s between priority's done event and
+// the next tail progress report. +79 in one tick is the same order of magnitude as the first
+// data point's +89, not the old continuous-rate model's 318 — a second independent confirmation
+// of the bounded-single-tick failure mode this file models, under a *worse* real overrun than the
+// first sample. It also independently corroborates the plan doc's flags-off multi-day estimate:
+// production's MAIN cursor was 1985/23,952 (8.3%) at this timestamp. This is a documented
+// observation, not a strict-tolerance replay test (unlike the first point) — the exact
+// priority-overrun timing that produced it is not fully recoverable from step-level logs alone
+// (see MEASUREMENT GAP below), so it is not asserted to a fixed delta in main-24h-sim.test.mjs.
+//
 // (1) is now modeled exactly (imported real constants). (2) is the harder, timing-sensitive part:
 // whether a real due session gets 1 tick or several depends on exactly when, mid-unit, a provider
 // call happens to cross the deadline — not observable from GH Actions step-level logs alone (see
