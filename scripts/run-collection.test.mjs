@@ -143,6 +143,16 @@ test('noOtherActiveRuns requires GitHub context and a clean in-progress list', a
   assert.equal(await noOtherActiveRuns(env, another), false, 'another active run → refuse to start');
 });
 
+test('pilot state is published under the same claimed lease for both the regular due session and an actual off-cycle attempt — never on the immediate not_due exit', () => {
+  assert.match(source, /import\s*\{\s*publishPilotState\s*\}\s*from\s*'\.\/pilot-price-metadata\.mjs'/);
+  const notDueExit = source.slice(source.indexOf("if(!stopAt){"), source.indexOf("if(!stopAt){") + 200);
+  assert.doesNotMatch(notDueExit, /publishPilotState/, 'the cheap 5-minute not_due heartbeat must not gain a new write');
+  const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.match(offCycleBlock, /await publishPilotState\(db,env\)/, 'off-cycle attempts publish too, not just regular due sessions');
+  const justBeforeDueSelection = source.slice(0, source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule})')).slice(-200);
+  assert.match(justBeforeDueSelection, /await publishPilotState\(db,env\)/, 'the regular due session publishes right before running daily selection');
+});
+
 test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN_MINUTES unset/0 → immediate not_due, no engine)', () => {
   assert.match(source, /const offCycleMinutes=Number\(env\.OFF_CYCLE_MAIN_MINUTES\?\?0\)/);
   assert.match(source, /const stopAt=offCycleMinutes>0\s*\n\s*\?offCycleMainBudget/);

@@ -6,6 +6,7 @@ import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
 import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
+import { publishPilotState } from './pilot-price-metadata.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
@@ -133,6 +134,10 @@ export async function main(env=process.env){
       if(!stopAt){
         console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
       }
+      // Published once per actual off-cycle attempt (not on the immediate not_due exit above) —
+      // this value only changes when the Variable is toggled, so it never needs the 5-minute
+      // heartbeat's own write load; the regular due session below covers the rest of the day.
+      await publishPilotState(db,env);
       const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
       const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
       const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
@@ -153,6 +158,9 @@ export async function main(env=process.env){
           .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
       return;
     }
+    // Published once per regular due session — every ~30 minutes at worst, well inside the
+    // 120-minute ceiling this same contract publishes, so the app never reads a stale pilot flag.
+    await publishPilotState(db,env);
     await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
     const end=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
