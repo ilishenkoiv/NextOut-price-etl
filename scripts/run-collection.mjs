@@ -136,7 +136,13 @@ export async function main(env=process.env){
       const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
       const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
       const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
-      const {priority:_priorityAdapter,...offCycleHandlers}=allAdapters; // never offer a priority handler off-cycle
+      // Off-cycle exists to advance MAIN (never priority). Offering fast/maintenance here as well
+      // would let a trigger that happens to land on the wall-clock 'fast' or 'maintenance' slot
+      // (SLOTS is wall-clock-driven, not off-cycle-aware) spend its whole bounded budget on that
+      // slot instead of MAIN, defeating the trigger's purpose. Fast/maintenance already get their
+      // guaranteed due-session slot every cycle regardless of this. Tail stays as a fallback (via
+      // guaranteeDailyMain/mainAtRisk) so a trigger never idles outright once MAIN is caught up.
+      const offCycleHandlers={main:allAdapters.main,tail:allAdapters.tail};
       engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt,guaranteeDailyMain,handlers:offCycleHandlers});
       console.log(JSON.stringify({event:'off_cycle_main_advance_start',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS),
         budgetMs:stopAt-Date.now(),mainCursor:engine.state.jobs.main?.checkpoint?.cursor,mainTotal:engine.state.jobs.main?.checkpoint?.total}));

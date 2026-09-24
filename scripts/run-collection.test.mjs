@@ -115,9 +115,15 @@ test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN
 
 test('off-cycle MAIN advance never offers a priority handler and never calls runDueDailySelection', () => {
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
-  assert.match(offCycleBlock, /const \{priority:_priorityAdapter,\.\.\.offCycleHandlers\}=allAdapters/);
+  assert.match(offCycleBlock, /const offCycleHandlers=\{main:allAdapters\.main,tail:allAdapters\.tail\}/);
   assert.match(offCycleBlock, /handlers:offCycleHandlers/);
   assert.doesNotMatch(offCycleBlock, /runDueDailySelection/);
+});
+
+test('off-cycle MAIN advance offers only main+tail — never fast/maintenance, which would waste a trigger landing on their wall-clock slot', () => {
+  const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.doesNotMatch(offCycleBlock, /fast:allAdapters\.fast/);
+  assert.doesNotMatch(offCycleBlock, /maintenance:allAdapters\.maintenance/);
 });
 
 test('off-cycle MAIN advance always computes its stop time from offCycleMainBudget with the exported safety margin', () => {
