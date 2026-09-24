@@ -52,8 +52,9 @@ begin
   if not ok or (select count(*) from public.roulette_pool_replacements where snapshot_at='2099-01-01T03:30:00Z' and rank=1)<>1
     or not exists(select 1 from public.daily_origin_cheapest_pool where snapshot_at='2099-01-01T03:30:00Z' and rank=1 and dest='QBB')
     then raise exception 'targeted replacement idempotency assertion failed'; end if;
-  -- A successful observation always refreshes the offer timestamp, including an unchanged price;
-  -- both increases and decreases replace the old offer price while the saved pool stays fixed.
+  -- Since 20260924070000, a successful observation refreshes the offer AND the exact pool row
+  -- (price/source_updated_at) in the same transaction; identity (snapshot_at/origin/flight_type/
+  -- rank/dest/departure_at/return_at) stays exactly as selected — only price/source_updated_at move.
   select to_jsonb(p) into pool_before from public.daily_origin_cheapest_pool p
     where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2;
   observed_at:=clock_timestamp();
@@ -63,23 +64,27 @@ begin
     jsonb_build_object('status','found','price',555,'transfers',1,'updated_at',observed_at,'price_source','{}'::jsonb));
   if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10'
       and price=555 and updated_at=observed_at)
-    or pool_before is distinct from (select to_jsonb(p) from public.daily_origin_cheapest_pool p
-      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2)
-    then raise exception 'unchanged confirmed price did not refresh observation immutably'; end if;
+    or not exists(select 1 from public.daily_origin_cheapest_pool p
+      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2
+        and dest='QCC' and price=555 and source_updated_at=observed_at)
+    or (pool_before->>'dest') is distinct from 'QCC'
+    then raise exception 'unchanged confirmed price did not sync offer+pool identically'; end if;
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
       'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
     jsonb_build_object('status','found','price',600,'transfers',1,'updated_at',clock_timestamp(),'price_source','{}'::jsonb));
   if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10' and price=600)
-    then raise exception 'confirmed price increase was not stored'; end if;
+    or not exists(select 1 from public.daily_origin_cheapest_pool p
+      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2 and dest='QCC' and price=600)
+    then raise exception 'confirmed price increase was not stored in offer and pool'; end if;
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
       'flight_type','any','rank',2,'dest','QCC','departure_at','2099-03-10','return_at','2099-03-17'),
     jsonb_build_object('status','found','price',500,'transfers',1,'updated_at',clock_timestamp(),'price_source','{}'::jsonb));
   if not exists(select 1 from public.offers where origin='FRA' and dest='QCC' and departure_at='2099-03-10' and price=500)
-    or pool_before is distinct from (select to_jsonb(p) from public.daily_origin_cheapest_pool p
-      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2)
-    then raise exception 'confirmed price decrease changed pool or was not stored'; end if;
+    or not exists(select 1 from public.daily_origin_cheapest_pool p
+      where snapshot_at='2099-01-01T03:30:00Z' and origin='FRA' and flight_type='any' and rank=2 and dest='QCC' and price=500)
+    then raise exception 'confirmed price decrease was not stored in offer and pool'; end if;
   -- Missing/NULL status is an inconclusive technical result and must fail closed as a no-op.
   perform public.collection_commit_roulette(test_owner,f+1,
     jsonb_build_object('observed_on','2099-01-01','snapshot_at','2099-01-01T03:30:00Z','origin','FRA',
