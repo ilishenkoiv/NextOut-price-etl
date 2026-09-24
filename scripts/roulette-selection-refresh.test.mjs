@@ -329,7 +329,7 @@ test('selection is owned by the coordinator pre-phase, not by a collector adapte
   assert.doesNotMatch(runCollection, poolWrite, 'the coordinator uses guarded publication RPCs, not table writes');
   assert.doesNotMatch(adapters, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m, 'main does not import the selection module');
   assert.match(runCollection, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
-  assert.match(runCollection, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes\}\)/);
+  assert.match(runCollection, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule\}\)/);
   assert.doesNotMatch(runCollection, /publishEndOfSessionPool|shouldPublishEndOfSession/);
 });
 

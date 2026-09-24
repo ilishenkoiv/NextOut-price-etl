@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { localMinuteOfDay, dueForInterval, priorityMarketPolicy, originDueThisCycle, partitionTicketsByMarketSchedule } from './priority-market-schedule.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
+import { readFileSync } from 'node:fs';
 
 // Berlin is UTC+1 (CET) in winter, UTC+2 (CEST) in summer.
 const berlinWinter = (h, m) => Date.parse(`2026-01-15T${String(h - 1).padStart(2, '0')}:${String(m).padStart(2, '0')}:00Z`);
@@ -96,4 +97,11 @@ test('partitionTicketsByMarketSchedule keeps not-due tickets out of this cycle w
   const { due, notDue } = partitionTicketsByMarketSchedule(instant, tickets);
   assert.deepEqual(due, []);
   assert.equal(notDue.length, 2);
+});
+
+test('the evening window is documented as a search/discovery-based pilot, never claimed as a proven purchase peak', () => {
+  const source = readFileSync(new URL('./priority-market-schedule.mjs', import.meta.url), 'utf8');
+  assert.match(source, /PILOT CAVEAT/);
+  assert.match(source, /search\/discovery[\s\S]{0,20}activity patterns/);
+  assert.match(source, /NOT a measured or proven[\s\S]{0,20}purchase peak/);
 });

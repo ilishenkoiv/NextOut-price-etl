@@ -56,7 +56,7 @@ export function isAutomatedTrigger(env={}){
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
 // recovery-only; no independently scheduled selection writer exists.
 export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES,
-  publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
+  pilotMarketSchedule=false,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
   if(!nightlySelectionDue(instant,selectionThresholdMinutes))return{state,published:false};
   const day=berlinObservedOn(instant),snapshotAt=new Date(instant).toISOString();
   const checkpoint=state.dailySelection?.day===day?structuredClone(state.dailySelection):{
@@ -65,22 +65,30 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   let published=false;
   if(!checkpoint.rouletteDone){
     if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
-    const result=await publishRoulette({db,snapshotAt,expansionWave:wave});
-    checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
-    await store.save(state);published ||= checkpoint.roulettePublished;
+    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule});
+    // sources_not_fresh (pilot only): sources have not shown a fresh post-pause pass yet — this
+    // is NOT "done for the day". Leave rouletteDone false so the next due cycle retries; never
+    // publish (or mark complete) a pool built from stale pre-pause prices.
+    if(result?.reason!=='sources_not_fresh'){
+      checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
+    } else checkpoint.rouletteSourcesNotFreshAt=Date.now();
+    await store.save(state);published ||= checkpoint.roulettePublished===true;
   }
   if(!checkpoint.windowDone){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
-    const result=await publishWindows({db,instant,wave});
-    checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
-    await store.save(state);published ||= checkpoint.windowPublished;
+    const result=await publishWindows({db,instant,wave,pilotMarketSchedule});
+    if(result?.reason!=='sources_not_fresh'){
+      checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
+    } else checkpoint.windowSourcesNotFreshAt=Date.now();
+    await store.save(state);published ||= checkpoint.windowPublished===true;
     if(checkpoint.windowPublished&&state.jobs.priority){
       state.jobs.priority.done=false;state.jobs.priority.completedAt=null;
       if(state.jobs.priority.checkpoint)state.jobs.priority.checkpoint.phase='roulette';
       await store.save(state);
     }
   }
-  checkpoint.completedAt=Date.now();await store.save(state);
+  if(checkpoint.rouletteDone&&checkpoint.windowDone)checkpoint.completedAt=Date.now();
+  await store.save(state);
   return{state,published};
 }
 
@@ -143,7 +151,7 @@ export async function main(env=process.env){
           .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
       return;
     }
-    await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes});
+    await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
     const end=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';

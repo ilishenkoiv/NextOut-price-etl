@@ -4,6 +4,16 @@
 (`PRIORITY_MARKET_SCHEDULE` unset). Do not turn it on in production until the app-side
 work below is done and verified — see "Why this is blocking".**
 
+**⚠ NEEDS RECONCILIATION BEFORE ACTING ON IT:** the "Why this is blocking" section below cites
+exact file paths, function names and line-level behavior read from a specific checkout of
+`NextOut-app-active` at the time this doc was written (this ETL repo, not the app repo — the two
+are not co-versioned). Before treating any of it as current, the second terminal/session must
+re-verify every cited path against **its own canonical release source** (the app repo's actual
+current `main`/release branch), not trust this description at face value — file paths can move,
+functions can be renamed, and a freshness check may already exist that this doc doesn't know
+about. If something below no longer matches, fix the mismatch in this doc, don't silently work
+around it.
+
 ## What the pilot changes, server-side
 
 `scripts/priority-market-schedule.mjs` (this PR). Per already-selected origin (membership/rank/
@@ -13,8 +23,12 @@ that), the price-only refresh cadence becomes:
 | Local market time (origin airport as proxy) | Cadence |
 |---|---|
 | DACH 19:00–23:00 / rest of Europe 18:00–23:00 | every 30 minutes (unchanged from today) |
-| 07:00 until the peak window above starts | every 2 hours |
+| 07:00 until the evening window above starts | every 2 hours |
 | 23:00–07:00 | no priority refresh at all — only MAIN/FAST/TAIL run |
+
+The evening hours above are a **pilot hypothesis based on general search/discovery activity
+patterns**, not a measured or proven purchase peak for this product — no booking/conversion data
+was used to set them (see the same caveat in `scripts/priority-market-schedule.mjs`).
 
 Consequence: `daily_origin_cheapest_pool.source_updated_at` / `window_prices.updated_at` for a
 given ticket can now be **legitimately up to ~2 hours old during the day, and up to ~8 hours

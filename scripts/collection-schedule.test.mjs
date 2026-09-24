@@ -329,3 +329,20 @@ test('an off-cycle engine cannot busy-loop past its own stopAt: it reports idle 
   assert.equal(r.status, 'idle');
   assert.equal(engine.state.jobs.main.checkpoint.cursor, 0); // nothing was attempted, nothing to roll back
 });
+
+test('off-cycle MAIN never silently claims it finished on time when the provider is slower than estimated: it fails loud instead', async () => {
+  // A unit whose maxUnitMs estimate fits the remaining budget is admitted, but the provider turns
+  // out to be slower than estimated and the real wall-clock time crosses stopAt mid-unit. The
+  // engine must never silently return as if the budget was respected — it raises, so a caller
+  // (run-collection.mjs's off-cycle branch) can never mistake a slow overrun for a clean stop.
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 5, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 10 * MINMS;
+  const stop = offCycleMainBudget(clock, { safetyMarginMs: 90_000, maxSessionMs: 2 * MINMS }); // a normal, safely-margined off-cycle budget
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 30_000, step: async ({ job }) => { clock += 5 * MINMS; /* simulated slow provider, way past its own estimate */
+      return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }; } } },
+  });
+  await assert.rejects(() => engine.tick(), /exceeded its slot/);
+});

@@ -9,7 +9,7 @@ const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'u
 test('daily selection is a checkpointed coordinator pre-phase, never an end-of-session republish', () => {
   assert.match(source, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
   assert.match(source, /^\s*import[^\n]*snapshot-daily-window-candidates/m);
-  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes\}\)/);
+  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule\}\)/);
   assert.doesNotMatch(source, /export\s+(?:async\s+)?function\s+(?:publishEndOfSessionPool|shouldPublishEndOfSession)/, 'end-of-session republish is gone');
   assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)/, 'the coordinator does not query/write the pool tables directly');
 });
@@ -42,6 +42,50 @@ test('due daily selection is serialized by the lease and fenced after each check
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');assert.ok(saved.length>=4);
   await runDueDailySelection({state,store,db:{},instant,wave:43,
     publishRoulette:async()=>{throw new Error('already checkpointed');},publishWindows:async()=>{throw new Error('already checkpointed');}});
+});
+
+test('morning transition (pilot): sources not fresh yet → no publish, not marked done, next due cycle retries',async()=>{
+  const instant=Date.parse('2026-09-24T05:05:00Z'); // 07:05 Berlin — pilot threshold just reached
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:123,checkpoint:{phase:'done'}}}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+    publishRoulette:async()=>({rebuilt:false,reason:'sources_not_fresh'}),
+    publishWindows:async()=>({published:false,reason:'sources_not_fresh'})});
+  assert.equal(result.published,false);
+  assert.equal(state.dailySelection.rouletteDone,false,'not marked done — must retry, never treated as today\'s finished selection');
+  assert.equal(state.dailySelection.windowDone,false);
+  assert.equal(state.dailySelection.completedAt,undefined,'the day is not complete while sources are not fresh');
+  assert.ok(state.dailySelection.rouletteSourcesNotFreshAt);
+  assert.ok(state.dailySelection.windowSourcesNotFreshAt);
+  // priority's checkpoint must NOT be reset to the 'roulette' phase — nothing was actually published.
+  assert.equal(state.jobs.priority.done,true);
+  assert.equal(state.jobs.priority.checkpoint.phase,'done');
+});
+
+test('morning transition (pilot): a later due cycle, once sources ARE fresh, publishes and marks the day done',async()=>{
+  const instant=Date.parse('2026-09-24T05:35:00Z'); // 07:35 Berlin, a later due cycle same day
+  // Simulates state already carrying the earlier not-ready attempt's markers.
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:123,checkpoint:{phase:'done'}}},
+    dailySelection:{day:'2026-09-24',rouletteDone:false,windowDone:false,startedAt:instant-1800000,rouletteSourcesNotFreshAt:instant-1800000}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+    publishRoulette:async()=>({rebuilt:true}),publishWindows:async()=>({published:true})});
+  assert.equal(result.published,true);
+  assert.equal(state.dailySelection.rouletteDone,true);
+  assert.equal(state.dailySelection.windowDone,true);
+  assert.ok(state.dailySelection.completedAt);
+});
+
+test('legacy (pilotMarketSchedule unset) never receives a sources_not_fresh reason and behaves exactly as before',async()=>{
+  const instant=Date.parse('2026-09-23T02:30:00Z'); // 03:30 Berlin, legacy threshold
+  const state={version:1,jobs:{}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const calls=[];
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:0,
+    publishRoulette:async args=>{calls.push(args);return{rebuilt:true};},publishWindows:async()=>({published:true})});
+  assert.equal(calls[0].pilotMarketSchedule,false);
+  assert.equal(result.published,true);
+  assert.equal(state.dailySelection.rouletteDone,true);
 });
 
 test('daily selection cannot publish after lease loss',async()=>{

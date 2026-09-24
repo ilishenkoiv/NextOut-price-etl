@@ -24,8 +24,14 @@ const MARKET_TIMEZONE = Object.freeze({
 const DACH_MARKETS = new Set(['de', 'at', 'ch']);
 
 const HOUR = 60;
-// Peak window: local start-of-evening-browsing to local end-of-day. DACH starts an hour later
-// than the rest of Europe per the owner's spec.
+// "Peak" window (internal name only — see caveat below): local start-of-evening to local
+// end-of-day. DACH starts an hour later than the rest of Europe per the owner's spec.
+//
+// PILOT CAVEAT: these hours are a pilot hypothesis derived from general search/discovery
+// activity patterns (when people browse/search travel content), NOT a measured or proven
+// "purchase peak" for this product — no booking/conversion data was used to set them. Treat
+// `phase:'peak'` below as "the pilot's higher-cadence evening window", not as a validated claim
+// about when users actually buy. Revisit with real product data before treating it as settled.
 const PEAK_START_MIN = { dach: 19 * HOUR, other: 18 * HOUR };
 const PEAK_END_MIN = 23 * HOUR;
 const DAYTIME_START_MIN = 7 * HOUR;

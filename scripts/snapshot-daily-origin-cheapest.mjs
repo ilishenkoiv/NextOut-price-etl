@@ -97,8 +97,31 @@ export function selectDailyCheapestPool(offers, today, limit = 10) {
     .sort((a, b) => String(a.origin).localeCompare(String(b.origin)) || a.rank - b.rank);
 }
 
+// PILOT ONLY: publishing "today's" pool is gated on TIME (nightlySelectionDue's threshold), but
+// time alone does not prove the post-pause 07:00 pass actually landed — a delay or error there
+// would otherwise let the blanket 36h eligibility window silently admit last-night's
+// pre-pause prices as if they were today's. Require, per expected origin, at least one offer no
+// older than `maxAgeMs`; if fewer than `minCoverage` of origins clear that bar, sources are not
+// ready yet and the caller must NOT mark the day done (see run-collection.mjs).
+export const PILOT_SOURCE_FRESHNESS_MS = 3 * 60 * 60 * 1000; // 3h: comfortably covers one 07:00 pass plus a retry
+export const PILOT_MIN_FRESH_ORIGIN_COVERAGE = 0.9;
+
+export function pilotSourcesReady(rows, instant, expectedOrigins,
+  { maxAgeMs = PILOT_SOURCE_FRESHNESS_MS, minCoverage = PILOT_MIN_FRESH_ORIGIN_COVERAGE } = {}) {
+  if (!Number.isFinite(instant)) throw new Error('Invalid instant');
+  const expected = expectedOrigins instanceof Set ? expectedOrigins : new Set(expectedOrigins);
+  if (expected.size === 0) return false;
+  const fresh = new Set();
+  for (const row of rows) {
+    if (!row?.origin || !expected.has(row.origin)) continue;
+    const age = instant - Date.parse(row.updated_at);
+    if (Number.isFinite(age) && age >= 0 && age <= maxAgeMs) fresh.add(row.origin);
+  }
+  return fresh.size / expected.size >= minCoverage;
+}
+
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
-  force=process.env.SNAPSHOT_FORCE_REBUILD==='true' } = {}) {
+  force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
   const instant=requestedSnapshotAt??Date.now();const observedOn = berlinObservedOn(instant);
   if(!force&&!nightlySelectionDue(instant))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
@@ -119,6 +142,9 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     offers.push(...data.filter(row=>origins.has(row.origin)&&publishedDestinations.has(row.dest)));
     if (data.length < PAGE) break;
   }
+
+  if(pilotMarketSchedule&&!force&&!pilotSourcesReady(offers,instant,origins))
+    return{rebuilt:false,observedOn,snapshotAt:null,reason:'sources_not_fresh'};
 
   const snapshotAt = requestedSnapshotAt ?? new Date().toISOString();
   const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({

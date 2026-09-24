@@ -3,7 +3,7 @@
 import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { computeAllWindows } from './collection-windows.mjs';
-import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins } from './snapshot-daily-origin-cheapest.mjs';
+import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, pilotSourcesReady } from './snapshot-daily-origin-cheapest.mjs';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 
@@ -49,7 +49,7 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
 async function loadAll(db,table,columns,order){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);for(const col of order)q=q.order(col,{ascending:true});
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));if((data??[]).length<PAGE)return out;}}
 
-export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true'}={}){
+export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',pilotMarketSchedule=false}={}){
   const today=berlinObservedOn(instant);if(!force&&!nightlySelectionDue(instant))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
@@ -57,6 +57,11 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
     loadAll(client,'window_prices','origin,dest,flight_type,departure_at,return_at,price,transfers,airline,updated_at,price_source',['origin','dest','flight_type','departure_at','return_at']),
     loadAll(client,'public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date']),
     loadAll(client,'origin_regions','airport,calendar_subdivision_code',['airport'])]);
+  // PILOT ONLY: same principle as the roulette pool (snapshot-daily-origin-cheapest.mjs) — time
+  // alone (nightlySelectionDue) does not prove the post-pause 07:00 pass has landed. A delay or
+  // error there must not publish today's carousel candidates from stale pre-pause window_prices.
+  if(pilotMarketSchedule&&!force&&!pilotSourcesReady(rows,instant,publishedSnapshotOrigins()))
+    return{published:false,reason:'sources_not_fresh',observedOn:today};
   const regions=[...new Set(originRegions.map(r=>r.calendar_subdivision_code).filter(Boolean))].sort();const snapshotAt=new Date(instant).toISOString();
   const candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,wave});if(!candidates.length)throw new Error('Daily window candidate selection is empty');
   const{data,error}=await client.rpc('publish_daily_window_candidates',{p_observed_on:today,p_snapshot_at:snapshotAt,p_candidates:candidates});if(error)throw error;
