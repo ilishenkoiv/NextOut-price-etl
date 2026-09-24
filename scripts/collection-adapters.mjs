@@ -22,6 +22,13 @@ export const PRIORITY_AUDIT_BATCH = 10;
 // A larger advertised unit strands usable time at the end of the five-minute priority budget.
 export const PRIORITY_UNIT_MAX_MS = 35_000;
 export const MAIN_REQUIRED_PROVIDER_CALLS = 4;
+// MAIN is a bounded adapter unit, not a continuous slot: each tick does at most MAIN_UNIT_WORK_MS
+// of provider/DB work before returning its checkpoint, admitted only if MAIN_UNIT_ADMIT_MS still
+// fits the caller's deadline. main-24h-sim.mjs imports these so the capacity model reflects the
+// same bounded-unit granularity as the real adapter, instead of treating a nominal SLOTS minute
+// budget as if it converts to cells at a flat continuous rate.
+export const MAIN_UNIT_WORK_MS = 75_000;
+export const MAIN_UNIT_ADMIT_MS = 90_000;
 export function projectMainCellMs({requestMs,dbMs=0,calendarFallback=false,retryCalls=0}){
   if(![requestMs,dbMs,retryCalls].every(Number.isFinite)||requestMs<0||dbMs<0||retryCalls<0)throw new Error('Invalid MAIN projection');
   return(MAIN_REQUIRED_PROVIDER_CALLS+Number(calendarFallback)+retryCalls)*requestMs+dbMs;
@@ -100,9 +107,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     // phase owns membership before the schedule engine starts; MAIN only refreshes source offers.
     // Four mandatory upstream calls (two return windows × direct/any) need more than the former
     // 30s unit at the 8s timeout. 75s work / 90s admission preserves the boundary guard.
-    maxUnitMs: 90_000,
+    maxUnitMs: MAIN_UNIT_ADMIT_MS,
     async step({ job, deadline }) {
-      const unitEnd = Math.min(deadline, clock() + 75_000);
+      const unitEnd = Math.min(deadline, clock() + MAIN_UNIT_WORK_MS);
       let cp = job.checkpoint ?? { cursor: 0, errors: 0, wave };
       const pinnedWave=cp.wave??wave;
       cp={...cp,wave:pinnedWave};

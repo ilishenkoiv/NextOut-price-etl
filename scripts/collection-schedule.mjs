@@ -264,3 +264,23 @@ export class SequentialSchedule {
     } finally { this.#busy = false; }
   }
 }
+
+// Extracted, unit-tested off-cycle driver: keep calling one bounded engine.tick() at a time while
+// runway remains before `stopAt` (the real safety-margin-bounded deadline before the next due
+// priority cycle, from offCycleMainBudget), stop the instant the engine reports true idle (nothing
+// schedulable right now), and never spin once idle. Each tick() call already rechecks its own
+// per-task deadline against `stopAt` (via SequentialSchedule's cycleEnd calc) before starting any
+// unit, already claims/renews the single lease and fence internally, and already persists the
+// checkpoint after every unit — this function adds no new deadline math, it only bounds *how many*
+// ticks are attempted. `minRunwayMs` mirrors the 5s guard the inline off-cycle loop used before
+// extraction: below it, a new tick could not plausibly complete useful work before `stopAt`.
+export async function runBoundedMainAdvance({ engine, stopAt, clock = Date.now, minRunwayMs = 5000, maxTicks = 1000 }) {
+  let ticks = 0, lastStatus = 'no_ticks';
+  while (clock() + minRunwayMs < stopAt && ticks < maxTicks) {
+    const result = await engine.tick();
+    ticks += 1;
+    lastStatus = result.status;
+    if (result.status === 'idle') break; // nothing left to do within this bounded budget — stop, don't spin
+  }
+  return { ticks, lastStatus };
+}

@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
-import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
@@ -146,13 +146,9 @@ export async function main(env=process.env){
       engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt,guaranteeDailyMain,handlers:offCycleHandlers});
       console.log(JSON.stringify({event:'off_cycle_main_advance_start',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS),
         budgetMs:stopAt-Date.now(),mainCursor:engine.state.jobs.main?.checkpoint?.cursor,mainTotal:engine.state.jobs.main?.checkpoint?.total}));
-      let offCycleResult=null;
-      while(Date.now()+5000<stopAt){
-        offCycleResult=await engine.tick();
-        if(offCycleResult.status==='idle')break; // nothing left to do within this bounded budget — stop, don't spin
-      }
+      const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt });
       console.log(JSON.stringify({event:'off_cycle_main_advance_end',source:triggerSource,providerRequests:provider.requests,
-        lastStatus:offCycleResult?.status??'no_ticks',
+        ticks,lastStatus,
         progress:Object.fromEntries(Object.entries(engine.state.jobs).filter(([k])=>k!=='priority')
           .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
       return;

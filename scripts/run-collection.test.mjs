@@ -143,8 +143,9 @@ test('pilot mode shifts the daily-selection due threshold past the night gap, le
   assert.equal(scheduledCollectionDue(morningState, morning, 7 * 60 + 5), true, 'pilot: due once local time reaches 07:05');
 });
 
-test('off-cycle MAIN advance session loop is bounded (cannot busy-loop) and stops on idle', () => {
+test('off-cycle MAIN advance delegates its bounded, keep-ticking loop to the shared, unit-tested runBoundedMainAdvance (see collection-schedule.test.mjs for its busy-loop/idle-exit/deadline coverage)', () => {
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
-  assert.match(offCycleBlock, /while\(Date\.now\(\)\+5000<stopAt\)\{/);
-  assert.match(offCycleBlock, /if\(offCycleResult\.status==='idle'\)break/);
+  assert.match(source, /import\s*\{[^}]*runBoundedMainAdvance[^}]*\}\s*from\s*'\.\/collection-schedule\.mjs'/);
+  assert.match(offCycleBlock, /const \{ ?ticks, ?lastStatus ?\} ?= ?await runBoundedMainAdvance\(\{ ?engine, ?stopAt ?\}\)/);
+  assert.doesNotMatch(offCycleBlock, /while\(Date\.now\(\)\+5000<stopAt\)/, 'the inline loop was extracted, not duplicated');
 });

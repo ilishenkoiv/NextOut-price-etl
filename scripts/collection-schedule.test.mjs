@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, PRIORITY_MAX_CYCLE_MS, mainAtRisk, nominalSessionBudgets,
-  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage, nextPriorityDueAt, offCycleMainBudget } from './collection-schedule.mjs';
+  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage, nextPriorityDueAt, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -345,4 +345,50 @@ test('off-cycle MAIN never silently claims it finished on time when the provider
       return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }; } } },
   });
   await assert.rejects(() => engine.tick(), /exceeded its slot/);
+});
+
+test('runBoundedMainAdvance keeps calling bounded ticks while runway remains, one main unit per productive tick', async () => {
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 100, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 0, stepCalls = 0;
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; },
+    stopAt: 6 * MINMS, // enough runway for several 75s-work/90s-admission units, not the whole plan
+    handlers: { main: { maxUnitMs: 90_000, step: async ({ job }) => { stepCalls++; clock += 75_000;
+      return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }; } } },
+  });
+  const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt: 6 * MINMS, clock: () => clock });
+  // Real units keep landing (matching cursor/stepCalls) until the scheduler's own
+  // LOWER_PHASE_RESERVE_MS guard makes the next unit no longer fit before stopAt; that last
+  // recheck costs one more (non-productive) tick() call, which is exactly what a caller must be
+  // able to tell apart from a wasted spin — lastStatus surfaces it as 'idle'.
+  assert.ok(stepCalls >= 3, `expected several bounded main units to run, got ${stepCalls}`);
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, stepCalls, 'one cell of progress per productive tick, matching the mocked adapter');
+  assert.equal(ticks, stepCalls + 1, 'exactly one extra tick() call detects the deadline and reports idle — no busy-loop beyond that');
+  assert.equal(lastStatus, 'idle', 'stops because the next unit no longer fits before stopAt, reported cleanly as idle');
+});
+
+test('runBoundedMainAdvance stops immediately and cleanly on true idle — no busy-loop', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'idle' }; } };
+  const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt: 10 * MINMS, clock: () => 0 });
+  assert.equal(ticks, 1, 'idle must stop the loop on the very first tick, not spin waiting for more work');
+  assert.equal(tickCalls, 1);
+  assert.equal(lastStatus, 'idle');
+});
+
+test('runBoundedMainAdvance never calls tick() once runway is exhausted (rechecks the hard deadline before every unit)', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } };
+  const { ticks } = await runBoundedMainAdvance({ engine, stopAt: 0, clock: () => 0 }); // zero runway from the start
+  assert.equal(ticks, 0);
+  assert.equal(tickCalls, 0, 'no unit may be attempted once stopAt has already been reached');
+});
+
+test('runBoundedMainAdvance has a hard iteration ceiling so a misbehaving engine can never spin forever', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } }; // never reports idle, never advances the clock
+  const { ticks } = await runBoundedMainAdvance({ engine, stopAt: 10 * MINMS, clock: () => 0, maxTicks: 25 });
+  assert.equal(ticks, 25);
+  assert.equal(tickCalls, 25);
 });
