@@ -10,6 +10,7 @@ import { withSupabaseRetry } from './supabase-retry.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { originDueThisCycle } from './priority-market-schedule.mjs';
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 
@@ -45,6 +46,9 @@ export function buildRouletteReplacementCandidates(offers,pool,allowedDests,toda
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
   const exactKey=t=>[t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|');
+  // PILOT, off by default: uniform 30-minute price refresh for every already-selected ticket
+  // (legacy) unless explicitly opted into the market/time-of-day cadence.
+  const pilotMarketSchedule=process.env.PRIORITY_MARKET_SCHEDULE==='pilot';
   // Bound the transient-retry backoff so no attempt (retry wait + one ~8s request +
   // the 9s boundary guard) can run past the unit/session deadline. If nothing fits,
   // delays is empty and the operation runs exactly once, failing honestly.
@@ -336,6 +340,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               .gte('departure_at',today).gte('updated_at',new Date(clock()-36*60*60*1000).toISOString()).gt('price',0),deadline):[];
           return{tickets:eligible,snapshotAt:latestSnapshot,allowedDests,replacements:buildRouletteReplacementCandidates(offers,eligible,allowedDests,today)};
         });
+        // PILOT (off by default): the full daily pool/plan/replacement pool are cached and left
+        // exactly as-is (membership/rank/dest never depend on time of day); only which of THIS
+        // cycle's tickets get a price re-confirmation is narrowed by market-local time of day.
+        // Filtered here (not inside store.plan's cached builder) so the cache stays the full,
+        // stable daily set and this filter is always re-evaluated fresh every cycle.
+        const effectiveTickets=pilotMarketSchedule?plan.tickets.filter(t=>originDueThisCycle(clock(),t.origin)):plan.tickets;
         const ticketPayload=ticket=>({...ticket,month:ticket.departure_at.slice(0,7),allowed_dests:plan.allowedDests,run_id:store.runId});
         const deferTechnical=(ticket,stage)=>{const key=[ticket.origin,ticket.dest,ticket.flight_type,ticket.departure_at,ticket.return_at].join('|');
           r.errors++;r.technicalDeferred=[...(r.technicalDeferred??[]).filter(item=>item.key!==key),{key,stage,cycle:r.cycle}];
@@ -367,10 +377,10 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
             }
           }
-          r.total=plan.tickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
+          r.total=effectiveTickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
           return{status:'progress',checkpoint:cp};
         }
-        const ticket=plan.tickets[r.cursor];
+        const ticket=effectiveTickets[r.cursor];
         if(ticket&&!r.pendingReplacement){
           const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
             direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
@@ -387,7 +397,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             p_observed_at:patch.updated_at}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
           if(result.status==='found')r.cursor++;
         }
-        r.total=plan.tickets.length;r.done=r.cursor>=r.total;
+        r.total=effectiveTickets.length;r.done=r.cursor>=r.total;
         cp.phase='weekend';
         return{status:'progress',checkpoint:cp};
       }
@@ -408,8 +418,13 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selected,
             groups:groupWindowConsumerTickets(selected)};
         });
-        w.setId=plan.setId;w.total=plan.groups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
-        const group=plan.groups[w.cursor];
+        // PILOT (off by default): same principle as roulette above — the cached plan/groups stay
+        // the full daily set; only which groups get touched THIS cycle is narrowed by each
+        // group's origin's market-local time of day. Every group from one groupWindowConsumerTickets
+        // bucket shares one origin (grouped by [origin,dest,departure_at,return_at]).
+        const effectiveGroups=pilotMarketSchedule?plan.groups.filter(g=>originDueThisCycle(clock(),g[0].origin)):plan.groups;
+        w.setId=plan.setId;w.total=effectiveGroups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
+        const group=effectiveGroups[w.cursor];
         if(group){
           if(group[0].departure_at<today){w.cursor++;w.expired=(w.expired??0)+group.length;}
           else{const age=Math.max(...group.map(ticket=>Math.max(0,clock()-Date.parse(ticket.updated_at))).filter(Number.isFinite));

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, PRIORITY_MAX_CYCLE_MS, mainAtRisk, nominalSessionBudgets,
-  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage } from './collection-schedule.mjs';
+  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage, nextPriorityDueAt, offCycleMainBudget } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -258,4 +258,74 @@ test('completed main is still counted once with the guarantee on (snapshot/count
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);
+});
+
+test('nextPriorityDueAt is the exact start of the NEXT 30-minute cycle, never the current one', () => {
+  assert.equal(nextPriorityDueAt(0), CYCLE_MS);
+  assert.equal(nextPriorityDueAt(CYCLE_MS - 1), CYCLE_MS);
+  assert.equal(nextPriorityDueAt(CYCLE_MS), 2 * CYCLE_MS); // exactly on a boundary counts as already in that cycle
+  assert.equal(nextPriorityDueAt(CYCLE_MS + 1), 2 * CYCLE_MS);
+});
+
+test('offCycleMainBudget never crosses into the safety margin before the next due cycle', () => {
+  // 10 minutes into a cycle, 20 minutes of runway left before the next due cycle.
+  const instant = 10 * MINMS;
+  const stop = offCycleMainBudget(instant, { safetyMarginMs: 5 * MINMS, maxSessionMs: 3 * MINMS });
+  assert.equal(stop, instant + 3 * MINMS); // maxSessionMs is the binding constraint here
+  assert.ok(nextPriorityDueAt(instant) - stop >= 5 * MINMS);
+});
+
+test('offCycleMainBudget is bounded by the safety margin, not just maxSessionMs, when the cycle is nearly over', () => {
+  // 27 minutes into a cycle: only 3 minutes of runway before the next due cycle.
+  const instant = 27 * MINMS;
+  const stop = offCycleMainBudget(instant, { safetyMarginMs: 90_000, maxSessionMs: 5 * MINMS });
+  assert.equal(stop, nextPriorityDueAt(instant) - 90_000);
+  assert.ok(stop - instant < 2 * MINMS, 'runway is capped well under maxSessionMs by the margin');
+});
+
+test('offCycleMainBudget fails closed (null = do no work) once inside the safety margin — never delays priority', () => {
+  const instant = 29 * MINMS; // 1 minute of runway, less than a 90s margin
+  assert.equal(offCycleMainBudget(instant, { safetyMarginMs: 90_000, maxSessionMs: 3 * MINMS }), null);
+  // A margin as wide as the whole cycle: everywhere inside the cycle is "too close" — always null.
+  assert.equal(offCycleMainBudget(1 * MINMS, { safetyMarginMs: CYCLE_MS, maxSessionMs: 3 * MINMS }), null);
+});
+
+test('offCycleMainBudget rejects invalid inputs instead of silently defaulting', () => {
+  assert.throws(() => offCycleMainBudget(-1, { safetyMarginMs: 1000, maxSessionMs: 1000 }), /Invalid clock/);
+  assert.throws(() => offCycleMainBudget(0, { safetyMarginMs: -1, maxSessionMs: 1000 }), /Invalid off-cycle budget/);
+  assert.throws(() => offCycleMainBudget(0, { safetyMarginMs: 0, maxSessionMs: 0 }), /Invalid off-cycle budget/);
+});
+
+test('an off-cycle engine with only fast/main/tail handlers never touches priority: no cursor reset, no lag', async () => {
+  // Simulates a mid-cycle (priority-not-due) trigger: the SAME engine machinery, just without a
+  // priority handler registered, resuming main from a non-zero saved cursor.
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 100, total: 23952, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const stop = offCycleMainBudget(10 * MINMS, { safetyMarginMs: 5 * MINMS, maxSessionMs: 3 * MINMS });
+  const engine = new SequentialSchedule({
+    state, clock: () => 10 * MINMS, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 1000, step: async ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }) } },
+  });
+  const r = await engine.tick();
+  assert.equal(r.task, 'main');
+  assert.equal(r.status, 'progress');
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, 101); // resumed from 100, not reset to 0
+  // The engine still tracks a priority job record internally (needed to compute priorityDue), but
+  // with no handler registered no work is ever attempted on it: checkpoint stays null, never done.
+  assert.equal(engine.state.jobs.priority.checkpoint, null);
+  assert.equal(engine.state.jobs.priority.done, false);
+});
+
+test('an off-cycle engine cannot busy-loop past its own stopAt: it reports idle once budget is exhausted', async () => {
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 5, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 10 * MINMS;
+  const stop = clock + 500; // a tiny 500ms budget
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 1000, step: async ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }) } },
+  });
+  const r = await engine.tick(); // a 1000ms unit cannot fit in a 500ms budget
+  assert.equal(r.status, 'idle');
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, 0); // nothing was attempted, nothing to roll back
 });

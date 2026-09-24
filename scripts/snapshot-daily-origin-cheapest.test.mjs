@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins } from './snapshot-daily-origin-cheapest.mjs';
+import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
+  LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
 
 test('selects one deterministic cheapest real future offer per origin and flight type', () => {
@@ -82,6 +83,22 @@ test('nightly due gate is 03:30 Berlin on winter, spring-DST and fall-DST days',
   assert.equal(nightlySelectionDue('2026-03-29T01:30:00Z'),true);
   assert.equal(nightlySelectionDue('2026-10-25T02:29:59Z'),false); // 03:29:59 CET
   assert.equal(nightlySelectionDue('2026-10-25T02:30:00Z'),true);
+});
+
+test('a pilot (later) threshold overrides the legacy 03:30 default without changing it', () => {
+  assert.equal(LEGACY_SELECTION_THRESHOLD_MINUTES, 3 * 60 + 30);
+  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 7 * 60 + 5);
+  // 03:30 Berlin (legacy-due) is still inside the pilot's night gap — not due under the pilot threshold.
+  assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), false);
+  assert.equal(nightlySelectionDue('2026-01-15T06:04:59Z', PILOT_SELECTION_THRESHOLD_MINUTES), false); // 07:04:59
+  assert.equal(nightlySelectionDue('2026-01-15T06:05:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), true); // 07:05:00
+  // Calling with no threshold argument is untouched — exact legacy behavior.
+  assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z'), true);
+});
+
+test('nightlySelectionDue rejects an out-of-range threshold instead of silently misfiring', () => {
+  assert.throws(() => nightlySelectionDue(Date.now(), -1), /Invalid selection threshold/);
+  assert.throws(() => nightlySelectionDue(Date.now(), 24 * 60), /Invalid selection threshold/);
 });
 
 test('production snapshot query refuses source observations older than 36 hours', () => {

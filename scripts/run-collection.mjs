@@ -4,11 +4,16 @@ import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
-import { SequentialSchedule, freshScheduleState, CYCLE_MS } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
-import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue } from './snapshot-daily-origin-cheapest.mjs';
+import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
+
+// Headroom an off-cycle (priority-not-due) trigger must always leave before the next real due
+// (priority) cycle. Generous relative to observed GH Actions/DB overhead (a due session's own
+// checkout+npm-ci+claim overhead measured ~15-20s) so a slow runner start never eats into it.
+export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
@@ -25,12 +30,12 @@ export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   return false;
 }
 
-export function scheduledCollectionDue(state, instant=Date.now()) {
+export function scheduledCollectionDue(state, instant=Date.now(), selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES) {
   if(!state||state.version!==1||!state.jobs)return true;
   const cycle=Math.floor(instant/CYCLE_MS),priority=state.jobs.priority;
   const priorityDue=!priority||priority.id!==cycle||!priority.done;
   const day=berlinObservedOn(instant),selection=state.dailySelection;
-  const selectionDue=nightlySelectionDue(instant)&&(
+  const selectionDue=nightlySelectionDue(instant,selectionThresholdMinutes)&&(
     selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true);
   return priorityDue||selectionDue;
 }
@@ -50,9 +55,9 @@ export function isAutomatedTrigger(env={}){
 // single database claim, verifies the lease before each idempotent once/day publication and
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
 // recovery-only; no independently scheduled selection writer exists.
-export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),
+export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES,
   publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
-  if(!nightlySelectionDue(instant))return{state,published:false};
+  if(!nightlySelectionDue(instant,selectionThresholdMinutes))return{state,published:false};
   const day=berlinObservedOn(instant),snapshotAt=new Date(instant).toISOString();
   const checkpoint=state.dailySelection?.day===day?structuredClone(state.dailySelection):{
     day,rouletteDone:false,windowDone:false,startedAt:instant};
@@ -105,10 +110,40 @@ export async function main(env=process.env){
     if(!await oldRunnerHasStopped(previous,{repository:env.GITHUB_REPOSITORY,token:env.GITHUB_TOKEN}))throw new Error('Old runner not confirmed stopped; refusing overlap');
     const state=await store.claim(previous?.owner??null)??freshScheduleState();claimed=true;
     if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
-    if(automated&&!scheduledCollectionDue(state)){
-      console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
+    const pilotMarketSchedule=env.PRIORITY_MARKET_SCHEDULE==='pilot';
+    const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
+    if(automated&&!scheduledCollectionDue(state,Date.now(),selectionThresholdMinutes)){
+      // OFF_CYCLE_MAIN_MINUTES is unset/0 by default: exact legacy behavior (immediate not_due,
+      // no provider work, no engine). Opt-in only. Priority is NOT due here by construction
+      // (scheduledCollectionDue already covers priorityDue||selectionDue) — this path never
+      // touches priority or daily selection, and never runs when it can't finish with a safety
+      // margin before the next real due (priority) cycle.
+      const offCycleMinutes=Number(env.OFF_CYCLE_MAIN_MINUTES??0);
+      const stopAt=offCycleMinutes>0
+        ?offCycleMainBudget(Date.now(),{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:offCycleMinutes*60000})
+        :null;
+      if(!stopAt){
+        console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
+      }
+      const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+      const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
+      const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
+      const {priority:_priorityAdapter,...offCycleHandlers}=allAdapters; // never offer a priority handler off-cycle
+      engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt,guaranteeDailyMain,handlers:offCycleHandlers});
+      console.log(JSON.stringify({event:'off_cycle_main_advance_start',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS),
+        budgetMs:stopAt-Date.now(),mainCursor:engine.state.jobs.main?.checkpoint?.cursor,mainTotal:engine.state.jobs.main?.checkpoint?.total}));
+      let offCycleResult=null;
+      while(Date.now()+5000<stopAt){
+        offCycleResult=await engine.tick();
+        if(offCycleResult.status==='idle')break; // nothing left to do within this bounded budget — stop, don't spin
+      }
+      console.log(JSON.stringify({event:'off_cycle_main_advance_end',source:triggerSource,providerRequests:provider.requests,
+        lastStatus:offCycleResult?.status??'no_ticks',
+        progress:Object.fromEntries(Object.entries(engine.state.jobs).filter(([k])=>k!=='priority')
+          .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
+      return;
     }
-    await runDueDailySelection({state,store,db,wave});
+    await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes});
     const end=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';

@@ -82,6 +82,29 @@ export function slotAt(timestamp) {
   return { ...slot, cycle, deadline: start + slot.to * MINUTE };
 }
 
+// The next instant priority becomes due — the start of the next 30-minute coordinator cycle.
+// Off-cycle (mid-cycle, 5-minute-trigger) MAIN work must always finish, lease released, before
+// this instant, with a safety margin — never delay a real due (priority) cycle's start.
+export function nextPriorityDueAt(instant) {
+  if (!Number.isFinite(instant) || instant < 0) throw new Error('Invalid clock');
+  return (Math.floor(instant / CYCLE_MS) + 1) * CYCLE_MS;
+}
+
+// How much wall-clock budget an off-cycle (priority-not-due) trigger may safely spend on
+// MAIN/FAST/TAIL before it MUST stop and release the lease, so the next real due cycle is never
+// delayed. Pure: given `instant`, `safetyMarginMs` (headroom before the next priority due-time
+// that must always remain untouched) and `maxSessionMs` (a hard ceiling on this trigger's own
+// session length, independent of cycle position), returns the absolute stop timestamp, or null
+// when there isn't enough runway left before the next due cycle to safely do any work at all
+// (fails closed — no work is better than delaying priority).
+export function offCycleMainBudget(instant, { safetyMarginMs, maxSessionMs }) {
+  if (!Number.isFinite(instant) || instant < 0) throw new Error('Invalid clock');
+  if (!(safetyMarginMs >= 0) || !(maxSessionMs > 0)) throw new Error('Invalid off-cycle budget parameters');
+  const ceiling = nextPriorityDueAt(instant) - safetyMarginMs;
+  if (ceiling <= instant) return null; // too close to (or past) the next due cycle — do nothing
+  return Math.min(ceiling, instant + maxSessionMs);
+}
+
 export function freshScheduleState() {
   return { version: 1, jobs: {}, completedMain: 0, missedFast: 0, missedPriority: 0 };
 }

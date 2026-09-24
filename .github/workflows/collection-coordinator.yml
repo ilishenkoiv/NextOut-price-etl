@@ -69,6 +69,11 @@ jobs:
           EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
           GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}
+          # Both OFF by default (repo Variables, toggle without a code change). See
+          # scripts/priority-market-schedule.mjs and docs/PILOT-MARKET-SCHEDULE-APP-CONTRACT.md —
+          # PRIORITY_MARKET_SCHEDULE must stay unset until the app-side freshness gate exists.
+          OFF_CYCLE_MAIN_MINUTES: ${{ vars.OFF_CYCLE_MAIN_MINUTES || '0' }}
+          PRIORITY_MARKET_SCHEDULE: ${{ vars.PRIORITY_MARKET_SCHEDULE || '' }}
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}

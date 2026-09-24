@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createAdapters, MAIN_REQUIRED_PROVIDER_CALLS, projectMainCellMs } from './collection-adapters.mjs';
 import { CollectionYield } from './collection-provider.mjs';
 
-function fixture(plan,response,{tableRows={}}={}){
+function fixture(plan,response,{tableRows={},clock=()=>100000}={}){
   const calls=[];
   const chain=data=>new Proxy({}, {get:(_,key)=>key==='then'?Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null})):()=>chain(data)});
   const db={rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},
@@ -11,7 +11,11 @@ function fixture(plan,response,{tableRows={}}={}){
   const store={args:()=>({p_owner:'test-owner',p_token:1}),lease:async()=>true,plan:async()=>plan,runId:'123'};
   let requests=0;
   const provider={request:async url=>{requests++;return response(requests,url);}};
-  return{adapters:createAdapters({db,store,provider,clock:()=>100000,wave:10}),calls,get requests(){return requests;}};
+  return{adapters:createAdapters({db,store,provider,clock,wave:10}),calls,get requests(){return requests;}};
+}
+function withPilotMarketSchedule(fn){
+  const previous=process.env.PRIORITY_MARKET_SCHEDULE;process.env.PRIORITY_MARKET_SCHEDULE='pilot';
+  return Promise.resolve().then(fn).finally(()=>{if(previous===undefined)delete process.env.PRIORITY_MARKET_SCHEDULE;else process.env.PRIORITY_MARKET_SCHEDULE=previous;});
 }
 const job={id:1,planDate:'2026-09-16',startedAt:100000,checkpoint:null};
 const mainPlan={months:['2027-01'],routes:[{origin:'FRA',dest:'MAD',stops:0,key:'FRA|MAD'}],breakKeys:[]};
@@ -121,4 +125,40 @@ test('malformed roulette data preserves the existing offer and defers the ticket
   assert.equal(result.checkpoint.roulette.errors,1);
   assert.equal(result.checkpoint.roulette.cursor,1);
   assert.equal(result.checkpoint.roulette.technicalDeferred[0].stage,'ticket');
+});
+
+test('pilot market schedule (off by default): a night-hours instant skips priority entirely for that origin, zero provider calls, cursor still resolves done',async()=>{
+  await withPilotMarketSchedule(async()=>{
+    const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
+    const nightUtc=Date.parse('2026-01-15T01:00:00Z'); // 02:00 Europe/Berlin — night, mainOnly
+    const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc});
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
+    assert.equal(f.requests,0,'no provider call for an origin whose market-local time is inside the night gap');
+    assert.equal(result.checkpoint.roulette.total,0);
+    assert.equal(result.checkpoint.roulette.done,true);
+  });
+});
+
+test('pilot market schedule (off by default): a DACH peak-hours instant still refreshes that origin normally',async()=>{
+  await withPilotMarketSchedule(async()=>{
+    const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
+    const peakUtc=Date.parse('2026-01-15T19:00:00Z'); // 20:00 Europe/Berlin — DACH peak (19:00-23:00)
+    const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc});
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
+    assert.equal(f.requests,1,'the one selected ticket is still refreshed at peak local time');
+    assert.equal(result.checkpoint.roulette.total,1);
+  });
+});
+
+test('pilot market schedule leaves the LEGACY (default, unset) path byte-identical: same origin/instant processes normally', async()=>{
+  const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
+  const nightUtc=Date.parse('2026-01-15T01:00:00Z');
+  assert.equal(process.env.PRIORITY_MARKET_SCHEDULE,undefined,'must not leak from a previous test');
+  const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc});
+  const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+  const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
+  assert.equal(f.requests,1,'without the pilot flag, night hours change nothing — exactly legacy behavior');
+  assert.equal(result.checkpoint.roulette.total,1);
 });

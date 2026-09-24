@@ -59,12 +59,23 @@ export function berlinObservedOn(value = Date.now()) {
   return new Date(timestamp).toLocaleDateString('en-CA',{timeZone:'Europe/Berlin'});
 }
 
-export function nightlySelectionDue(value = Date.now()) {
+// Legacy threshold: 03:30 Berlin. Under the always-on 30-minute refresh this was already well
+// after a full night of fresh priority passes, so sources feeding the pool were reliably fresh.
+export const LEGACY_SELECTION_THRESHOLD_MINUTES = 3 * 60 + 30;
+// PILOT threshold: under the market/time-of-day cadence (priority-market-schedule.mjs), 03:30
+// Berlin falls INSIDE the 23:00-07:00 night gap where priority does not refresh at all — sources
+// would be several hours stale at that instant. 07:05 gives the 07:00 daytime-cadence resume five
+// minutes (one due cycle) to land at least one fresh pass before the day's pool is published, so
+// "today's" pool is never built from yesterday's last-pre-pause prices.
+export const PILOT_SELECTION_THRESHOLD_MINUTES = 7 * 60 + 5;
+
+export function nightlySelectionDue(value = Date.now(), thresholdMinutes = LEGACY_SELECTION_THRESHOLD_MINUTES) {
   const timestamp=typeof value==='number'?value:Date.parse(value);
   if(!Number.isFinite(timestamp))throw new Error('Invalid selection timestamp');
+  if(!Number.isFinite(thresholdMinutes)||thresholdMinutes<0||thresholdMinutes>=24*60)throw new Error('Invalid selection threshold');
   const parts=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Berlin',hour:'2-digit',minute:'2-digit',hourCycle:'h23'})
     .formatToParts(new Date(timestamp)).filter(p=>p.type!=='literal').map(p=>[p.type,p.value]));
-  return Number(parts.hour)*60+Number(parts.minute)>=3*60+30;
+  return Number(parts.hour)*60+Number(parts.minute)>=thresholdMinutes;
 }
 
 export function selectDailyCheapestPool(offers, today, limit = 10) {

@@ -9,7 +9,7 @@ const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'u
 test('daily selection is a checkpointed coordinator pre-phase, never an end-of-session republish', () => {
   assert.match(source, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
   assert.match(source, /^\s*import[^\n]*snapshot-daily-window-candidates/m);
-  assert.match(source, /runDueDailySelection\(\{state,store,db,wave\}\)/);
+  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes\}\)/);
   assert.doesNotMatch(source, /export\s+(?:async\s+)?function\s+(?:publishEndOfSessionPool|shouldPublishEndOfSession)/, 'end-of-session republish is gone');
   assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)/, 'the coordinator does not query/write the pool tables directly');
 });
@@ -61,4 +61,40 @@ test('noOtherActiveRuns requires GitHub context and a clean in-progress list', a
 
   const another = async () => ({ ok: true, json: async () => ({ workflow_runs: [{ id: 100 }, { id: 999 }] }) });
   assert.equal(await noOtherActiveRuns(env, another), false, 'another active run → refuse to start');
+});
+
+test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN_MINUTES unset/0 → immediate not_due, no engine)', () => {
+  assert.match(source, /const offCycleMinutes=Number\(env\.OFF_CYCLE_MAIN_MINUTES\?\?0\)/);
+  assert.match(source, /const stopAt=offCycleMinutes>0\s*\n\s*\?offCycleMainBudget/);
+  assert.match(source, /if\(!stopAt\)\{\s*\n\s*console\.log\(JSON\.stringify\(\{event:'collection_not_due'/);
+});
+
+test('off-cycle MAIN advance never offers a priority handler and never calls runDueDailySelection', () => {
+  const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.match(offCycleBlock, /const \{priority:_priorityAdapter,\.\.\.offCycleHandlers\}=allAdapters/);
+  assert.match(offCycleBlock, /handlers:offCycleHandlers/);
+  assert.doesNotMatch(offCycleBlock, /runDueDailySelection/);
+});
+
+test('off-cycle MAIN advance always computes its stop time from offCycleMainBudget with the exported safety margin', () => {
+  assert.match(source, /export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000/);
+  assert.match(source, /safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS/);
+});
+
+test('pilot mode shifts the daily-selection due threshold past the night gap, legacy default is unchanged', () => {
+  const winterNight = Date.parse('2026-01-15T02:30:00Z'); // 03:30 Europe/Berlin — legacy threshold, exactly at boundary
+  assert.equal(scheduledCollectionDue({ version: 1, jobs: {} }, winterNight), true); // no priority job yet → always due regardless
+  const state = { version: 1, jobs: { priority: { id: Math.floor(winterNight / CYCLE_MS), done: true } },
+    dailySelection: { day: '2026-01-14', rouletteDone: true, windowDone: true } }; // yesterday's selection, not yet re-run today
+  assert.equal(scheduledCollectionDue(state, winterNight), true, 'legacy: 03:30 Berlin is due');
+  assert.equal(scheduledCollectionDue(state, winterNight, 7 * 60 + 5), false, 'pilot: 03:30 Berlin is inside the night gap, not due yet');
+  const morning = Date.parse('2026-01-15T06:05:00Z'); // 07:05 Europe/Berlin
+  const morningState = { ...state, jobs: { priority: { id: Math.floor(morning / CYCLE_MS), done: true } } };
+  assert.equal(scheduledCollectionDue(morningState, morning, 7 * 60 + 5), true, 'pilot: due once local time reaches 07:05');
+});
+
+test('off-cycle MAIN advance session loop is bounded (cannot busy-loop) and stops on idle', () => {
+  const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.match(offCycleBlock, /while\(Date\.now\(\)\+5000<stopAt\)\{/);
+  assert.match(offCycleBlock, /if\(offCycleResult\.status==='idle'\)break/);
 });
