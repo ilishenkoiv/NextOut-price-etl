@@ -393,6 +393,85 @@ test('runBoundedMainAdvance has a hard iteration ceiling so a misbehaving engine
   assert.equal(tickCalls, 25);
 });
 
+// Regression coverage for the production traces that showed a genuinely-idle-looking off-cycle
+// session had, in fact, made or could still make real MAIN progress:
+//   21:10  ticks=1 providerRequests=0   mainCursor unchanged  lastStatus='idle'
+//   21:15  ticks=1 providerRequests=266 mainCursor 2371→2432  lastStatus='idle'
+// Root cause: SequentialSchedule.tick() only `return`s early on 'progress'/'done'. On 'empty' or
+// 'yield' it advances the persisted frame phase and keeps sweeping tail/maintenance/reserve WITHIN
+// THE SAME tick() call, so a MAIN unit that ran for most of its allotted deadline (21:15's 266
+// requests / 61 cells) and then yielded — or a MAIN job still on its 60s post-yield `retryAt`
+// cooldown from an earlier trigger (21:10, skipped before ever calling adapter.step) — both
+// surface as a bare top-level 'idle'. The pre-fix runBoundedMainAdvance stopped the whole off-cycle
+// process on that first 'idle', discarding any remaining `stopAt` runway and forcing the next
+// 5-minute cron trigger to pay full session startup before MAIN could resume.
+test('off-cycle idle after a MAIN cooldown (the 21:10 trace: 0 requests, cursor unchanged) waits out the retry instead of ending the session',async()=>{
+  const state=freshScheduleState();
+  // main.retryAt is 30s in the future — as SequentialSchedule.tick() itself leaves it right after a
+  // yield/empty result (retryAt = that tick's clock() + 60_000); this trigger's own claim/session
+  // start landed 30s into that cooldown, well before minRunwayMs is even relevant.
+  state.jobs.main={id:0,planDate:'2026-09-24',checkpoint:{cursor:2371,total:5000,wave:43},done:false,startedAt:0,completedAt:null,retryAt:30_000,activeMs:0};
+  let clock=0,stepCalls=0,sleptMs=null;
+  const engine=new SequentialSchedule({
+    state,clock:()=>clock,lease:async()=>true,save:async s=>{state.jobs=s.jobs;state.frame=s.frame;},
+    stopAt:20*MINMS, // ~20 minutes of real stopAt runway still available — nowhere near exhausted
+    handlers:{main:{maxUnitMs:90_000,step:async({job})=>{stepCalls++;clock+=75_000;
+      return{status:'progress',checkpoint:{...job.checkpoint,cursor:job.checkpoint.cursor+1}};}}},
+  });
+  const sleep=async ms=>{sleptMs=ms;clock+=ms;};
+  const{ticks,lastStatus}=await runBoundedMainAdvance({engine,stopAt:20*MINMS,clock:()=>clock,sleep});
+  assert.ok(sleptMs!==null&&sleptMs<=60_000,'waits out MAIN\'s own bounded (<=60s) retryAt cooldown, no busy-loop');
+  assert.ok(stepCalls>=1,'after the cooldown, MAIN actually resumes and makes real progress in this same session');
+  assert.ok(state.jobs.main.checkpoint.cursor>2371,'the durable cursor advances instead of the session ending at cursor unchanged');
+  assert.ok(ticks>1,'more than the single wasted idle tick from before the fix');
+});
+
+test('off-cycle idle right after a real MAIN burst (the 21:15 trace: 266 requests, cursor +61) stops cleanly once too little runway remains',async()=>{
+  const state=freshScheduleState();
+  state.jobs.main={id:0,planDate:'2026-09-24',checkpoint:{cursor:2371,total:5000,wave:43},done:false,startedAt:0,completedAt:null,retryAt:0,activeMs:0};
+  let clock=0,slept=false;
+  const engine=new SequentialSchedule({
+    state,clock:()=>clock,lease:async()=>true,save:async s=>{state.jobs=s.jobs;state.frame=s.frame;},
+    stopAt:80_000, // barely any runway left, matching a MAIN burst that already consumed the window
+    handlers:{main:{maxUnitMs:75_000,step:async({job})=>{clock+=75_000;
+      // Mirrors collection-adapters.mjs's provider-throttle CollectionYield: the unit ran to (near)
+      // its own deadline doing real work, then yielded — SequentialSchedule.tick() sets retryAt.
+      return{status:'yield',checkpoint:{...job.checkpoint,cursor:job.checkpoint.cursor+61}};}}},
+  });
+  const sleep=async ms=>{slept=true;clock+=ms;};
+  const{lastStatus}=await runBoundedMainAdvance({engine,stopAt:80_000,clock:()=>clock,sleep});
+  assert.equal(lastStatus,'idle');
+  assert.equal(state.jobs.main.checkpoint.cursor,2432,'the real progress from this trigger is preserved');
+  assert.equal(slept,false,'retryAt (clock()+60s) would land past stopAt minus minRunwayMs — must not wait, must stop cleanly');
+});
+
+test('off-cycle never waits past stopAt: a retryAt that would leave less than minRunwayMs stops immediately instead of oversleeping',async()=>{
+  const state=freshScheduleState();
+  state.jobs.main={id:0,planDate:'2026-09-24',checkpoint:{cursor:10,total:5000,wave:43},done:false,startedAt:0,completedAt:null,retryAt:57_000,activeMs:0};
+  let clock=0,tickCalls=0;
+  const engine={state,tick:async()=>{tickCalls++;return{status:'idle'};}};
+  const{ticks,lastStatus}=await runBoundedMainAdvance({engine,stopAt:60_000,clock:()=>clock,minRunwayMs:5000,
+    sleep:async()=>{throw new Error('must never sleep when the wait would cross stopAt - minRunwayMs');}});
+  assert.equal(tickCalls,1);assert.equal(ticks,1);assert.equal(lastStatus,'idle');
+});
+
+test('off-cycle does not retry-wait when MAIN is already done, has no pending retry, or the cooldown already elapsed (never a busy-loop)',async()=>{
+  const casesDone={id:0,planDate:'x',checkpoint:{cursor:5000,total:5000},done:true,retryAt:0,activeMs:0};
+  const engineDone={state:{jobs:{main:casesDone}},tick:async()=>({status:'idle'})};
+  const r1=await runBoundedMainAdvance({engine:engineDone,stopAt:10*MINMS,clock:()=>0,sleep:async()=>{throw new Error('no sleep: done');}});
+  assert.equal(r1.ticks,1);
+
+  const noRetry={id:0,planDate:'x',checkpoint:{cursor:10,total:5000},done:false,retryAt:0,activeMs:0};
+  const engineNoRetry={state:{jobs:{main:noRetry}},tick:async()=>({status:'idle'})};
+  const r2=await runBoundedMainAdvance({engine:engineNoRetry,stopAt:10*MINMS,clock:()=>0,sleep:async()=>{throw new Error('no sleep: no pending retry');}});
+  assert.equal(r2.ticks,1);
+
+  const staleRetry={id:0,planDate:'x',checkpoint:{cursor:10,total:5000},done:false,retryAt:100,activeMs:0};
+  const engineStale={state:{jobs:{main:staleRetry}},tick:async()=>({status:'idle'})};
+  const r3=await runBoundedMainAdvance({engine:engineStale,stopAt:10*MINMS,clock:()=>1000,sleep:async()=>{throw new Error('no sleep: retryAt already elapsed');}});
+  assert.equal(r3.ticks,1);
+});
+
 // The next four tests simulate separate off-cycle GitHub Actions invocations (each a fresh
 // process, fresh SequentialSchedule instance) that only share the durably-saved checkpoint — the
 // exact shape of successive real 5-minute-trigger sessions. `durable` stands in for the row

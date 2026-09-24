@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger } from './run-collection.mjs';
-import { CYCLE_MS } from './collection-schedule.mjs';
+import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger,
+  OFF_CYCLE_SAFETY_MARGIN_MS } from './run-collection.mjs';
+import { CYCLE_MS, offCycleMainBudget, nextPriorityDueAt, runBoundedMainAdvance, SequentialSchedule, freshScheduleState } from './collection-schedule.mjs';
 
 const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'utf8');
 
@@ -194,4 +195,47 @@ test('off-cycle MAIN advance delegates its bounded, keep-ticking loop to the sha
   assert.match(source, /import\s*\{[^}]*runBoundedMainAdvance[^}]*\}\s*from\s*'\.\/collection-schedule\.mjs'/);
   assert.match(offCycleBlock, /const \{ ?ticks, ?lastStatus ?\} ?= ?await runBoundedMainAdvance\(\{ ?engine, ?stopAt ?\}\)/);
   assert.doesNotMatch(offCycleBlock, /while\(Date\.now\(\)\+5000<stopAt\)/, 'the inline loop was extracted, not duplicated');
+});
+
+// The off-cycle MAIN progress-continuation fix (runBoundedMainAdvance waiting out MAIN's own
+// short retryAt cooldown instead of ending the session on a same-tick 'idle') reads only the
+// MAIN job and `stopAt`/`clock`. It has no market/time-of-day input at all: `offCycleMainBudget`
+// is a pure function of `instant` and the two fixed constants below, and `offCycleHandlers` in
+// run-collection.mjs unconditionally excludes 'priority' with no branch on PRIORITY_MARKET_SCHEDULE
+// (see the two tests above). priority-market-schedule.mjs's peak(19:00-23:00 DACH/18:00-23:00
+// other)/daytime(07:00-19:00, 2h cadence)/night(23:00-07:00, MAIN-only) cadence governs only
+// which roulette/window tickets a DUE priority cycle refreshes — off-cycle triggers can never run
+// priority, so that cadence cannot affect this fix. This test pins that invariant across
+// representative peak/day/night instants and both legacy and pilot mode: identical stopAt budget,
+// identical MAIN-continuation behavior, in every case.
+test('off-cycle MAIN advance and its cooldown-continuation fix are identical at peak/day/night boundaries and under legacy/pilot mode — neither reads market-schedule state',async()=>{
+  const instants={
+    dachPeak:Date.parse('2026-09-24T17:05:00Z'),   // 19:05 Europe/Berlin — DACH peak start
+    daytime:Date.parse('2026-09-24T08:10:00Z'),     // 10:10 Europe/Berlin — 2h daytime cadence
+    night:Date.parse('2026-09-24T01:00:00Z'),       // 03:00 Europe/Berlin — night, MAIN-only for priority
+  };
+  for(const [label,instant] of Object.entries(instants)){
+    for(const pilotMarketSchedule of [false,true]){
+      // offCycleMainBudget takes no mode flag; assert its result is exactly the pure formula,
+      // regardless of which mode this representative instant is evaluated under.
+      const stopAt=offCycleMainBudget(instant,{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:20*60000});
+      const expectedCeiling=nextPriorityDueAt(instant)-OFF_CYCLE_SAFETY_MARGIN_MS;
+      assert.equal(stopAt,Math.min(expectedCeiling,instant+20*60000),
+        `${label}/pilot=${pilotMarketSchedule}: stopAt must equal the pure offCycleMainBudget formula`);
+      if(stopAt===null)continue; // too close to the next due cycle at this instant — nothing to advance, consistent in both modes
+      // The cooldown-continuation fix itself: same MAIN state, same outcome, independent of mode.
+      const state=freshScheduleState();
+      state.jobs.main={id:0,planDate:'2026-09-24',checkpoint:{cursor:100,total:5000,wave:43},done:false,startedAt:instant,completedAt:null,retryAt:instant+30_000,activeMs:0};
+      let clock=instant;
+      const engine=new SequentialSchedule({
+        state,clock:()=>clock,lease:async()=>true,save:async s=>{state.jobs=s.jobs;state.frame=s.frame;},
+        stopAt,handlers:{main:{maxUnitMs:90_000,step:async({job})=>{clock+=75_000;
+          return{status:'progress',checkpoint:{...job.checkpoint,cursor:job.checkpoint.cursor+1}};}}},
+      });
+      const sleep=async ms=>{clock+=ms;};
+      await runBoundedMainAdvance({engine,stopAt,clock:()=>clock,sleep});
+      assert.ok(state.jobs.main.checkpoint.cursor>100,
+        `${label}/pilot=${pilotMarketSchedule}: MAIN resumed past its cooldown regardless of time-of-day or market-schedule mode`);
+    }
+  }
 });

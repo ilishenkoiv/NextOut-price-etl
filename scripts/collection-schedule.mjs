@@ -267,20 +267,48 @@ export class SequentialSchedule {
 
 // Extracted, unit-tested off-cycle driver: keep calling one bounded engine.tick() at a time while
 // runway remains before `stopAt` (the real safety-margin-bounded deadline before the next due
-// priority cycle, from offCycleMainBudget), stop the instant the engine reports true idle (nothing
-// schedulable right now), and never spin once idle. Each tick() call already rechecks its own
-// per-task deadline against `stopAt` (via SequentialSchedule's cycleEnd calc) before starting any
-// unit, already claims/renews the single lease and fence internally, and already persists the
-// checkpoint after every unit — this function adds no new deadline math, it only bounds *how many*
-// ticks are attempted. `minRunwayMs` mirrors the 5s guard the inline off-cycle loop used before
+// priority cycle, from offCycleMainBudget), stop once there is genuinely nothing left to do, and
+// never spin. Each tick() call already rechecks its own per-task deadline against `stopAt` (via
+// SequentialSchedule's cycleEnd calc) before starting any unit, already claims/renews the single
+// lease and fence internally, and already persists the checkpoint after every unit — this function
+// adds no new deadline math beyond the bounded retry wait below, it only bounds *how many* ticks
+// are attempted. `minRunwayMs` mirrors the 5s guard the inline off-cycle loop used before
 // extraction: below it, a new tick could not plausibly complete useful work before `stopAt`.
-export async function runBoundedMainAdvance({ engine, stopAt, clock = Date.now, minRunwayMs = 5000, maxTicks = 1000 }) {
+//
+// A single tick() can report overall 'idle' immediately AFTER real MAIN progress in that SAME
+// call: tick()'s outer loop only `return`s early on 'progress'/'done'; on 'empty'/'yield' it
+// advances the persisted frame phase and keeps sweeping tail/maintenance/reserve within the same
+// call, so a MAIN unit that made real progress and then yielded (provider throttle: the next
+// request would not fit before its unit deadline) can still surface as a bare 'idle' once nothing
+// else is schedulable either. Treating that 'idle' as "stop for the rest of this off-cycle window"
+// is exactly the bug this fixes: it ends the whole GH Actions process (and its safe `stopAt`
+// runway) at the first blip, forcing the NEXT 5-minute cron trigger to pay full session startup
+// (checkout/npm ci/claim) before MAIN can resume — instead of this same process simply waiting out
+// MAIN's own short (60s, `SequentialSchedule.tick`'s yield/empty retryAt) cooldown and continuing.
+// So on 'idle', only stop when MAIN is actually finished, has no scheduled retry, or waiting for
+// that retry would not leave enough runway for another tick before `stopAt` — otherwise wait
+// exactly until MAIN's retryAt (bounded by the codebase's own 60s constant, never a busy loop) and
+// try again. Never touches priority: off-cycle's own handlers (main.mjs's off-cycle caller) never
+// include a 'priority' adapter, so this can only ever extend MAIN/TAIL work, never delay or
+// duplicate a due priority cycle — the hard stop before `nextPriorityDueAt` remains `stopAt` itself,
+// unchanged and untouched by this loop, in both legacy and PRIORITY_MARKET_SCHEDULE=pilot mode.
+export async function runBoundedMainAdvance({ engine, stopAt, clock = Date.now, minRunwayMs = 5000, maxTicks = 1000,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   let ticks = 0, lastStatus = 'no_ticks';
   while (clock() + minRunwayMs < stopAt && ticks < maxTicks) {
     const result = await engine.tick();
     ticks += 1;
     lastStatus = result.status;
-    if (result.status === 'idle') break; // nothing left to do within this bounded budget — stop, don't spin
+    if (result.status !== 'idle') continue; // real progress/done this tick — keep driving normally
+    const main = engine.state?.jobs?.main;
+    const mainHasMoreWork = Boolean(main) && !main.done && Number(main.checkpoint?.total) > Number(main.checkpoint?.cursor ?? 0);
+    const retryAt = Number(main?.retryAt ?? 0);
+    // Nothing to wait for (main done/unstarted/no pending retry), the cooldown has already
+    // elapsed (retrying immediately would busy-loop against an unrelated idle cause), or waiting
+    // it out would leave less than minRunwayMs before stopAt: genuinely stop here, unchanged from
+    // the original behavior.
+    if (!mainHasMoreWork || !(retryAt > clock()) || retryAt + minRunwayMs >= stopAt) break;
+    await sleep(retryAt - clock());
   }
   return { ticks, lastStatus };
 }
