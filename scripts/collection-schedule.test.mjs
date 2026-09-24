@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SequentialSchedule, freshScheduleState, prepareJob, slotAt, SLOTS, CYCLE_MS, MAIN_CYCLE_MS, PRIORITY_MAX_CYCLE_MS, mainAtRisk, nominalSessionBudgets,
-  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage } from './collection-schedule.mjs';
+  priorityCycleProjection, measuredPriorityCapacity, projectMonthlyRunnerUsage, nextPriorityDueAt, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 
 test('a cycle has the agreed budgets and no overlaps or holes', () => {
   let end = 0;
@@ -258,4 +258,217 @@ test('completed main is still counted once with the guarantee on (snapshot/count
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);
+});
+
+test('nextPriorityDueAt is the exact start of the NEXT 30-minute cycle, never the current one', () => {
+  assert.equal(nextPriorityDueAt(0), CYCLE_MS);
+  assert.equal(nextPriorityDueAt(CYCLE_MS - 1), CYCLE_MS);
+  assert.equal(nextPriorityDueAt(CYCLE_MS), 2 * CYCLE_MS); // exactly on a boundary counts as already in that cycle
+  assert.equal(nextPriorityDueAt(CYCLE_MS + 1), 2 * CYCLE_MS);
+});
+
+test('offCycleMainBudget never crosses into the safety margin before the next due cycle', () => {
+  // 10 minutes into a cycle, 20 minutes of runway left before the next due cycle.
+  const instant = 10 * MINMS;
+  const stop = offCycleMainBudget(instant, { safetyMarginMs: 5 * MINMS, maxSessionMs: 3 * MINMS });
+  assert.equal(stop, instant + 3 * MINMS); // maxSessionMs is the binding constraint here
+  assert.ok(nextPriorityDueAt(instant) - stop >= 5 * MINMS);
+});
+
+test('offCycleMainBudget is bounded by the safety margin, not just maxSessionMs, when the cycle is nearly over', () => {
+  // 27 minutes into a cycle: only 3 minutes of runway before the next due cycle.
+  const instant = 27 * MINMS;
+  const stop = offCycleMainBudget(instant, { safetyMarginMs: 90_000, maxSessionMs: 5 * MINMS });
+  assert.equal(stop, nextPriorityDueAt(instant) - 90_000);
+  assert.ok(stop - instant < 2 * MINMS, 'runway is capped well under maxSessionMs by the margin');
+});
+
+test('offCycleMainBudget fails closed (null = do no work) once inside the safety margin — never delays priority', () => {
+  const instant = 29 * MINMS; // 1 minute of runway, less than a 90s margin
+  assert.equal(offCycleMainBudget(instant, { safetyMarginMs: 90_000, maxSessionMs: 3 * MINMS }), null);
+  // A margin as wide as the whole cycle: everywhere inside the cycle is "too close" — always null.
+  assert.equal(offCycleMainBudget(1 * MINMS, { safetyMarginMs: CYCLE_MS, maxSessionMs: 3 * MINMS }), null);
+});
+
+test('offCycleMainBudget rejects invalid inputs instead of silently defaulting', () => {
+  assert.throws(() => offCycleMainBudget(-1, { safetyMarginMs: 1000, maxSessionMs: 1000 }), /Invalid clock/);
+  assert.throws(() => offCycleMainBudget(0, { safetyMarginMs: -1, maxSessionMs: 1000 }), /Invalid off-cycle budget/);
+  assert.throws(() => offCycleMainBudget(0, { safetyMarginMs: 0, maxSessionMs: 0 }), /Invalid off-cycle budget/);
+});
+
+test('an off-cycle engine with only fast/main/tail handlers never touches priority: no cursor reset, no lag', async () => {
+  // Simulates a mid-cycle (priority-not-due) trigger: the SAME engine machinery, just without a
+  // priority handler registered, resuming main from a non-zero saved cursor.
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 100, total: 23952, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const stop = offCycleMainBudget(10 * MINMS, { safetyMarginMs: 5 * MINMS, maxSessionMs: 3 * MINMS });
+  const engine = new SequentialSchedule({
+    state, clock: () => 10 * MINMS, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 1000, step: async ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }) } },
+  });
+  const r = await engine.tick();
+  assert.equal(r.task, 'main');
+  assert.equal(r.status, 'progress');
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, 101); // resumed from 100, not reset to 0
+  // The engine still tracks a priority job record internally (needed to compute priorityDue), but
+  // with no handler registered no work is ever attempted on it: checkpoint stays null, never done.
+  assert.equal(engine.state.jobs.priority.checkpoint, null);
+  assert.equal(engine.state.jobs.priority.done, false);
+});
+
+test('an off-cycle engine cannot busy-loop past its own stopAt: it reports idle once budget is exhausted', async () => {
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 5, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 10 * MINMS;
+  const stop = clock + 500; // a tiny 500ms budget
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 1000, step: async ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }) } },
+  });
+  const r = await engine.tick(); // a 1000ms unit cannot fit in a 500ms budget
+  assert.equal(r.status, 'idle');
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, 0); // nothing was attempted, nothing to roll back
+});
+
+test('off-cycle MAIN never silently claims it finished on time when the provider is slower than estimated: it fails loud instead', async () => {
+  // A unit whose maxUnitMs estimate fits the remaining budget is admitted, but the provider turns
+  // out to be slower than estimated and the real wall-clock time crosses stopAt mid-unit. The
+  // engine must never silently return as if the budget was respected — it raises, so a caller
+  // (run-collection.mjs's off-cycle branch) can never mistake a slow overrun for a clean stop.
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 5, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 10 * MINMS;
+  const stop = offCycleMainBudget(clock, { safetyMarginMs: 90_000, maxSessionMs: 2 * MINMS }); // a normal, safely-margined off-cycle budget
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; }, stopAt: stop,
+    handlers: { main: { maxUnitMs: 30_000, step: async ({ job }) => { clock += 5 * MINMS; /* simulated slow provider, way past its own estimate */
+      return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }; } } },
+  });
+  await assert.rejects(() => engine.tick(), /exceeded its slot/);
+});
+
+test('runBoundedMainAdvance keeps calling bounded ticks while runway remains, one main unit per productive tick', async () => {
+  const state = freshScheduleState();
+  state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, total: 100, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  let clock = 0, stepCalls = 0;
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async (s) => { state.jobs = s.jobs; state.frame = s.frame; },
+    stopAt: 6 * MINMS, // enough runway for several 75s-work/90s-admission units, not the whole plan
+    handlers: { main: { maxUnitMs: 90_000, step: async ({ job }) => { stepCalls++; clock += 75_000;
+      return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } }; } } },
+  });
+  const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt: 6 * MINMS, clock: () => clock });
+  // Real units keep landing (matching cursor/stepCalls) until the scheduler's own
+  // LOWER_PHASE_RESERVE_MS guard makes the next unit no longer fit before stopAt; that last
+  // recheck costs one more (non-productive) tick() call, which is exactly what a caller must be
+  // able to tell apart from a wasted spin — lastStatus surfaces it as 'idle'.
+  assert.ok(stepCalls >= 3, `expected several bounded main units to run, got ${stepCalls}`);
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, stepCalls, 'one cell of progress per productive tick, matching the mocked adapter');
+  assert.equal(ticks, stepCalls + 1, 'exactly one extra tick() call detects the deadline and reports idle — no busy-loop beyond that');
+  assert.equal(lastStatus, 'idle', 'stops because the next unit no longer fits before stopAt, reported cleanly as idle');
+});
+
+test('runBoundedMainAdvance stops immediately and cleanly on true idle — no busy-loop', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'idle' }; } };
+  const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt: 10 * MINMS, clock: () => 0 });
+  assert.equal(ticks, 1, 'idle must stop the loop on the very first tick, not spin waiting for more work');
+  assert.equal(tickCalls, 1);
+  assert.equal(lastStatus, 'idle');
+});
+
+test('runBoundedMainAdvance never calls tick() once runway is exhausted (rechecks the hard deadline before every unit)', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } };
+  const { ticks } = await runBoundedMainAdvance({ engine, stopAt: 0, clock: () => 0 }); // zero runway from the start
+  assert.equal(ticks, 0);
+  assert.equal(tickCalls, 0, 'no unit may be attempted once stopAt has already been reached');
+});
+
+test('runBoundedMainAdvance has a hard iteration ceiling so a misbehaving engine can never spin forever', async () => {
+  let tickCalls = 0;
+  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } }; // never advances the clock
+  const { ticks } = await runBoundedMainAdvance({ engine, stopAt: 10 * MINMS, clock: () => 0, maxTicks: 25 });
+  assert.equal(ticks, 25);
+  assert.equal(tickCalls, 25);
+});
+
+// The next four tests simulate separate off-cycle GitHub Actions invocations (each a fresh
+// process, fresh SequentialSchedule instance) that only share the durably-saved checkpoint — the
+// exact shape of successive real 5-minute-trigger sessions. `durable` stands in for the row
+// CollectionStore reads/writes; each "trigger" builds its engine from a structuredClone of it, so
+// nothing but the saved checkpoint carries over, the same as two separate GH Actions jobs would.
+function offCycleSession({ durable, clockStart, budgetMs, mainStep }) {
+  let clock = clockStart;
+  const state = structuredClone(durable.state);
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true,
+    save: async s => { durable.state = structuredClone(s); }, stopAt: clockStart + budgetMs,
+    handlers: { main: { maxUnitMs: 90_000, step: async args => { clock += 75_000; return mainStep(args); } } },
+  });
+  return runBoundedMainAdvance({ engine, stopAt: clockStart + budgetMs, clock: () => clock }).then(r => ({ ...r, engine }));
+}
+
+test('successive off-cycle triggers accumulate MAIN progress across separate sessions without resetting the checkpoint', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const step = ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } });
+
+  const first = await offCycleSession({ durable, clockStart: 10 * MINMS, budgetMs: 6 * MINMS, mainStep: step });
+  const cursorAfterFirst = durable.state.jobs.main.checkpoint.cursor;
+  assert.ok(cursorAfterFirst > 0, 'first trigger made real progress');
+  assert.equal(first.lastStatus, 'idle');
+
+  // A second, independently-built session (new engine, no shared object identity with the first)
+  // resumes from the persisted checkpoint rather than restarting at 0.
+  const second = await offCycleSession({ durable, clockStart: 40 * MINMS, budgetMs: 6 * MINMS, mainStep: step });
+  assert.ok(durable.state.jobs.main.checkpoint.cursor > cursorAfterFirst, 'second trigger resumed and advanced further, not reset');
+  assert.equal(second.lastStatus, 'idle');
+  // Priority was never offered a handler in either session — untouched across both triggers.
+  assert.equal(durable.state.jobs.priority.checkpoint, null);
+  assert.equal(durable.state.jobs.priority.done, false);
+});
+
+test('soft per-cell errors from the main adapter accumulate in the persisted checkpoint across successive off-cycle triggers without halting progress', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  // Every other cell reports a provider probe failure — the real main adapter's soft-error shape
+  // (cp.errors increments, cursor still advances, status stays 'progress' — see
+  // collection-adapters.mjs's directResult/anyResult error accounting).
+  const flakyStep = ({ job }) => {
+    const failed = job.checkpoint.cursor % 2 === 1;
+    return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1, errors: job.checkpoint.errors + (failed ? 1 : 0) } };
+  };
+
+  await offCycleSession({ durable, clockStart: 10 * MINMS, budgetMs: 6 * MINMS, mainStep: flakyStep });
+  const afterFirst = durable.state.jobs.main.checkpoint;
+  assert.ok(afterFirst.cursor > 0 && afterFirst.errors > 0, 'errors were recorded without stalling the cursor');
+  assert.equal(afterFirst.errors, Math.floor(afterFirst.cursor / 2), 'error count matches the flaky pattern exactly, no double-count or drop');
+
+  await offCycleSession({ durable, clockStart: 40 * MINMS, budgetMs: 6 * MINMS, mainStep: flakyStep });
+  const afterSecond = durable.state.jobs.main.checkpoint;
+  assert.ok(afterSecond.cursor > afterFirst.cursor, 'a second session keeps making progress despite earlier errors');
+  assert.ok(afterSecond.errors > afterFirst.errors, 'the error count is cumulative across sessions, not reset');
+});
+
+test('a hard adapter failure mid-unit propagates out of an off-cycle session instead of being swallowed, and the last durably-saved checkpoint is left intact', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 3, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const checkpointBefore = structuredClone(durable.state.jobs.main.checkpoint);
+  let clock = 10 * MINMS;
+  const state = structuredClone(durable.state);
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async s => { durable.state = structuredClone(s); },
+    stopAt: clock + 6 * MINMS,
+    handlers: { main: { maxUnitMs: 90_000, step: async () => { clock += 75_000; throw new Error('provider write was not acknowledged'); } } },
+  });
+  await assert.rejects(
+    () => runBoundedMainAdvance({ engine, stopAt: clock + 6 * MINMS, clock: () => clock }),
+    /provider write was not acknowledged/,
+    'a genuine adapter failure must surface to the caller (run-collection.mjs\'s top-level catch), not be treated as a clean stop',
+  );
+  // The failed unit's pre-attempt state was durably saved (SequentialSchedule.tick() persists
+  // BEFORE calling adapter.step); the checkpoint itself is exactly what it was before the failed
+  // unit — no partial/corrupt forward write from the unit that threw.
+  assert.deepEqual(durable.state.jobs.main.checkpoint, checkpointBefore);
 });

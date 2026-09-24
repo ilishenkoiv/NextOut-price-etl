@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins } from './snapshot-daily-origin-cheapest.mjs';
+import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
+  LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES, pilotSourcesReady, PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
 
 test('selects one deterministic cheapest real future offer per origin and flight type', () => {
@@ -82,6 +83,56 @@ test('nightly due gate is 03:30 Berlin on winter, spring-DST and fall-DST days',
   assert.equal(nightlySelectionDue('2026-03-29T01:30:00Z'),true);
   assert.equal(nightlySelectionDue('2026-10-25T02:29:59Z'),false); // 03:29:59 CET
   assert.equal(nightlySelectionDue('2026-10-25T02:30:00Z'),true);
+});
+
+test('a pilot (later) threshold overrides the legacy 03:30 default without changing it', () => {
+  assert.equal(LEGACY_SELECTION_THRESHOLD_MINUTES, 3 * 60 + 30);
+  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 7 * 60 + 5);
+  // 03:30 Berlin (legacy-due) is still inside the pilot's night gap — not due under the pilot threshold.
+  assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), false);
+  assert.equal(nightlySelectionDue('2026-01-15T06:04:59Z', PILOT_SELECTION_THRESHOLD_MINUTES), false); // 07:04:59
+  assert.equal(nightlySelectionDue('2026-01-15T06:05:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), true); // 07:05:00
+  // Calling with no threshold argument is untouched — exact legacy behavior.
+  assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z'), true);
+});
+
+test('nightlySelectionDue rejects an out-of-range threshold instead of silently misfiring', () => {
+  assert.throws(() => nightlySelectionDue(Date.now(), -1), /Invalid selection threshold/);
+  assert.throws(() => nightlySelectionDue(Date.now(), 24 * 60), /Invalid selection threshold/);
+});
+
+test('pilotSourcesReady requires most expected origins to show a fresh offer, not just any offer within 36h', () => {
+  const now = Date.parse('2026-09-24T05:05:00Z');
+  const expected = new Set(['FRA', 'MUC', 'LHR', 'AMS']);
+  const freshRow = (origin, ageMs) => ({ origin, updated_at: new Date(now - ageMs).toISOString() });
+  // All fresh (well inside 3h) — ready.
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000), freshRow('MUC', 5 * 60000), freshRow('LHR', 5 * 60000), freshRow('AMS', 5 * 60000)], now, expected), true);
+  // All stale (>3h, e.g. only pre-pause data survived) — not ready, even though well inside the blanket 36h eligibility window.
+  assert.equal(pilotSourcesReady([freshRow('FRA', 8 * 3600000), freshRow('MUC', 8 * 3600000), freshRow('LHR', 8 * 3600000), freshRow('AMS', 8 * 3600000)], now, expected), false);
+  // Only 1/4 fresh (25% < 90% coverage) — not ready.
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000), freshRow('MUC', 8 * 3600000), freshRow('LHR', 8 * 3600000), freshRow('AMS', 8 * 3600000)], now, expected), false);
+  // An origin missing from `rows` entirely counts against coverage exactly like a stale one.
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000), freshRow('MUC', 5 * 60000), freshRow('LHR', 5 * 60000)], now, expected), false);
+  // No expected origins at all → never ready (fails closed, not vacuously true).
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000)], now, new Set()), false);
+});
+
+test('pilotSourcesReady respects the exact freshness boundary and rejects a bad instant', () => {
+  const now = Date.parse('2026-09-24T05:05:00Z');
+  const expected = new Set(['FRA']);
+  assert.equal(pilotSourcesReady([{ origin: 'FRA', updated_at: new Date(now - PILOT_SOURCE_FRESHNESS_MS).toISOString() }], now, expected), true); // exactly at the boundary — inclusive
+  assert.equal(pilotSourcesReady([{ origin: 'FRA', updated_at: new Date(now - PILOT_SOURCE_FRESHNESS_MS - 1000).toISOString() }], now, expected), false);
+  assert.throws(() => pilotSourcesReady([], NaN, expected), /Invalid instant/);
+});
+
+test('the pilot freshness gate is wired into both daily-publish scripts, gated by pilotMarketSchedule', () => {
+  const originSource = readFileSync(new URL('./snapshot-daily-origin-cheapest.mjs', import.meta.url), 'utf8');
+  const windowSource = readFileSync(new URL('./snapshot-daily-window-candidates.mjs', import.meta.url), 'utf8');
+  assert.match(originSource, /if\(pilotMarketSchedule&&!force&&!pilotSourcesReady\(offers,instant,origins\)\)/);
+  assert.match(originSource, /reason:'sources_not_fresh'/);
+  assert.match(windowSource, /import \{ berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, pilotSourcesReady \}/);
+  assert.match(windowSource, /if\(pilotMarketSchedule&&!force&&!pilotSourcesReady\(rows,instant,publishedSnapshotOrigins\(\)\)\)/);
+  assert.match(windowSource, /reason:'sources_not_fresh'/);
 });
 
 test('production snapshot query refuses source observations older than 36 hours', () => {

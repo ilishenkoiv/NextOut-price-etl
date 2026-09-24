@@ -4,11 +4,17 @@ import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
-import { SequentialSchedule, freshScheduleState, CYCLE_MS } from './collection-schedule.mjs';
+import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
+import { publishPilotState } from './pilot-price-metadata.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
-import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue } from './snapshot-daily-origin-cheapest.mjs';
+import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
+
+// Headroom an off-cycle (priority-not-due) trigger must always leave before the next real due
+// (priority) cycle. Generous relative to observed GH Actions/DB overhead (a due session's own
+// checkout+npm-ci+claim overhead measured ~15-20s) so a slow runner start never eats into it.
+export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
@@ -25,12 +31,12 @@ export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   return false;
 }
 
-export function scheduledCollectionDue(state, instant=Date.now()) {
+export function scheduledCollectionDue(state, instant=Date.now(), selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES) {
   if(!state||state.version!==1||!state.jobs)return true;
   const cycle=Math.floor(instant/CYCLE_MS),priority=state.jobs.priority;
   const priorityDue=!priority||priority.id!==cycle||!priority.done;
   const day=berlinObservedOn(instant),selection=state.dailySelection;
-  const selectionDue=nightlySelectionDue(instant)&&(
+  const selectionDue=nightlySelectionDue(instant,selectionThresholdMinutes)&&(
     selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true);
   return priorityDue||selectionDue;
 }
@@ -50,9 +56,9 @@ export function isAutomatedTrigger(env={}){
 // single database claim, verifies the lease before each idempotent once/day publication and
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
 // recovery-only; no independently scheduled selection writer exists.
-export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),
-  publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
-  if(!nightlySelectionDue(instant))return{state,published:false};
+export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES,
+  pilotMarketSchedule=false,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
+  if(!nightlySelectionDue(instant,selectionThresholdMinutes))return{state,published:false};
   const day=berlinObservedOn(instant),snapshotAt=new Date(instant).toISOString();
   const checkpoint=state.dailySelection?.day===day?structuredClone(state.dailySelection):{
     day,rouletteDone:false,windowDone:false,startedAt:instant};
@@ -60,22 +66,30 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   let published=false;
   if(!checkpoint.rouletteDone){
     if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
-    const result=await publishRoulette({db,snapshotAt,expansionWave:wave});
-    checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
-    await store.save(state);published ||= checkpoint.roulettePublished;
+    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule});
+    // sources_not_fresh (pilot only): sources have not shown a fresh post-pause pass yet — this
+    // is NOT "done for the day". Leave rouletteDone false so the next due cycle retries; never
+    // publish (or mark complete) a pool built from stale pre-pause prices.
+    if(result?.reason!=='sources_not_fresh'){
+      checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
+    } else checkpoint.rouletteSourcesNotFreshAt=Date.now();
+    await store.save(state);published ||= checkpoint.roulettePublished===true;
   }
   if(!checkpoint.windowDone){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
-    const result=await publishWindows({db,instant,wave});
-    checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
-    await store.save(state);published ||= checkpoint.windowPublished;
+    const result=await publishWindows({db,instant,wave,pilotMarketSchedule});
+    if(result?.reason!=='sources_not_fresh'){
+      checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
+    } else checkpoint.windowSourcesNotFreshAt=Date.now();
+    await store.save(state);published ||= checkpoint.windowPublished===true;
     if(checkpoint.windowPublished&&state.jobs.priority){
       state.jobs.priority.done=false;state.jobs.priority.completedAt=null;
       if(state.jobs.priority.checkpoint)state.jobs.priority.checkpoint.phase='roulette';
       await store.save(state);
     }
   }
-  checkpoint.completedAt=Date.now();await store.save(state);
+  if(checkpoint.rouletteDone&&checkpoint.windowDone)checkpoint.completedAt=Date.now();
+  await store.save(state);
   return{state,published};
 }
 
@@ -105,10 +119,49 @@ export async function main(env=process.env){
     if(!await oldRunnerHasStopped(previous,{repository:env.GITHUB_REPOSITORY,token:env.GITHUB_TOKEN}))throw new Error('Old runner not confirmed stopped; refusing overlap');
     const state=await store.claim(previous?.owner??null)??freshScheduleState();claimed=true;
     if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
-    if(automated&&!scheduledCollectionDue(state)){
-      console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
+    const pilotMarketSchedule=env.PRIORITY_MARKET_SCHEDULE==='pilot';
+    const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
+    if(automated&&!scheduledCollectionDue(state,Date.now(),selectionThresholdMinutes)){
+      // OFF_CYCLE_MAIN_MINUTES is unset/0 by default: exact legacy behavior (immediate not_due,
+      // no provider work, no engine). Opt-in only. Priority is NOT due here by construction
+      // (scheduledCollectionDue already covers priorityDue||selectionDue) — this path never
+      // touches priority or daily selection, and never runs when it can't finish with a safety
+      // margin before the next real due (priority) cycle.
+      const offCycleMinutes=Number(env.OFF_CYCLE_MAIN_MINUTES??0);
+      const stopAt=offCycleMinutes>0
+        ?offCycleMainBudget(Date.now(),{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:offCycleMinutes*60000})
+        :null;
+      if(!stopAt){
+        console.log(JSON.stringify({event:'collection_not_due',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS)}));return;
+      }
+      // Published once per actual off-cycle attempt (not on the immediate not_due exit above) —
+      // this value only changes when the Variable is toggled, so it never needs the 5-minute
+      // heartbeat's own write load; the regular due session below covers the rest of the day.
+      await publishPilotState(db,env);
+      const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+      const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
+      const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
+      // Off-cycle exists to advance MAIN (never priority). Offering fast/maintenance here as well
+      // would let a trigger that happens to land on the wall-clock 'fast' or 'maintenance' slot
+      // (SLOTS is wall-clock-driven, not off-cycle-aware) spend its whole bounded budget on that
+      // slot instead of MAIN, defeating the trigger's purpose. Fast/maintenance already get their
+      // guaranteed due-session slot every cycle regardless of this. Tail stays as a fallback (via
+      // guaranteeDailyMain/mainAtRisk) so a trigger never idles outright once MAIN is caught up.
+      const offCycleHandlers={main:allAdapters.main,tail:allAdapters.tail};
+      engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt,guaranteeDailyMain,handlers:offCycleHandlers});
+      console.log(JSON.stringify({event:'off_cycle_main_advance_start',source:triggerSource,cycle:Math.floor(Date.now()/CYCLE_MS),
+        budgetMs:stopAt-Date.now(),mainCursor:engine.state.jobs.main?.checkpoint?.cursor,mainTotal:engine.state.jobs.main?.checkpoint?.total}));
+      const { ticks, lastStatus } = await runBoundedMainAdvance({ engine, stopAt });
+      console.log(JSON.stringify({event:'off_cycle_main_advance_end',source:triggerSource,providerRequests:provider.requests,
+        ticks,lastStatus,
+        progress:Object.fromEntries(Object.entries(engine.state.jobs).filter(([k])=>k!=='priority')
+          .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
+      return;
     }
-    await runDueDailySelection({state,store,db,wave});
+    // Published once per regular due session — every ~30 minutes at worst, well inside the
+    // 120-minute ceiling this same contract publishes, so the app never reads a stale pilot flag.
+    await publishPilotState(db,env);
+    await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
     const end=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
