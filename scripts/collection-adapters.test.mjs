@@ -152,6 +152,37 @@ test('pilot market schedule (off by default): a DACH peak-hours instant still re
   });
 });
 
+test('pilot market schedule (window/carousel path): a night-hours instant skips that origin\'s window group entirely — parity with the roulette path above',async()=>{
+  await withPilotMarketSchedule(async()=>{
+    const nightUtc=Date.parse('2026-01-15T01:00:00Z'); // 02:00 Europe/Berlin — night, mainOnly
+    const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',
+      position:1,window_kind:'weekend',exact_observed_at:'2026-01-14T09:00:00Z',updated_at:'2026-01-14T09:00:00Z'};
+    const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
+    const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc,
+      tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
+    assert.equal(f.requests,0,'no provider call for a window group whose origin is inside the night gap');
+    assert.equal(result.checkpoint.weekend.total,0);
+    assert.equal(result.checkpoint.weekend.done,true);
+  });
+});
+
+test('pilot market schedule (window/carousel path): a DACH peak-hours instant still refreshes that origin\'s group normally',async()=>{
+  await withPilotMarketSchedule(async()=>{
+    const peakUtc=Date.parse('2026-01-15T19:00:00Z'); // 20:00 Europe/Berlin — DACH peak (19:00-23:00)
+    const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',
+      position:1,window_kind:'weekend',exact_observed_at:'2026-01-14T09:00:00Z',updated_at:'2026-01-14T09:00:00Z'};
+    const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
+    const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc,
+      tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
+    assert.equal(f.requests,1,'the one selected window group is still refreshed at peak local time');
+    assert.equal(result.checkpoint.weekend.total,1);
+  });
+});
+
 test('pilot market schedule leaves the LEGACY (default, unset) path byte-identical: same origin/instant processes normally', async()=>{
   const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
   const nightUtc=Date.parse('2026-01-15T01:00:00Z');

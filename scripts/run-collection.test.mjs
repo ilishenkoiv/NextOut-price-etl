@@ -76,6 +76,42 @@ test('morning transition (pilot): a later due cycle, once sources ARE fresh, pub
   assert.ok(state.dailySelection.completedAt);
 });
 
+test('day boundary: yesterday\'s completed selection does not block today\'s — both roulette and carousel/window rebuild for the new Berlin day',async()=>{
+  const instant=Date.parse('2026-09-24T05:00:00Z'); // a new Berlin day, legacy threshold already past
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}},
+    dailySelection:{day:'2026-09-23',rouletteDone:true,windowDone:true,completedAt:1,startedAt:1}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const calls=[];
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,
+    publishRoulette:async args=>{calls.push('roulette');return{rebuilt:true};},
+    publishWindows:async args=>{calls.push('window');return{published:true};}});
+  assert.equal(state.dailySelection.day,'2026-09-24','the checkpoint moved to the new Berlin day, not reusing yesterday\'s');
+  assert.deepEqual(calls,['roulette','window'],'both paths rebuild for the new day — neither is silently skipped as "already done"');
+  assert.equal(result.published,true);
+  assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
+});
+
+test('asymmetric retry: roulette sources fresh and published while window sources are not — only window retries next cycle, roulette is never re-published',async()=>{
+  const instant=Date.parse('2026-09-24T05:05:00Z');
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const calls=[];
+  const first=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+    publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true};},
+    publishWindows:async()=>{calls.push('window');return{published:false,reason:'sources_not_fresh'};}});
+  assert.equal(state.dailySelection.rouletteDone,true,'roulette published — done for the day');
+  assert.equal(state.dailySelection.windowDone,false,'window not ready — must retry, never marked done from a not-fresh result');
+  assert.equal(first.published,true,'the roulette publish alone already counts as progress this cycle');
+  const later=Date.parse('2026-09-24T05:35:00Z');
+  const second=await runDueDailySelection({state,store,db:{},instant:later,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+    publishRoulette:async()=>{calls.push('roulette-again');return{rebuilt:true};},
+    publishWindows:async()=>{calls.push('window-again');return{published:true};}});
+  assert.deepEqual(calls,['roulette','window','window-again'],'roulette is never re-invoked once done for the day — only the still-pending window path retries');
+  assert.equal(second.published,true);
+  assert.equal(state.dailySelection.windowDone,true);
+  assert.ok(state.dailySelection.completedAt,'the day only completes once BOTH independently-gated paths are done');
+});
+
 test('legacy (pilotMarketSchedule unset) never receives a sources_not_fresh reason and behaves exactly as before',async()=>{
   const instant=Date.parse('2026-09-23T02:30:00Z'); // 03:30 Berlin, legacy threshold
   const state={version:1,jobs:{}};
