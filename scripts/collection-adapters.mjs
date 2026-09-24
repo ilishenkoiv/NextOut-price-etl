@@ -411,11 +411,16 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.phase==='weekend'){
         let w=cp.weekend;
         if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,passStartedAt:clock()};}
-        const epochs=await load('daily_window_candidate_epochs','observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups',
-          ['snapshot_at'],q=>q,deadline);
+        // Latest-row-only: snapshot_at is UNIQUE on this table (see
+        // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
+        // same row ascending-order .at(-1) used to, without paging the whole epoch history
+        // on every weekend-phase tick.
+        const epochs=await query(()=>db.from('daily_window_candidate_epochs')
+          .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
+          .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
-        const epoch=epochs.at(-1),epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
+        const epoch=epochs[0],epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
         if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at};
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
           const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
