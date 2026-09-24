@@ -387,8 +387,88 @@ test('runBoundedMainAdvance never calls tick() once runway is exhausted (recheck
 
 test('runBoundedMainAdvance has a hard iteration ceiling so a misbehaving engine can never spin forever', async () => {
   let tickCalls = 0;
-  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } }; // never reports idle, never advances the clock
+  const engine = { tick: async () => { tickCalls++; return { status: 'progress' }; } }; // never advances the clock
   const { ticks } = await runBoundedMainAdvance({ engine, stopAt: 10 * MINMS, clock: () => 0, maxTicks: 25 });
   assert.equal(ticks, 25);
   assert.equal(tickCalls, 25);
+});
+
+// The next four tests simulate separate off-cycle GitHub Actions invocations (each a fresh
+// process, fresh SequentialSchedule instance) that only share the durably-saved checkpoint — the
+// exact shape of successive real 5-minute-trigger sessions. `durable` stands in for the row
+// CollectionStore reads/writes; each "trigger" builds its engine from a structuredClone of it, so
+// nothing but the saved checkpoint carries over, the same as two separate GH Actions jobs would.
+function offCycleSession({ durable, clockStart, budgetMs, mainStep }) {
+  let clock = clockStart;
+  const state = structuredClone(durable.state);
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true,
+    save: async s => { durable.state = structuredClone(s); }, stopAt: clockStart + budgetMs,
+    handlers: { main: { maxUnitMs: 90_000, step: async args => { clock += 75_000; return mainStep(args); } } },
+  });
+  return runBoundedMainAdvance({ engine, stopAt: clockStart + budgetMs, clock: () => clock }).then(r => ({ ...r, engine }));
+}
+
+test('successive off-cycle triggers accumulate MAIN progress across separate sessions without resetting the checkpoint', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const step = ({ job }) => ({ status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1 } });
+
+  const first = await offCycleSession({ durable, clockStart: 10 * MINMS, budgetMs: 6 * MINMS, mainStep: step });
+  const cursorAfterFirst = durable.state.jobs.main.checkpoint.cursor;
+  assert.ok(cursorAfterFirst > 0, 'first trigger made real progress');
+  assert.equal(first.lastStatus, 'idle');
+
+  // A second, independently-built session (new engine, no shared object identity with the first)
+  // resumes from the persisted checkpoint rather than restarting at 0.
+  const second = await offCycleSession({ durable, clockStart: 40 * MINMS, budgetMs: 6 * MINMS, mainStep: step });
+  assert.ok(durable.state.jobs.main.checkpoint.cursor > cursorAfterFirst, 'second trigger resumed and advanced further, not reset');
+  assert.equal(second.lastStatus, 'idle');
+  // Priority was never offered a handler in either session — untouched across both triggers.
+  assert.equal(durable.state.jobs.priority.checkpoint, null);
+  assert.equal(durable.state.jobs.priority.done, false);
+});
+
+test('soft per-cell errors from the main adapter accumulate in the persisted checkpoint across successive off-cycle triggers without halting progress', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 0, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  // Every other cell reports a provider probe failure — the real main adapter's soft-error shape
+  // (cp.errors increments, cursor still advances, status stays 'progress' — see
+  // collection-adapters.mjs's directResult/anyResult error accounting).
+  const flakyStep = ({ job }) => {
+    const failed = job.checkpoint.cursor % 2 === 1;
+    return { status: 'progress', checkpoint: { ...job.checkpoint, cursor: job.checkpoint.cursor + 1, errors: job.checkpoint.errors + (failed ? 1 : 0) } };
+  };
+
+  await offCycleSession({ durable, clockStart: 10 * MINMS, budgetMs: 6 * MINMS, mainStep: flakyStep });
+  const afterFirst = durable.state.jobs.main.checkpoint;
+  assert.ok(afterFirst.cursor > 0 && afterFirst.errors > 0, 'errors were recorded without stalling the cursor');
+  assert.equal(afterFirst.errors, Math.floor(afterFirst.cursor / 2), 'error count matches the flaky pattern exactly, no double-count or drop');
+
+  await offCycleSession({ durable, clockStart: 40 * MINMS, budgetMs: 6 * MINMS, mainStep: flakyStep });
+  const afterSecond = durable.state.jobs.main.checkpoint;
+  assert.ok(afterSecond.cursor > afterFirst.cursor, 'a second session keeps making progress despite earlier errors');
+  assert.ok(afterSecond.errors > afterFirst.errors, 'the error count is cumulative across sessions, not reset');
+});
+
+test('a hard adapter failure mid-unit propagates out of an off-cycle session instead of being swallowed, and the last durably-saved checkpoint is left intact', async () => {
+  const durable = { state: freshScheduleState() };
+  durable.state.jobs.main = { id: 0, planDate: '2026-09-24', checkpoint: { cursor: 3, errors: 0, total: 50, wave: 43 }, done: false, startedAt: 0, completedAt: null, retryAt: 0, activeMs: 0 };
+  const checkpointBefore = structuredClone(durable.state.jobs.main.checkpoint);
+  let clock = 10 * MINMS;
+  const state = structuredClone(durable.state);
+  const engine = new SequentialSchedule({
+    state, clock: () => clock, lease: async () => true, save: async s => { durable.state = structuredClone(s); },
+    stopAt: clock + 6 * MINMS,
+    handlers: { main: { maxUnitMs: 90_000, step: async () => { clock += 75_000; throw new Error('provider write was not acknowledged'); } } },
+  });
+  await assert.rejects(
+    () => runBoundedMainAdvance({ engine, stopAt: clock + 6 * MINMS, clock: () => clock }),
+    /provider write was not acknowledged/,
+    'a genuine adapter failure must surface to the caller (run-collection.mjs\'s top-level catch), not be treated as a clean stop',
+  );
+  // The failed unit's pre-attempt state was durably saved (SequentialSchedule.tick() persists
+  // BEFORE calling adapter.step); the checkpoint itself is exactly what it was before the failed
+  // unit — no partial/corrupt forward write from the unit that threw.
+  assert.deepEqual(durable.state.jobs.main.checkpoint, checkpointBefore);
 });
