@@ -53,6 +53,20 @@ export function poolExistsForObservedOn(rows, observedOn) {
   return rows.some((row) => (row?.observed_on ?? observedOn) === observedOn);
 }
 
+// Accepts a number (epoch ms) or an ISO-8601 string and normalizes to a finite epoch-ms number.
+// Callers downstream (pilotSourcesReady, nightlySelectionDue) require a numeric instant; a raw
+// ISO string passed straight through previously reached pilotSourcesReady's Number.isFinite check
+// and threw there with no context. Fail fast, here, with the offending value in the message.
+export function normalizeInstant(value) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error(`Invalid snapshot instant: ${value}`);
+    return value;
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) throw new Error(`Invalid snapshot instant: ${JSON.stringify(value)}`);
+  return parsed;
+}
+
 export function berlinObservedOn(value = Date.now()) {
   const timestamp = typeof value === 'number' ? value : Date.parse(value);
   if (!Number.isFinite(timestamp)) throw new Error('Invalid snapshot timestamp');
@@ -123,7 +137,7 @@ export function pilotSourcesReady(rows, instant, expectedOrigins,
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
   force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
-  const instant=requestedSnapshotAt??Date.now();const observedOn = berlinObservedOn(instant);
+  const instant=normalizeInstant(requestedSnapshotAt??Date.now());const observedOn = berlinObservedOn(instant);
   if(!force&&!nightlySelectionDue(instant))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
   const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
 

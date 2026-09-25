@@ -16,6 +16,13 @@ import { main as publishDailyWindows } from './snapshot-daily-window-candidates.
 // checkout+npm-ci+claim overhead measured ~15-20s) so a slow runner start never eats into it.
 export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 
+// A daily-selection failure (bad source data, a transient DB error, etc.) is recorded on the
+// checkpoint with its message and timestamp instead of aborting the whole session. This throttle
+// keeps a persistently failing selection from re-reading the full offers table on every
+// invocation of this coordinator (as often as every 5 minutes via supabase-cron): a retry is
+// attempted at most once per this interval; MAIN and priority still run every time regardless.
+export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
+
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
   for(let page=1;page<=10;page++){
@@ -36,8 +43,10 @@ export function scheduledCollectionDue(state, instant=Date.now(), selectionThres
   const cycle=Math.floor(instant/CYCLE_MS),priority=state.jobs.priority;
   const priorityDue=!priority||priority.id!==cycle||!priority.done;
   const day=berlinObservedOn(instant),selection=state.dailySelection;
-  const selectionDue=nightlySelectionDue(instant,selectionThresholdMinutes)&&(
-    selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true);
+  const selectionIncomplete=selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true;
+  // A recent same-day selection failure is not due again yet — see dailySelectionRetryThrottled.
+  const selectionDue=nightlySelectionDue(instant,selectionThresholdMinutes)&&selectionIncomplete
+    &&!dailySelectionRetryThrottled(state,instant);
   return priorityDue||selectionDue;
 }
 
@@ -93,6 +102,16 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   return{state,published};
 }
 
+// Whether a same-day daily-selection failure is recent enough (within retryMs) to skip retrying
+// it this cycle. Shared by scheduledCollectionDue (so a throttled selection alone never makes an
+// otherwise-idle off-cycle trigger think a full due session is needed) and by main() itself.
+export function dailySelectionRetryThrottled(state, instant, retryMs=DAILY_SELECTION_RETRY_MS) {
+  const selection=state?.dailySelection;
+  if(selection?.day!==berlinObservedOn(instant))return false;
+  const lastError=selection.lastError;
+  return Boolean(lastError?.at)&&(instant-lastError.at)<retryMs;
+}
+
 export async function main(env=process.env){
   if(env.COLLECTION_MODE!=='coordinated')throw new Error('Coordinated mode has not been enabled');
   for(const key of ['TP_TOKEN','SUPABASE_SERVICE_KEY','GITHUB_TOKEN'])if(!env[key])throw new Error(`Missing required ${key}`);
@@ -101,7 +120,10 @@ export async function main(env=process.env){
   const wave=Number(env.EXPANSION_WAVE??0);expansionTargets(wave);
   const minutes=Number(env.COLLECTION_SESSION_MINUTES??25);
   if(!Number.isInteger(minutes)||minutes<1||minutes>240)throw new Error('Session must be 1–240 minutes');
-  if(!await noOtherActiveRuns(env))throw new Error('Other active workflow or unknown GitHub state; no collection started');
+  // Normal intersection of runs (another workflow already in progress, or GitHub state is
+  // unreadable): not an error, just this run standing down. Exit 0, not 1 — a real lease/DB
+  // failure below still throws and exits 1.
+  if(!await noOtherActiveRuns(env)){console.log('skipped: other active workflow run or unknown GitHub state; no collection started');return;}
   let dbDeadline=Infinity; let activeStore=null;
   const db=createClient(env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',env.SUPABASE_SERVICE_KEY,{
     auth:{persistSession:false,autoRefreshToken:false},global:{fetch:async(input,init={})=>{
@@ -116,7 +138,9 @@ export async function main(env=process.env){
   let claimed=false,engine=null,stopping=false;const stop=()=>{stopping=true;};
   try{
     const previous=await store.inspect();
-    if(!await oldRunnerHasStopped(previous,{repository:env.GITHUB_REPOSITORY,token:env.GITHUB_TOKEN}))throw new Error('Old runner not confirmed stopped; refusing overlap');
+    // Same normal-intersection case as above (an old runner from the previous cycle has not yet
+    // confirmed it stopped): stand down cleanly, exit 0. A real lease/DB failure below still throws.
+    if(!await oldRunnerHasStopped(previous,{repository:env.GITHUB_REPOSITORY,token:env.GITHUB_TOKEN})){console.log('skipped: old runner not confirmed stopped; refusing overlap');return;}
     const state=await store.claim(previous?.owner??null)??freshScheduleState();claimed=true;
     if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
     const pilotMarketSchedule=env.PRIORITY_MARKET_SCHEDULE==='pilot';
@@ -161,7 +185,22 @@ export async function main(env=process.env){
     // Published once per regular due session — every ~30 minutes at worst, well inside the
     // 120-minute ceiling this same contract publishes, so the app never reads a stale pilot flag.
     await publishPilotState(db,env);
-    await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
+    // A daily-selection error must never take down the whole session: priority and MAIN below
+    // still need to run regardless of this call's outcome. The failure is checkpointed with its
+    // message and timestamp, and dailySelectionRetryThrottled keeps a persistently failing
+    // selection from re-reading the full offers table on every invocation of this coordinator.
+    if(dailySelectionRetryThrottled(state,Date.now())){
+      console.log(JSON.stringify({event:'daily_selection_retry_throttled',source:triggerSource,lastError:state.dailySelection.lastError}));
+    }else{
+      try{
+        await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
+        if(state.dailySelection?.lastError){delete state.dailySelection.lastError;await store.save(state);}
+      }catch(error){
+        state.dailySelection={...(state.dailySelection||{}),lastError:{message:error.message,at:Date.now()}};
+        await store.save(state);
+        console.error(JSON.stringify({event:'daily_selection_failed',source:triggerSource,error:error.message}));
+      }
+    }
     const end=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';

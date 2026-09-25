@@ -56,6 +56,7 @@ export function marketTimeZone(market) {
 // that interval, measured in cycles — anchored to the Unix epoch so it never drifts and needs no
 // stored state. A 30-minute interval is due every cycle; a 2-hour interval, every 4th cycle.
 export function dueForInterval(instant, intervalMs) {
+  if (!Number.isFinite(instant)) throw new Error('Invalid instant');
   if (!(intervalMs > 0) || intervalMs % CYCLE_MS !== 0) throw new Error('Interval must be a positive multiple of CYCLE_MS');
   const cyclesPerInterval = intervalMs / CYCLE_MS;
   return Math.floor(instant / CYCLE_MS) % cyclesPerInterval === 0;

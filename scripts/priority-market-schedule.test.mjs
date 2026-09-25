@@ -65,6 +65,12 @@ test('dueForInterval is cycle-aligned to the epoch: 30-minute interval fires eve
   assert.equal(due.filter(Boolean).length, 1); // exactly one of every 4 consecutive 30-min cycles
 });
 
+test('dueForInterval rejects a non-numeric instant explicitly instead of silently returning false', () => {
+  assert.throws(() => dueForInterval(NaN, 30 * 60_000), /Invalid instant/);
+  assert.throws(() => dueForInterval(undefined, 30 * 60_000), /Invalid instant/);
+  assert.throws(() => dueForInterval('not-a-number', 30 * 60_000), /Invalid instant/);
+});
+
 test('dueForInterval rejects an interval that is not a multiple of CYCLE_MS (would silently drift)', () => {
   assert.throws(() => dueForInterval(Date.now(), 45 * 60_000), /multiple of CYCLE_MS/);
 });
