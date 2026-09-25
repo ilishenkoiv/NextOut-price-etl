@@ -6,6 +6,7 @@ import { computeAllWindows } from './collection-windows.mjs';
 import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, pilotSourcesReady } from './snapshot-daily-origin-cheapest.mjs';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
+import { recordRead } from './collection-egress.mjs';
 
 const PAGE=1000,CONTRACT_VERSION=1;
 const addDays=(iso,n)=>{const d=new Date(iso+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
@@ -46,15 +47,20 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
     ||a.return_at.localeCompare(b.return_at)||a.position-b.position);
 }
 
-async function loadAll(db,table,columns,order){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);for(const col of order)q=q.order(col,{ascending:true});
-  const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));if((data??[]).length<PAGE)return out;}}
+async function loadAll(db,table,columns,order,filter){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);if(filter)q=filter(q);for(const col of order)q=q.order(col,{ascending:true});
+  const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',pilotMarketSchedule=false}={}){
   const today=berlinObservedOn(instant);if(!force&&!nightlySelectionDue(instant))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
+  // Same date window (min..max) and freshness cutoff (36h) that selectDailyWindowCandidates
+  // enforces below, pushed into the query so the DB does the row elimination instead of
+  // shipping the full window_prices table over the wire on every run.
+  const windowMin=addDays(today,10),windowMax=addMonths(today,4),freshCutoffIso=new Date(instant-36*60*60*1000).toISOString();
   const [rows,holidays,originRegions]=await Promise.all([
-    loadAll(client,'window_prices','origin,dest,flight_type,departure_at,return_at,price,transfers,airline,updated_at,price_source',['origin','dest','flight_type','departure_at','return_at']),
+    loadAll(client,'window_prices','origin,dest,flight_type,departure_at,return_at,price,transfers,airline,updated_at,price_source',['origin','dest','flight_type','departure_at','return_at'],
+      q=>q.gte('departure_at',windowMin).lte('departure_at',windowMax).gte('updated_at',freshCutoffIso)),
     loadAll(client,'public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date']),
     loadAll(client,'origin_regions','airport,calendar_subdivision_code',['airport'])]);
   // PILOT ONLY: same principle as the roulette pool (snapshot-daily-origin-cheapest.mjs) — time

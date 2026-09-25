@@ -193,3 +193,53 @@ test('pilot market schedule leaves the LEGACY (default, unset) path byte-identic
   assert.equal(f.requests,1,'without the pilot flag, night hours change nothing — exactly legacy behavior');
   assert.equal(result.checkpoint.roulette.total,1);
 });
+
+// Regression coverage for the latest-row-only daily_window_candidate_epochs read
+// (collection-adapters.mjs, weekend phase): the epoch query changed from an ascending
+// full-table page scan (`load(...).at(-1)`) to `order(desc).limit(1)`, which reads exactly
+// the one row snapshot_at's UNIQUE constraint guarantees is the latest. These tests pin the
+// invalidation/resume semantics the weekend phase depends on, so a future change to that
+// query cannot silently reintroduce stale or duplicated progress.
+const windowTicketA={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',
+  position:1,window_kind:'weekend',exact_observed_at:'2026-01-14T09:00:00Z',updated_at:'2026-01-14T09:00:00Z'};
+const windowTicketB={origin:'FRA',dest:'ROM',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',
+  position:2,window_kind:'weekend',exact_observed_at:'2026-01-14T09:00:00Z',updated_at:'2026-01-14T09:00:00Z'};
+const twoGroupPlan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',
+  tickets:[windowTicketA,windowTicketB],groups:[[windowTicketA],[windowTicketB]]};
+const someUtc=Date.parse('2026-01-15T12:00:00Z');
+
+test('weekend phase: an unchanged latest epoch (retry/resume) continues the cursor instead of restarting the pass',async()=>{
+  const epoch={observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:2,exact_request_groups:2};
+  const f=fixture(twoGroupPlan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>someUtc,
+    tableRows:{daily_window_candidate_epochs:[epoch]}});
+  const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true},
+    weekend:{day:'2026-01-15',dayId:1,cursor:1,done:false,errors:0,passStartedAt:0,snapshotAt:epoch.snapshot_at}};
+  const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:someUtc+200000});
+  assert.equal(f.requests,1,'only the still-pending second group is refreshed, not a restarted first group');
+  assert.equal(result.checkpoint.weekend.snapshotAt,epoch.snapshot_at);
+  assert.equal(result.checkpoint.weekend.cursor,2,'resumes from cursor=1 to cursor=2, never resets to 0');
+  assert.equal(result.checkpoint.weekend.done,true);
+});
+
+test('weekend phase: a new epoch publication (or Berlin-day rollover, which always emits one) invalidates in-flight progress',async()=>{
+  const newEpoch={observed_on:'2026-01-16',snapshot_at:'2026-01-16T00:00:00Z',contract_version:1,candidate_rows:2,exact_request_groups:2};
+  const f=fixture(twoGroupPlan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>someUtc,
+    tableRows:{daily_window_candidate_epochs:[newEpoch]}});
+  const staleCheckpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true},
+    weekend:{day:'2026-01-15',dayId:1,cursor:1,done:false,errors:3,passStartedAt:0,snapshotAt:'2026-01-15T00:00:00Z'}};
+  const result=await f.adapters.priority.step({job:{...job,checkpoint:staleCheckpoint},deadline:someUtc+200000});
+  assert.equal(result.checkpoint.weekend.snapshotAt,newEpoch.snapshot_at,'adopts the new latest epoch');
+  assert.equal(result.checkpoint.weekend.cursor,1,'restarts at group 0 and advances to 1, discarding the stale cursor=1 from the old epoch');
+  assert.equal(result.checkpoint.weekend.errors,0,'stale error count from the superseded epoch is not carried forward');
+});
+
+test('weekend phase: no epoch rows at all is reported as blocked, not an empty-latest-row crash',async()=>{
+  const f=fixture(twoGroupPlan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>someUtc,
+    tableRows:{daily_window_candidate_epochs:[]}});
+  const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+  const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:someUtc+200000});
+  assert.equal(f.requests,0);
+  assert.equal(result.status,'done');
+  assert.equal(result.checkpoint.weekend.blockedReason,'no_daily_window_candidate_epoch');
+  assert.equal(result.checkpoint.weekend.done,true);
+});

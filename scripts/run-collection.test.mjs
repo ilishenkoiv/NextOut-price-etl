@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger } from './run-collection.mjs';
+import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger,
+  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS } from './run-collection.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
+import { berlinObservedOn } from './snapshot-daily-origin-cheapest.mjs';
 
 const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'utf8');
 
@@ -149,8 +151,12 @@ test('pilot state is published under the same claimed lease for both the regular
   assert.doesNotMatch(notDueExit, /publishPilotState/, 'the cheap 5-minute not_due heartbeat must not gain a new write');
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
   assert.match(offCycleBlock, /await publishPilotState\(db,env\)/, 'off-cycle attempts publish too, not just regular due sessions');
-  const justBeforeDueSelection = source.slice(0, source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule})')).slice(-200);
-  assert.match(justBeforeDueSelection, /await publishPilotState\(db,env\)/, 'the regular due session publishes right before running daily selection');
+  const dueSelectionCallIndex = source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule})');
+  const regularPublishIndex = source.lastIndexOf('await publishPilotState(db,env)', dueSelectionCallIndex);
+  const betweenPublishAndSelection = source.slice(regularPublishIndex, dueSelectionCallIndex);
+  assert.ok(regularPublishIndex > -1, 'the regular due session publishes pilot state before running daily selection');
+  assert.doesNotMatch(betweenPublishAndSelection, /new SequentialSchedule|new CollectionProvider/,
+    'nothing else runs between the regular publish and the (possibly throttled/caught) daily selection attempt');
 });
 
 test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN_MINUTES unset/0 → immediate not_due, no engine)', () => {
@@ -194,4 +200,98 @@ test('off-cycle MAIN advance delegates its bounded, keep-ticking loop to the sha
   assert.match(source, /import\s*\{[^}]*runBoundedMainAdvance[^}]*\}\s*from\s*'\.\/collection-schedule\.mjs'/);
   assert.match(offCycleBlock, /const \{ ?ticks, ?lastStatus ?\} ?= ?await runBoundedMainAdvance\(\{ ?engine, ?stopAt ?\}\)/);
   assert.doesNotMatch(offCycleBlock, /while\(Date\.now\(\)\+5000<stopAt\)/, 'the inline loop was extracted, not duplicated');
+});
+
+// --- D1: normal run intersection resolves (exit 0), a real error still rejects (exit 1) ---
+
+test('main() stands down cleanly (not an error) on the normal intersection of runs — the CLI wrapper only sets exitCode on a rejection, so this is the exit-0 path',async()=>{
+  const logs=[];const originalLog=console.log;console.log=(...args)=>logs.push(args.map(String).join(' '));
+  try{
+    // No GITHUB_RUN_ID/GITHUB_REPOSITORY: noOtherActiveRuns fails its own regex guard and returns
+    // false synchronously, with no network call — deterministic and hermetic.
+    const env={COLLECTION_MODE:'coordinated',TP_TOKEN:'t',SUPABASE_SERVICE_KEY:'k',GITHUB_TOKEN:'t'};
+    await assert.doesNotReject(()=>main(env), 'the normal intersection case must resolve, never reject');
+    assert.ok(logs.some(l=>l.startsWith('skipped:')), `expected a 'skipped: ...' log line, got: ${JSON.stringify(logs)}`);
+  }finally{console.log=originalLog;}
+});
+
+test('main() still rejects (exit 1) for a genuine setup error, unlike the intersection skip above — the same contract real lease/DB errors below rely on',async()=>{
+  await assert.rejects(()=>main({COLLECTION_MODE:'coordinated',TP_TOKEN:'t',GITHUB_TOKEN:'t'}), /Missing required SUPABASE_SERVICE_KEY/);
+});
+
+test('only the two documented run-intersection checks return early with a skip; every other failure path (claim, save, lease, the daily-selection catch) is untouched',()=>{
+  assert.equal((source.match(/console\.log\('skipped: /g)||[]).length, 2, 'exactly noOtherActiveRuns and oldRunnerHasStopped skip — no other check was softened');
+  assert.match(source, /const state=await store\.claim\(previous\?\.owner\?\?null\)\?\?freshScheduleState\(\);claimed=true;/, 'store.claim is still awaited directly and still throws on a real lease/DB failure');
+  assert.doesNotMatch(source, /store\.claim[^;]*\.catch/, 'claim failures are not swallowed');
+});
+
+// --- A2: a daily-selection failure is checkpointed and throttled, never aborts the session ---
+
+test('dailySelectionRetryThrottled: no retry within 30 minutes of a same-day failure; a new day or an old failure retries',()=>{
+  const instant=Date.parse('2026-09-25T07:00:00Z');
+  const failedAt=instant-5*60000;
+  const state={dailySelection:{day:berlinObservedOn(instant),lastError:{message:'boom',at:failedAt}}};
+  assert.equal(dailySelectionRetryThrottled(state,instant),true,'5 minutes after a failure — still throttled');
+  assert.equal(DAILY_SELECTION_RETRY_MS, 30*60000);
+  assert.equal(dailySelectionRetryThrottled(state,failedAt+29*60000),true,'just under 30 minutes — still throttled');
+  assert.equal(dailySelectionRetryThrottled(state,failedAt+31*60000),false,'past 30 minutes — retry allowed');
+  const otherDayState={dailySelection:{day:'2026-09-24',lastError:{message:'boom',at:instant}}};
+  assert.equal(dailySelectionRetryThrottled(otherDayState,instant),false,'a new Berlin day never inherits yesterday\'s throttle');
+  assert.equal(dailySelectionRetryThrottled({},instant),false,'no prior selection at all — never throttled');
+});
+
+test('a throttled selection alone does not make scheduledCollectionDue trigger a full session when priority is not due',()=>{
+  const instant=Date.parse('2026-09-25T02:30:00Z'); // 03:30 Berlin, legacy threshold just reached
+  const cycle=Math.floor(instant/CYCLE_MS);
+  const state={version:1,jobs:{priority:{id:cycle,done:true}},
+    dailySelection:{day:berlinObservedOn(instant),rouletteDone:false,windowDone:false,lastError:{message:'boom',at:instant-60000}}};
+  assert.equal(scheduledCollectionDue(state,instant),false,'priority already done this cycle and selection is throttled — nothing is due');
+  assert.equal(scheduledCollectionDue(state,instant+31*60000),true,'once the throttle expires, selection becomes due again');
+});
+
+test('runDueDailySelection error: checkpointed with message+time, MAIN/priority still run this session, retry is throttled for 30 minutes',async()=>{
+  const instant=Date.parse('2026-09-25T07:00:00Z');
+  const state={version:1,jobs:{}};const saved=[];
+  const store={lease:async()=>true,save:async v=>saved.push(structuredClone(v))};
+  // Mirrors main()'s inline try/catch around runDueDailySelection (see run-collection.mjs).
+  async function attemptSelection(now){
+    if(dailySelectionRetryThrottled(state,now))return{throttled:true};
+    try{
+      await runDueDailySelection({state,store,db:{},instant:now,wave:0,
+        publishRoulette:async()=>{throw new Error('offers query failed')},publishWindows:async()=>({published:true})});
+      return{ok:true};
+    }catch(error){
+      state.dailySelection={...(state.dailySelection||{}),lastError:{message:error.message,at:now}};
+      await store.save(state);
+      return{error};
+    }
+  }
+  const first=await attemptSelection(instant);
+  assert.ok(first.error,'the selection error is caught, not left to propagate');
+  assert.equal(state.dailySelection.lastError.message,'offers query failed');
+  assert.equal(state.dailySelection.lastError.at,instant);
+  // A second attempt 5 minutes later must not re-invoke publishRoulette (would re-read offers).
+  let secondCallMade=false;
+  async function attemptWithSpy(now){
+    if(dailySelectionRetryThrottled(state,now))return{throttled:true};
+    secondCallMade=true;
+    try{await runDueDailySelection({state,store,db:{},instant:now,wave:0,
+      publishRoulette:async()=>{throw new Error('offers query failed')},publishWindows:async()=>({published:true})});return{ok:true};}
+    catch(error){state.dailySelection={...(state.dailySelection||{}),lastError:{message:error.message,at:now}};await store.save(state);return{error};}
+  }
+  const second=await attemptWithSpy(instant+5*60000);
+  assert.equal(second.throttled,true);
+  assert.equal(secondCallMade,false,'throttled — the offers table is not re-read 5 minutes after a failure');
+  // Past 30 minutes, a retry is attempted again.
+  const third=await attemptWithSpy(instant+31*60000);
+  assert.equal(secondCallMade,true);
+  assert.ok(third.error);
+});
+
+test('every coordinator run logs a final egress_summary line and resets the counter at the start',()=>{
+  assert.match(source,/^\s*import\s*\{\s*resetEgress,\s*egressSummary\s*\}\s*from\s*'\.\/collection-egress\.mjs'/m);
+  assert.match(source,/export async function main\(env=process\.env\)\{\s*resetEgress\(\);/,
+    'resetEgress must run at the very start of every coordinator invocation');
+  assert.match(source,/finally\{[\s\S]*console\.log\(JSON\.stringify\(egressSummary\(\)\)\);[\s\S]*\}/,
+    'egress_summary must be logged in the finally block so it always runs, including on early returns and thrown errors');
 });

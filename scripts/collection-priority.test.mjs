@@ -134,3 +134,40 @@ test('a persisted legacy window checkpoint is adopted with 44.61s left in the pr
   const adopted=engine.state.jobs.priority.checkpoint.weekend;
   assert.equal(adopted.snapshotAt,snapshot);assert.equal(adopted.cursor,1);assert.equal(adopted.total,1);
 });
+
+test('roulette plan is a daily artifact keyed only by snapshot: reused across 30-minute cycles, rebuilt only when the snapshot changes',async()=>{
+  const now=Date.parse('2026-09-23T10:00:00Z');
+  let snapshot='2026-09-23T03:30:00Z';
+  const ticketRow=()=>({origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',rank:1,price:100,
+    transfers:0,market:'de',source_updated_at:snapshot,price_source:{},snapshot_at:snapshot,observed_on:'2026-09-23'});
+  const db={from:table=>chain(table==='daily_origin_cheapest_pool'?[ticketRow()]:[]),
+    rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
+  const keysPerCall=[];const cache=new Map();let builds=0;
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async(key,build)=>{
+    keysPerCall.push(key);
+    if(cache.has(key))return cache.get(key);
+    builds++;const value=await build();cache.set(key,value);return value;
+  }};
+  const provider={request:async url=>{const u=new URL(url);return{kind:'ok',json:{success:true,data:[{origin:'BER',
+    destination:u.searchParams.get('destination'),departure_at:'2026-10-10T06:00:00Z',return_at:'2026-10-17T20:00:00Z',price:100,transfers:0}]}};}};
+  const adapters=createAdapters({db,store,provider,clock:()=>now});
+  const cp1={cycle:1,dueAt:now,phase:'roulette',auditDone:true,roulette:{cycle:1,cursor:0,done:false,errors:0}};
+  const a=await adapters.priority.step({job:{id:1,planDate:'2026-09-23',checkpoint:cp1},deadline:now+200000});
+  assert.equal(a.checkpoint.roulette.done,true,'a single-ticket pool finishes roulette within one step');
+  assert.equal(builds,1);
+  // Cycle 2: a brand-new 30-minute cycle (job.id changes) with the SAME daily snapshot. The
+  // previous roulette pass is done, so a fresh roulette checkpoint starts — but the plan key must
+  // still resolve to the same cached daily artifact instead of rebuilding from a new r.cycle.
+  const b=await adapters.priority.step({job:{id:2,planDate:'2026-09-23',checkpoint:a.checkpoint},deadline:now+200000});
+  assert.equal(b.checkpoint.roulette.done,true);
+  assert.equal(builds,1,'same snapshot across cycles must not trigger a second plan build');
+  const rouletteKeys=keysPerCall.filter(k=>k.includes('/roulette-'));
+  assert.equal(rouletteKeys.length,2);
+  assert.equal(rouletteKeys[0],rouletteKeys[1],'the roulette plan key must not depend on the 30-minute cycle id');
+  // Cycle 3: a new daily snapshot appears. Only now must the plan rebuild, under a new key.
+  snapshot='2026-09-24T03:30:00Z';
+  const c=await adapters.priority.step({job:{id:3,planDate:'2026-09-24',checkpoint:b.checkpoint},deadline:now+200000});
+  assert.equal(c.checkpoint.roulette.done,true);
+  assert.equal(builds,2,'a new snapshot must trigger exactly one rebuild');
+  assert.notEqual(keysPerCall.at(-1),rouletteKeys[0],'a new snapshot must use a new plan key');
+});

@@ -13,6 +13,7 @@ import { expansionTargets } from '../src/data/expansion-targets.js';
 import { originDueThisCycle } from './priority-market-schedule.mjs';
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
+import { recordRead } from './collection-egress.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -85,7 +86,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         let q = db.from(table).select(columns); for (const key of order) q = q.order(key);
         return apply(q).range(from, from + 999);
       }, deadline, { retry: true });
-      rows.push(...data); if (data.length < 1000) return rows;
+      rows.push(...data); recordRead(table, data); if (data.length < 1000) return rows;
     }
   }
   const watches = deadline => load('price_watch_push_rules','origin,dest,watch_scope,country_code',
@@ -245,6 +246,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const rows=await query(()=>db.from('window_prices').select('updated_at').eq('origin',ticket.origin).eq('dest',ticket.dest)
       .eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at)
       .gte('updated_at',new Date(clock()-30*60*1000).toISOString()).limit(1),deadline,{retry:true});
+    recordRead('window_prices',rows);
     return rows?.length>0;
   }
 
@@ -330,11 +332,16 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.phase==='roulette'){
         const r=cp.roulette;
         const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+        recordRead('daily_origin_cheapest_pool',latest);
         const latestSnapshot=latest[0]?.snapshot_at??null;
         if(r.snapshotAt!==latestSnapshot){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;
           delete r.pendingReplacement;delete r.technicalDeferred;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
         const snapshotId=String(Math.max(0,Date.parse(latestSnapshot??'')||0));
-        const plan=await store.plan(`coordinator/roulette-${r.cycle}-${snapshotId}.json`,async()=>{
+        // Keyed only by snapshot (not r.cycle): the plan is a daily artifact, built once per
+        // snapshot and reused for every 30-minute cycle until the snapshot changes (see the
+        // snapshotAt reset above). Previously keying on r.cycle rebuilt this every cycle and
+        // re-read the full offers table each time.
+        const plan=await store.plan(`coordinator/roulette-${snapshotId}-0.json`,async()=>{
           if(!latestSnapshot)return{tickets:[],snapshotAt:null,allowedDests:[],replacements:{}};
           const tickets=await load('daily_origin_cheapest_pool','observed_on,snapshot_at,origin,dest,flight_type,departure_at,return_at,rank,price,transfers,market,source_updated_at,price_source',
             ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latestSnapshot),deadline);
@@ -411,11 +418,17 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.phase==='weekend'){
         let w=cp.weekend;
         if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,passStartedAt:clock()};}
-        const epochs=await load('daily_window_candidate_epochs','observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups',
-          ['snapshot_at'],q=>q,deadline);
+        // Latest-row-only: snapshot_at is UNIQUE on this table (see
+        // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
+        // same row ascending-order .at(-1) used to, without paging the whole epoch history
+        // on every weekend-phase tick.
+        const epochs=await query(()=>db.from('daily_window_candidate_epochs')
+          .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
+          .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+        recordRead('daily_window_candidate_epochs',epochs);
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
-        const epoch=epochs.at(-1),epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
+        const epoch=epochs[0],epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
         if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at};
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
           const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
