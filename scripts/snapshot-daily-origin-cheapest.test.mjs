@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
-  LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES, pilotSourcesReady, PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE } from './snapshot-daily-origin-cheapest.mjs';
+  LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES, pilotSourcesReady, freshOriginFraction,
+  PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
 
 test('selects one deterministic cheapest real future offer per origin and flight type', () => {
@@ -125,15 +126,33 @@ test('pilotSourcesReady respects the exact freshness boundary and rejects a bad 
   assert.throws(() => pilotSourcesReady([], NaN, expected), /Invalid instant/);
 });
 
-test('the pilot freshness gate is wired into both daily-publish scripts, gated by pilotMarketSchedule', () => {
+test('selection never gates on source freshness: neither daily-publish script early-returns sources_not_fresh any more', () => {
   const originSource = readFileSync(new URL('./snapshot-daily-origin-cheapest.mjs', import.meta.url), 'utf8');
   const windowSource = readFileSync(new URL('./snapshot-daily-window-candidates.mjs', import.meta.url), 'utf8');
-  assert.match(originSource, /if\(pilotMarketSchedule&&!force&&!pilotSourcesReady\(offers,instant,origins\)\)/);
-  assert.match(originSource, /reason:'sources_not_fresh'/);
-  assert.match(windowSource, /import \{ berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, pilotSourcesReady \}/);
-  assert.match(windowSource, /if\(pilotMarketSchedule&&!force&&!pilotSourcesReady\(rows,instant,publishedSnapshotOrigins\(\)\)\)/);
-  assert.match(windowSource, /reason:'sources_not_fresh'/);
+  assert.doesNotMatch(originSource, /reason:'sources_not_fresh'/);
+  assert.doesNotMatch(windowSource, /reason:'sources_not_fresh'/);
+  // The freshness fraction is still computed and logged — just never used to gate publication.
+  assert.match(originSource, /freshOriginFraction\(offers, ?instant, ?origins\)/);
+  assert.match(windowSource, /freshOriginFraction\(rows,instant,publishedSnapshotOrigins\(\)\)/);
+  assert.match(originSource, /daily_selection_published/);
+  assert.match(windowSource, /daily_selection_published/);
 });
+
+test('freshOriginFraction: partial coverage returns the exact fraction, not a boolean; pilotSourcesReady reuses it against the coverage threshold', () => {
+  const now = Date.parse('2026-09-24T05:05:00Z');
+  const expected = new Set(['FRA', 'MUC', 'LHR', 'AMS']);
+  const freshRow = (origin, ageMs) => ({ origin, updated_at: new Date(now - ageMs).toISOString() });
+  assert.equal(freshOriginFraction([freshRow('FRA', 5 * 60000), freshRow('MUC', 8 * 3600000), freshRow('LHR', 8 * 3600000), freshRow('AMS', 8 * 3600000)], now, expected), 0.25);
+  assert.equal(freshOriginFraction([], now, new Set()), 0, 'no expected origins at all -> fraction 0, never a divide-by-zero');
+  assert.throws(() => freshOriginFraction([], NaN, expected), /Invalid instant/);
+  // pilotSourcesReady is now a thin wrapper: true only once the fraction clears minCoverage.
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000), freshRow('MUC', 5 * 60000), freshRow('LHR', 5 * 60000), freshRow('AMS', 5 * 60000)], now, expected), true);
+  assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000)], now, expected), false);
+});
+
+// main()-level behavior (immediate publish + point-refresh) is covered in
+// roulette-selection-refresh.test.mjs, which already handles the service-key-read-at-import-time
+// ordering (dynamic import after setting process.env.SUPABASE_SERVICE_KEY).
 
 test('production snapshot query refuses source observations older than 36 hours', () => {
   const source = readFileSync(new URL('./snapshot-daily-origin-cheapest.mjs', import.meta.url), 'utf8');

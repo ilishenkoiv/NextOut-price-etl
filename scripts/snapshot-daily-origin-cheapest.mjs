@@ -6,6 +6,7 @@ import { expansionTargets } from '../src/data/expansion-targets.js';
 import { ORIGINS_ALL } from '../src/data/origins.js';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { recordRead } from './collection-egress.mjs';
+import { pointRefreshTickets, ticketKey } from './daily-selection-refresh.mjs';
 
 export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
@@ -112,37 +113,40 @@ export function selectDailyCheapestPool(offers, today, limit = 10) {
     .sort((a, b) => String(a.origin).localeCompare(String(b.origin)) || a.rank - b.rank);
 }
 
-// PILOT ONLY: publishing "today's" pool is gated on TIME (nightlySelectionDue's threshold), but
-// time alone does not prove the post-pause 07:00 pass actually landed — a delay or error there
-// would otherwise let the blanket 36h eligibility window silently admit last-night's
-// pre-pause prices as if they were today's. Require, per expected origin, at least one offer no
-// older than `maxAgeMs`; if fewer than `minCoverage` of origins clear that bar, sources are not
-// ready yet and the caller must NOT mark the day done (see run-collection.mjs).
+// Observability only, never a gate: the fraction of expected origins that show at least one
+// offer no older than `maxAgeMs`. Selection never waits for this to clear a threshold (see
+// main() below) — it is logged so a slow/broken source pass is visible without re-reading the
+// full offers table on every retry.
 export const PILOT_SOURCE_FRESHNESS_MS = 3 * 60 * 60 * 1000; // 3h: comfortably covers one 07:00 pass plus a retry
 export const PILOT_MIN_FRESH_ORIGIN_COVERAGE = 0.9;
 
-export function pilotSourcesReady(rows, instant, expectedOrigins,
-  { maxAgeMs = PILOT_SOURCE_FRESHNESS_MS, minCoverage = PILOT_MIN_FRESH_ORIGIN_COVERAGE } = {}) {
+export function freshOriginFraction(rows, instant, expectedOrigins, { maxAgeMs = PILOT_SOURCE_FRESHNESS_MS } = {}) {
   if (!Number.isFinite(instant)) throw new Error('Invalid instant');
   const expected = expectedOrigins instanceof Set ? expectedOrigins : new Set(expectedOrigins);
-  if (expected.size === 0) return false;
+  if (expected.size === 0) return 0;
   const fresh = new Set();
   for (const row of rows) {
     if (!row?.origin || !expected.has(row.origin)) continue;
     const age = instant - Date.parse(row.updated_at);
     if (Number.isFinite(age) && age >= 0 && age <= maxAgeMs) fresh.add(row.origin);
   }
-  return fresh.size / expected.size >= minCoverage;
+  return fresh.size / expected.size;
+}
+
+// Kept for callers/tests that want a single boolean read of the same coverage signal.
+export function pilotSourcesReady(rows, instant, expectedOrigins,
+  { maxAgeMs = PILOT_SOURCE_FRESHNESS_MS, minCoverage = PILOT_MIN_FRESH_ORIGIN_COVERAGE } = {}) {
+  return freshOriginFraction(rows, instant, expectedOrigins, { maxAgeMs }) >= minCoverage;
 }
 
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
-  force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false } = {}) {
+  force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false, provider=null, refreshDeadline=Infinity, clock=Date.now } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
-  const instant=normalizeInstant(requestedSnapshotAt??Date.now());const observedOn = berlinObservedOn(instant);
+  const instant=normalizeInstant(requestedSnapshotAt??clock());const observedOn = berlinObservedOn(instant);
   if(!force&&!nightlySelectionDue(instant))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
   const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
 
-  const freshSince = new Date(Date.now() - MAX_SOURCE_AGE_MS).toISOString();
+  const freshSince = new Date(clock() - MAX_SOURCE_AGE_MS).toISOString();
   const offers = [];
   const publishedDestinations=publishedSnapshotDestinations(expansionWave);
   const origins=publishedSnapshotOrigins();
@@ -159,10 +163,13 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     if (data.length < PAGE) break;
   }
 
-  if(pilotMarketSchedule&&!force&&!pilotSourcesReady(offers,instant,origins))
-    return{rebuilt:false,observedOn,snapshotAt:null,reason:'sources_not_fresh'};
+  // Selection is READ-ONLY against already-collected data and never waits for freshness — this
+  // full offers read happens exactly once, right here, regardless of source freshness. The
+  // fraction of expected origins with a recent offer is only ever logged (see the
+  // daily_selection_published event below), never a gate.
+  const freshFraction = freshOriginFraction(offers, instant, origins);
 
-  const snapshotAt = requestedSnapshotAt ?? new Date().toISOString();
+  const snapshotAt = requestedSnapshotAt ?? new Date(clock()).toISOString();
   const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
   observed_on: observedOn,
   snapshot_at: snapshotAt,
@@ -203,13 +210,35 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');
 
+  // Point-refresh: confirm the SELECTED tickets' exact prices via the provider before publishing
+  // (order: select -> point-refresh -> publish). Sequential, normal pace, never re-reads offers.
+  // Deduplicated across pool+chosen so a route selected in both never gets a second request.
+  // If the deadline runs out mid-sweep, unrefreshed rows simply keep their bulk-selection price —
+  // the pool is still published (partial refresh), and the ordinary scheduled cadence
+  // (priority-market-schedule.mjs) confirms the rest over subsequent cycles.
+  let refresh = { attempted: 0, refreshed: 0, misses: 0, errors: 0, total: 0 };
+  if (provider) {
+    const byKey = new Map();
+    for (const row of [...pool, ...chosen]) byKey.set(ticketKey(row), row);
+    const tickets = [...byKey.values()];
+    const { confirmed, ...stats } = await pointRefreshTickets(tickets, { provider, clock, deadline: refreshDeadline, sourceTable: 'offers' });
+    refresh = stats;
+    const apply = row => {
+      const c = confirmed.get(ticketKey(row));
+      return c ? { ...row, price: c.price, transfers: c.transfers, source_updated_at: c.updated_at, price_source: c.price_source ?? row.price_source } : row;
+    };
+    for (let i = 0; i < pool.length; i++) pool[i] = apply(pool[i]);
+    for (let i = 0; i < chosen.length; i++) chosen[i] = apply(chosen[i]);
+  }
+
   const {data:didPublish,error:publishError}=await supabase.rpc('publish_daily_cheapest_selection',{
     p_observed_on:observedOn,p_snapshot_at:snapshotAt,p_rank1:chosen,p_pool:pool,p_force:force});
   if(publishError)throw publishError;
-  if(didPublish!==true){console.log(`daily_origin_cheapest_pool already selected for ${observedOn}; membership/order/rank left untouched.`);
+  if(didPublish!==true){console.log(JSON.stringify({event:'daily_selection_noop',scope:'roulette',observedOn,reason:'already_published'}));
     return{rebuilt:false,observedOn,snapshotAt:null,reason:'already_published'};}
-  console.log(`Saved ${chosen.length} rank-1 rows and ${pool.length} pool rows for ${observedOn} from ${offers.length} future offers.`);
-  return { rebuilt: true, observedOn, snapshotAt };
+  console.log(JSON.stringify({event:'daily_selection_published',scope:'roulette',observedOn,snapshotAt,
+    rank1Rows:chosen.length,poolRows:pool.length,sourceOffers:offers.length,freshFraction,refresh}));
+  return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh, rank1Rows: chosen.length, poolRows: pool.length };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
