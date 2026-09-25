@@ -5,6 +5,7 @@ import { DESTINATIONS } from '../src/data/destinations.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { ORIGINS_ALL } from '../src/data/origins.js';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
+import { recordRead } from './collection-egress.mjs';
 
 export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
@@ -151,6 +152,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     .gte('departure_at', observedOn).gte('updated_at', freshSince).gt('price', 0)
     .order('origin').order('flight_type').order('price').order('dest').order('departure_at').order('return_at').range(from, from + PAGE - 1);
     if (error) throw error;
+    recordRead('offers', data);
     // Collection can warm new airports before their app metadata/weather/photos
     // are ready. Do not let an unknown destination displace the published pool.
     offers.push(...data.filter(row=>origins.has(row.origin)&&publishedDestinations.has(row.dest)));

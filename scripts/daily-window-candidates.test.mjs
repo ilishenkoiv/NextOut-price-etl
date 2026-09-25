@@ -43,3 +43,51 @@ test('migration exposes atomic daily publication, fenced price-only refresh, rea
   assert.match(verify,/canonical destination identity mapping mismatch/);
   assert.match(verify,/rollback;\s*$/);assert.match(rollback,/rename to daily_window_candidates_rollback_20260922/);
 });
+
+test('window_prices date-window and freshness filtering happens server-side and matches the old client-side result exactly',async()=>{
+  const { main } = await import('./snapshot-daily-window-candidates.mjs');
+  const instant = Date.parse('2026-09-22T04:00:00.000Z');
+  const fresh = '2026-09-22T03:45:00.000Z';
+  const allRows = [
+    row('BCN','direct',200,{updated_at:fresh}),
+    row('BCN','any',150,{updated_at:fresh}),
+    row('FCO','any',100,{updated_at:fresh}),
+    row('ATH','any',300,{updated_at:fresh}),
+    // stale: older than the 36h freshness cutoff (2026-09-20T16:00:00.000Z) -> must be excluded
+    row('VCE','any',80,{updated_at:'2026-09-19T00:00:00.000Z'}),
+    // out of window: departs long after the 4-month horizon -> must be excluded
+    row('MAD','any',90,{departure_at:'2027-06-01',return_at:'2027-06-03',updated_at:fresh}),
+    // out of window: departs before the 10-day lead -> must be excluded
+    row('LIS','any',70,{departure_at:'2026-09-25',return_at:'2026-09-27',updated_at:fresh}),
+  ];
+  let returnedRowCount = null;
+  function serverTable(rows) {
+    let data = rows.slice();
+    const builder = {
+      select(){return builder;},
+      gte(col,val){data=data.filter(r=>String(r[col])>=val);return builder;},
+      lte(col,val){data=data.filter(r=>String(r[col])<=val);return builder;},
+      eq(col,val){data=data.filter(r=>r[col]===val);return builder;},
+      order(){return builder;},
+      range(from,to){const page=data.slice(from,to+1);if(rows===allRows)returnedRowCount=page.length;return Promise.resolve({data:page,error:null});},
+    };
+    return builder;
+  }
+  const db = {
+    from(table){
+      if(table==='window_prices')return serverTable(allRows);
+      if(table==='public_holidays')return serverTable([]);
+      if(table==='origin_regions')return serverTable([{airport:'BER',calendar_subdivision_code:'DE-BE'}]);
+      throw new Error('unexpected table '+table);
+    },
+    rpc(){throw new Error('rpc not stubbed for this call');},
+  };
+  let published=null;
+  db.rpc=(name,args)=>{if(name!=='publish_daily_window_candidates')throw new Error('unexpected rpc '+name);published=args;return Promise.resolve({data:true,error:null});};
+  await main({db,instant,force:true});
+  assert.ok(returnedRowCount!==null && returnedRowCount<allRows.length,
+    'the DB-side filter must already narrow the row set before it reaches JS (server-side filtering happened)');
+  const expected = selectDailyWindowCandidates(allRows,{today:'2026-09-22',snapshotAt:new Date(instant).toISOString(),holidays:[],regions:['DE-BE'],wave:0});
+  assert.deepEqual(published.p_candidates, expected,
+    'server-side date/freshness filtering must produce the identical candidate set as the old full-table client-side filter');
+});

@@ -6,6 +6,7 @@ import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
 import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
+import { resetEgress, egressSummary } from './collection-egress.mjs';
 import { publishPilotState } from './pilot-price-metadata.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
@@ -113,6 +114,7 @@ export function dailySelectionRetryThrottled(state, instant, retryMs=DAILY_SELEC
 }
 
 export async function main(env=process.env){
+  resetEgress();
   if(env.COLLECTION_MODE!=='coordinated')throw new Error('Coordinated mode has not been enabled');
   for(const key of ['TP_TOKEN','SUPABASE_SERVICE_KEY','GITHUB_TOKEN'])if(!env[key])throw new Error(`Missing required ${key}`);
   const triggerSource=collectionTriggerSource(env),automated=isAutomatedTrigger(env);
@@ -236,6 +238,7 @@ export async function main(env=process.env){
       "\nA successful session is not a claim that the day's main pass or all fast refreshes met their deadlines. Check pass timestamps and error counts.\n");
   }finally{
     process.off('SIGTERM',stop);process.off('SIGINT',stop);
+    console.log(JSON.stringify(egressSummary()));
     if(claimed)await store.release();
   }
 }

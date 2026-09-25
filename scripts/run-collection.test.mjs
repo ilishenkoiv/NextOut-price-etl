@@ -287,3 +287,11 @@ test('runDueDailySelection error: checkpointed with message+time, MAIN/priority 
   assert.equal(secondCallMade,true);
   assert.ok(third.error);
 });
+
+test('every coordinator run logs a final egress_summary line and resets the counter at the start',()=>{
+  assert.match(source,/^\s*import\s*\{\s*resetEgress,\s*egressSummary\s*\}\s*from\s*'\.\/collection-egress\.mjs'/m);
+  assert.match(source,/export async function main\(env=process\.env\)\{\s*resetEgress\(\);/,
+    'resetEgress must run at the very start of every coordinator invocation');
+  assert.match(source,/finally\{[\s\S]*console\.log\(JSON\.stringify\(egressSummary\(\)\)\);[\s\S]*\}/,
+    'egress_summary must be logged in the finally block so it always runs, including on early returns and thrown errors');
+});
