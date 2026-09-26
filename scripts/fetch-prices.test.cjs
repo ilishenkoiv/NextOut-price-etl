@@ -135,6 +135,33 @@ describe('fetch-prices.mjs — an honest empty answer must not delete offers', (
   });
 });
 
+// §variant-timestamps (owner spec 2026-09-26): the per-variant checked_at patch must ride in the
+// SAME priceBuf.push call as the price/updated_at fields — a separate later write would break the
+// "same instant" guarantee and could land outside the success guard entirely.
+describe('fetch-prices.mjs — variant checked_at rides the same guarded push as the price row', () => {
+  it('imports the pure patch helper', () => {
+    assert.match(SRC, /import\s*\{\s*variantCheckedAtPatch\s*\}\s*from\s*['"]\.\/price-variant-timestamps\.mjs['"]/);
+  });
+
+  it('spreads variantCheckedAtPatch(answered, ...) inside the priceBuf.push object literal', () => {
+    const site = pushSites().find((s) => s.buf === 'priceBuf');
+    assert.ok(site, 'no priceBuf.push( found');
+    // The push spans multiple source lines; scan forward to its balanced closing to grab the
+    // whole object literal rather than assuming a fixed line count.
+    let depth = 0;
+    let end = site.index;
+    for (let i = site.index; i < LINES.length; i += 1) {
+      for (const ch of LINES[i]) {
+        if (ch === '(') depth += 1;
+        if (ch === ')') depth -= 1;
+      }
+      if (depth <= 0 && i > site.index) { end = i; break; }
+    }
+    const block = LINES.slice(site.index, end + 1).join('\n');
+    assert.match(block, /\.\.\.variantCheckedAtPatch\(\s*answered\s*,/);
+  });
+});
+
 describe('fetch-prices.mjs — baseline read resilience', () => {
   it('retries transient baseline failures before aborting the run', () => {
     assert.match(SRC, /const BASELINE_READ_RETRY_BACKOFF_MS = \[2000, 5000, 15000\]/);

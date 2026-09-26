@@ -18,6 +18,7 @@
 // were discontinued and return 404 on everything.
 
 import { withPriceProvenance } from './price-provenance.mjs';
+import { variantCheckedAtPatch } from './price-variant-timestamps.mjs';
 import { roundTripOffers, monthlyQuoteProvenance, augmentDailyPriority, priorityWatchRouteKeys } from './quote-integrity.mjs';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
@@ -1546,9 +1547,15 @@ async function main() {
         okCells += 1;
         const pair = usedType === 'direct' ? { direct: res.min, any: null } : { direct: null, any: res.min };
         byMonth[ym] = pair;
-        // One prices row per route-month → upsert on PK (origin,dest,month).
+        // One prices row per route-month → upsert on PK (origin,dest,month). `checkedAtIso` is
+        // shared with `updated_at` below so the row's write time and its variant freshness
+        // stamp(s) are the exact same instant, never two clock reads apart (§variant-timestamps).
         const market = marketForOrigin(origin);
-        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any, updated_at: new Date().toISOString(), price_source:monthlyQuoteProvenance(res.offers,res.min) });
+        const checkedAtIso = new Date().toISOString();
+        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any,
+          updated_at: checkedAtIso, price_source: monthlyQuoteProvenance(res.offers, res.min),
+          ...variantCheckedAtPatch(answered, checkedAtIso),
+        });
         // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
         snapshotRows.push({ origin, market, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
 
