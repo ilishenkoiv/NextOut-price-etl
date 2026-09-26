@@ -1,33 +1,51 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { variantCheckedAtPatch } from './price-variant-timestamps.mjs';
+import { buildVariantPriceRow } from './price-variant-timestamps.mjs';
 
 const NOW = '2026-09-26T12:00:00.000Z';
+const OLD_DIRECT_AT = '2026-09-20T03:00:00.000Z';
+const OLD_ANY_AT = '2026-09-18T03:00:00.000Z';
+const prevBoth = { direct: 150, any_stops: 300, direct_checked_at: OLD_DIRECT_AT, any_checked_at: OLD_ANY_AT };
 
-test('direct-only: only direct answered → stamps direct_checked_at only', () => {
-  const patch = variantCheckedAtPatch(new Set(['direct']), NOW);
-  assert.deepEqual(patch, { direct_checked_at: NOW });
+test('successful priced check: direct answered with a real price → updates fare AND timestamp', () => {
+  const row = buildVariantPriceRow(new Set(['direct']), { direct: 99 }, NOW, prevBoth);
+  assert.equal(row.direct, 99);
+  assert.equal(row.direct_checked_at, NOW);
 });
 
-test('any-only: only any answered → stamps any_checked_at only', () => {
-  const patch = variantCheckedAtPatch(new Set(['any']), NOW);
-  assert.deepEqual(patch, { any_checked_at: NOW });
+test('confirmed no-fare: direct answered with min:null → clears ONLY direct\'s fare, still stamps its checked_at (a real observation)', () => {
+  const row = buildVariantPriceRow(new Set(['direct']), { direct: null }, NOW, prevBoth);
+  assert.equal(row.direct, null);
+  assert.equal(row.direct_checked_at, NOW);
+  // The sibling is untouched by this same call — proven in the next tests.
 });
 
-test('mixed success/failure: natural type confirmed empty, alt type refused this cycle → only the answered type is stamped', () => {
-  // Mirrors fetch-prices.mjs: naturalType added to `answered` on its own ok response (even
-  // min:null); altType is added only if ITS OWN probe was ok — an outright refusal never adds it.
-  const answered = new Set(['direct']); // 'any' probe refused/timed out this cycle, not added
-  const patch = variantCheckedAtPatch(answered, NOW);
-  assert.deepEqual(patch, { direct_checked_at: NOW });
+test('failed/untouched sibling (any not in answered): retains BOTH its baseline fare and its baseline timestamp, never cleared, never freshened', () => {
+  const row = buildVariantPriceRow(new Set(['direct']), { direct: 99 }, NOW, prevBoth);
+  assert.equal(row.any_stops, 300);
+  assert.equal(row.any_checked_at, OLD_ANY_AT);
 });
 
-test('both genuinely observed this cycle (alt closed an empty natural cell): stamps both', () => {
-  const patch = variantCheckedAtPatch(new Set(['direct', 'any']), NOW);
-  assert.deepEqual(patch, { direct_checked_at: NOW, any_checked_at: NOW });
+test('mixed batch shape (both types answered this cycle): each gets its OWN fare and now-timestamp, independent of the other', () => {
+  const row = buildVariantPriceRow(new Set(['direct', 'any']), { direct: 120, any: null }, NOW, prevBoth);
+  assert.deepEqual(row, { direct: 120, direct_checked_at: NOW, any_stops: null, any_checked_at: NOW });
 });
 
-test('empty answered set → empty patch (pure-function contract; in fetch-prices.mjs an entirely-carried/failed cell never reaches this call at all — see fetch-prices.test.cjs)', () => {
-  const patch = variantCheckedAtPatch(new Set(), NOW);
-  assert.deepEqual(patch, {});
+test('brand-new row, no prev at all: unanswered variant is null fare + null timestamp, not prev-shaped garbage', () => {
+  const row = buildVariantPriceRow(new Set(['direct']), { direct: 500 }, NOW, undefined);
+  assert.deepEqual(row, { direct: 500, direct_checked_at: NOW, any_stops: null, any_checked_at: null });
+});
+
+test('nothing answered this cycle (defensive — fetch-prices.mjs never reaches this call in that case, see fetch-prices.test.cjs): both columns fully carried forward, neither cleared nor freshened', () => {
+  const row = buildVariantPriceRow(new Set(), {}, NOW, prevBoth);
+  assert.deepEqual(row, { direct: 150, direct_checked_at: OLD_DIRECT_AT, any_stops: 300, any_checked_at: OLD_ANY_AT });
+});
+
+test('always returns all four keys explicitly — never omits one (the batch-upsert safety property; see prices-upsert-request.test.mjs)', () => {
+  for (const answered of [new Set(), new Set(['direct']), new Set(['any']), new Set(['direct', 'any'])]) {
+    const row = buildVariantPriceRow(answered, { direct: 1, any: 2 }, NOW, prevBoth);
+    for (const key of ['direct', 'direct_checked_at', 'any_stops', 'any_checked_at']) {
+      assert.ok(Object.prototype.hasOwnProperty.call(row, key), `missing ${key}`);
+    }
+  }
 });

@@ -18,7 +18,7 @@
 // were discontinued and return 404 on everything.
 
 import { withPriceProvenance } from './price-provenance.mjs';
-import { variantCheckedAtPatch } from './price-variant-timestamps.mjs';
+import { buildVariantPriceRow } from './price-variant-timestamps.mjs';
 import { roundTripOffers, monthlyQuoteProvenance, augmentDailyPriority, priorityWatchRouteKeys } from './quote-integrity.mjs';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
@@ -820,7 +820,7 @@ async function loadPriceBaseline() {
   for (;;) {
     const res = await readBaselinePage(`baseline page ${from / PAGE + 1}`, () => supabase
       .from('prices')
-      .select('origin,dest,month,direct,any_stops')
+      .select('origin,dest,month,direct,any_stops,direct_checked_at,any_checked_at')
       .order('origin', { ascending: true })
       .order('dest', { ascending: true })
       .order('month', { ascending: true })
@@ -831,7 +831,10 @@ async function loadPriceBaseline() {
     if (error) throw new Error(`could not load existing prices (baseline): ${describeError(httpStatusOf(res, error), error)}`);
     if (!data || data.length === 0) break;
     for (const r of data) {
-      map.set(`${r.origin}|${r.dest}|${r.month}`, { direct: r.direct, any_stops: r.any_stops });
+      map.set(`${r.origin}|${r.dest}|${r.month}`, {
+        direct: r.direct, any_stops: r.any_stops,
+        direct_checked_at: r.direct_checked_at, any_checked_at: r.any_checked_at,
+      });
       // Deadness is judged over the CURRENT horizon only. A row for a month that has already
       // passed says nothing about whether the route flies in the months we are collecting.
       if (!HORIZON_MONTHS.has(r.month)) continue;
@@ -1508,9 +1511,15 @@ async function main() {
       const retNext = nextMonthYM(ym);
       const naturalType = naturalDirect ? 'direct' : 'any';
       const answered = new Set(); // flight types that returned an ok response for THIS cell
+      // Each type's OWN observed price this cycle (a real number, or null for a genuine confirmed
+      // no-fare) — set ONLY for a type actually in `answered`. Distinct from `res.min`/`usedType`
+      // below, which track the single attempt whose OFFERS populate the offers table for this
+      // cell; a type can be genuinely re-confirmed empty here even when the OTHER type supplies
+      // the cell's `res`/offers (§fare-preservation, owner spec 2026-09-26).
+      const variantPrice = {};
       // Attempt 1 (§attempt-order): the cell's NATURAL type over BOTH return windows (§edge-months).
       let res = await probeType(origin, dest, ym, retNext, naturalDirect, request);
-      if (res.ok) answered.add(naturalType);
+      if (res.ok) { answered.add(naturalType); variantPrice[naturalType] = res.min; }
       let usedType = naturalType;
       // §load: extra attempts fire ONLY on a genuinely EMPTY cell (ok:true, no price) — never on a
       // failed one (ok:false keeps its previous value, §first-edit). Order: alt stop-type, then the
@@ -1519,7 +1528,7 @@ async function main() {
         const altType = naturalDirect ? 'any' : 'direct';
         const alt = await probeType(origin, dest, ym, retNext, !naturalDirect, request);
         extraRequests += 2;
-        if (alt.ok) answered.add(altType);
+        if (alt.ok) { answered.add(altType); variantPrice[altType] = alt.min; }
         if (alt.ok && alt.min != null) {
           res = alt;
           usedType = altType;
@@ -1529,6 +1538,7 @@ async function main() {
           extraRequests += 1;
           if (cal.ok && cal.min != null) {
             answered.add(cal.type);
+            variantPrice[cal.type] = cal.min; // supersedes a prior empty result for the same type
             res = { ok: true, min: cal.min, offers: cal.offers };
             usedType = cal.type;
             cellsClosedByCalendar += 1;
@@ -1545,28 +1555,36 @@ async function main() {
       if (ok) {
         okRouteMonths += 1;
         okCells += 1;
-        const pair = usedType === 'direct' ? { direct: res.min, any: null } : { direct: null, any: res.min };
-        byMonth[ym] = pair;
         // One prices row per route-month → upsert on PK (origin,dest,month). `checkedAtIso` is
         // shared with `updated_at` below so the row's write time and its variant freshness
         // stamp(s) are the exact same instant, never two clock reads apart (§variant-timestamps).
+        // `prev` is looked up BEFORE the row is built because buildVariantPriceRow needs it: a
+        // failed/untouched sibling variant carries forward BOTH its baseline fare AND its
+        // baseline checked_at, never cleared and never freshened (§fare-preservation). A batched
+        // upsert always supplies all four columns explicitly for every row — see
+        // price-variant-timestamps.mjs for why an omitted key is unsafe once another row in the
+        // same flush batch supplies it.
         const market = marketForOrigin(origin);
         const checkedAtIso = new Date().toISOString();
-        priceBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any,
+        const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
+        const variantRow = buildVariantPriceRow(answered, variantPrice, checkedAtIso, prev);
+        byMonth[ym] = { direct: variantRow.direct, any: variantRow.any_stops };
+        priceBuf.push({ origin, market, dest, month: ym,
           updated_at: checkedAtIso, price_source: monthlyQuoteProvenance(res.offers, res.min),
-          ...variantCheckedAtPatch(answered, checkedAtIso),
+          ...variantRow,
         });
         // Tee (observe only) the same values for the history snapshot — no effect on collection/write.
-        snapshotRows.push({ origin, market, dest, month: ym, direct: pair.direct, any: pair.any, fetched_at: RUN_START_ISO });
+        snapshotRows.push({ origin, market, dest, month: ym, direct: variantRow.direct, any: variantRow.any_stops, fetched_at: RUN_START_ISO });
 
         // price_history: log ONLY when this price differs from the baseline (or the route is new).
-        const prev = existingPrices.get(`${origin}|${dest}|${ym}`);
-        const hasPrice = pair.direct != null || pair.any != null;
+        // An untouched/failed sibling's carried-forward fare always equals its own baseline value
+        // here, so it never shows as "changed" — only a genuinely observed variant can.
+        const hasPrice = variantRow.direct != null || variantRow.any_stops != null;
         const changed = !prev
-          || (prev.direct ?? null) !== (pair.direct ?? null)
-          || (prev.any_stops ?? null) !== (pair.any ?? null);
+          || (prev.direct ?? null) !== (variantRow.direct ?? null)
+          || (prev.any_stops ?? null) !== (variantRow.any_stops ?? null);
         if (changed && hasPrice) {
-          historyBuf.push({ origin, market, dest, month: ym, direct: pair.direct, any_stops: pair.any });
+          historyBuf.push({ origin, market, dest, month: ym, direct: variantRow.direct, any_stops: variantRow.any_stops });
           pricesChanged += 1;
         } else if (!changed) {
           pricesUnchanged += 1;
