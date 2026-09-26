@@ -3,7 +3,7 @@
 import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { computeAllWindows } from './collection-windows.mjs';
-import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, freshOriginFraction } from './snapshot-daily-origin-cheapest.mjs';
+import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, freshOriginFraction, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { recordRead } from './collection-egress.mjs';
@@ -53,7 +53,11 @@ async function loadAll(db,table,columns,order,filter){const out=[];for(let from=
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
   pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now}={}){
-  const today=berlinObservedOn(instant);if(!force&&!nightlySelectionDue(instant))return{published:false,reason:'not_due',observedOn:today};
+  const today=berlinObservedOn(instant);
+  // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — see the
+  // matching comment in snapshot-daily-origin-cheapest.mjs's main().
+  const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
+  if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
   // Same date window (min..max) and freshness cutoff (36h) that selectDailyWindowCandidates

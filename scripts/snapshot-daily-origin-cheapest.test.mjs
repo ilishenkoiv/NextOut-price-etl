@@ -88,11 +88,11 @@ test('nightly due gate is 03:30 Berlin on winter, spring-DST and fall-DST days',
 
 test('a pilot (later) threshold overrides the legacy 03:30 default without changing it', () => {
   assert.equal(LEGACY_SELECTION_THRESHOLD_MINUTES, 3 * 60 + 30);
-  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 7 * 60 + 5);
+  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 6 * 60);
   // 03:30 Berlin (legacy-due) is still inside the pilot's night gap — not due under the pilot threshold.
   assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), false);
-  assert.equal(nightlySelectionDue('2026-01-15T06:04:59Z', PILOT_SELECTION_THRESHOLD_MINUTES), false); // 07:04:59
-  assert.equal(nightlySelectionDue('2026-01-15T06:05:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), true); // 07:05:00
+  assert.equal(nightlySelectionDue('2026-01-15T04:59:59Z', PILOT_SELECTION_THRESHOLD_MINUTES), false); // 05:59:59
+  assert.equal(nightlySelectionDue('2026-01-15T05:00:00Z', PILOT_SELECTION_THRESHOLD_MINUTES), true); // 06:00:00
   // Calling with no threshold argument is untouched — exact legacy behavior.
   assert.equal(nightlySelectionDue('2026-01-15T02:30:00Z'), true);
 });

@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger,
-  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS } from './run-collection.mjs';
+  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS,
+  DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './run-collection.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
 import { berlinObservedOn } from './snapshot-daily-origin-cheapest.mjs';
 
@@ -313,4 +314,9 @@ test('every coordinator run logs a final egress_summary line and resets the coun
     'resetEgress must run at the very start of every coordinator invocation');
   assert.match(source,/finally\{[\s\S]*console\.log\(JSON\.stringify\(egressSummary\(\)\)\);[\s\S]*\}/,
     'egress_summary must be logged in the finally block so it always runs, including on early returns and thrown errors');
+});
+
+test('post-selection point-refresh budget: 10-minute cap, 5-minute reserve for MAIN/priority', () => {
+  assert.equal(DAILY_SELECTION_REFRESH_MAX_MS, 10 * 60_000);
+  assert.equal(DAILY_SELECTION_REFRESH_RESERVE_MS, 5 * 60_000);
 });
