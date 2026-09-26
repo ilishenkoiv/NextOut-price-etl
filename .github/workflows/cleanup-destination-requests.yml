@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   cleanup:
-    if: vars.COLLECTION_MODE != 'coordinated'
+    if: github.event_name == 'workflow_dispatch' || vars.COLLECTION_MODE != 'coordinated'
     name: Delete destination requests older than 24 months
     runs-on: ubuntu-latest
     timeout-minutes: 10

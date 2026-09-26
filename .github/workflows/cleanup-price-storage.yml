@@ -26,6 +26,12 @@ env:
 
 jobs:
   cleanup:
+    # Under coordinated mode, the quarterly prune is owned by the coordinator's nightly
+    # maintenance block (03:00-05:45 Berlin, on the quarter's first day — see
+    # scripts/collection-adapters.mjs / scripts/maintenance-window.mjs); the scheduled trigger is
+    # skipped here. A manual workflow_dispatch still runs (the bash gate below still short-circuits
+    # allowed=true for COLLECTION_MODE=coordinated, unchanged).
+    if: github.event_name == 'workflow_dispatch' || vars.COLLECTION_MODE != 'coordinated'
     name: Prune old snapshots and sweep markers
     runs-on: ubuntu-latest
     timeout-minutes: 20
