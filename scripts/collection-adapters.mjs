@@ -7,6 +7,7 @@ import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
 import { withSupabaseRetry } from './supabase-retry.mjs';
+import { logDbError, dbErrorCode } from './db-error.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
@@ -61,7 +62,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // the 9s boundary guard) can run past the unit/session deadline. If nothing fits,
   // delays is empty and the operation runs exactly once, failing honestly.
   function retryBudget(deadline) {
-    const base = [1000, 3000, 8000]; const delays = []; let projected = clock();
+    const base = [1000, 3000, 9000]; const delays = []; let projected = clock();
     for (const d of base) { projected += d + 8000; if (projected + 9000 > deadline) break; delays.push(d); }
     return { label: 'coordinator db', delays, sleep, random, now: clock, warn: () => {} };
   }
@@ -69,23 +70,31 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // lease before every attempt. Only reads and PROVEN-idempotent writes pass retry:true;
   // permanent Postgres/RLS/schema errors are non-transient and surface unchanged, so a
   // failed operation never becomes a false success and never masks a real error.
-  async function query(build, deadline = Infinity, { retry = false } = {}) {
+  // `op` names the operation for the structured db_error log line and the thrown message —
+  // every call site below passes one so a failure is traceable to what it was doing, not just
+  // reduced to an opaque error code.
+  async function query(build, deadline = Infinity, { retry = false, op = 'db_operation' } = {}) {
     if (clock() + 9000 >= deadline) throw new CollectionYield('Database unit would cross boundary');
+    let attempts = 0;
     const attempt = async () => {
+      attempts++;
       if (!await store.lease()) throw new Error('Database operation forbidden: lease lost');
       return build();
     };
     const result = retry ? await withSupabaseRetry(attempt, retryBudget(deadline)) : await attempt();
-    if (result.error) throw new Error(`Collection database operation failed (${result.error.code ?? 'unknown'})`);
+    if (result.error) {
+      logDbError({ op, error: result.error, status: result.status, attempt: attempts });
+      throw new Error(`Collection database operation failed: ${op} (${dbErrorCode(result.error)})`);
+    }
     return result.data;
   }
-  async function load(table, columns, order, apply = q => q, deadline = Infinity) {
+  async function load(table, columns, order, apply = q => q, deadline = Infinity, op = table) {
     const rows = [];
     for (let from = 0; ; from += 1000) {
       const data = await query(() => {
         let q = db.from(table).select(columns); for (const key of order) q = q.order(key);
         return apply(q).range(from, from + 999);
-      }, deadline, { retry: true });
+      }, deadline, { retry: true, op });
       rows.push(...data); recordRead(table, data); if (data.length < 1000) return rows;
     }
   }
@@ -98,7 +107,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     // collection_commit_main/window/roulette are idempotent by construction (fenced,
     // upsert-on-conflict / delete-by-PK, price_history append guarded against the
     // persisted row), so a retry after a committed-but-lost response cannot double-write.
-    const accepted=await query(() => db.rpc(name, { ...store.args(), ...payload }), deadline, { retry: true });
+    const accepted=await query(() => db.rpc(name, { ...store.args(), ...payload }), deadline, { retry: true, op: name });
     if(accepted!==true)throw new Error('Collection write was not acknowledged');
     return accepted;
   }
@@ -169,7 +178,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           if (hasPrice || (directResult.ok&&anyResult.ok&&direct==null&&any==null)) {
             const recorded = await query(()=>db.rpc('collection_record_route_observation',{...store.args(),p_pass_id:job.id,
               p_origin:route.origin,p_dest:route.dest,p_month:month,p_horizon:plan.months,
-              p_has_price:hasPrice,p_is_expansion:expansion.has(route.dest)}),unitEnd,{retry:true});
+              p_has_price:hasPrice,p_is_expansion:expansion.has(route.dest)}),unitEnd,{retry:true,op:'collection_record_route_observation'});
             if(recorded!==true)throw new Error('Route price-health observation was not acknowledged');
           }
           cp = { ...cp, cursor:cp.cursor+1, errors:cp.errors+Number(!directResult.ok)+Number(!anyResult.ok), total };
@@ -186,7 +195,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const hhmm=new Date(job.startedAt).toLocaleTimeString('en-GB',{timeZone:'Europe/Berlin',hour:'2-digit',minute:'2-digit',hour12:false}).replace(':','');
           const path=`snapshots/${date.slice(0,4)}/${date.slice(5,7)}/${date}_${hhmm}_coordinator-${job.id}.csv.gz`;
           const body=gzipSync(csv);
-          await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true});
+          await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true,op:'price_snapshot_upload'});
           // The pass is complete once its private CSV is preserved. Daily selection remains the
           // coordinator pre-phase and is never coupled to MAIN completion.
           return {status:'done',checkpoint:{...cp,stage:'complete',snapshotPath:path}};
@@ -217,7 +226,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       await commit('collection_commit_window_candidate',{p_ticket:ticket,p_result:candidateResult},deadline);
     }else await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
     if(fare){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
-      p_observed_at:now}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
+      p_observed_at:now}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
     return outcome.status!=='error';
   }
 
@@ -245,7 +254,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   async function windowWasRefreshedRecently(ticket,deadline){
     const rows=await query(()=>db.from('window_prices').select('updated_at').eq('origin',ticket.origin).eq('dest',ticket.dest)
       .eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at)
-      .gte('updated_at',new Date(clock()-30*60*1000).toISOString()).limit(1),deadline,{retry:true});
+      .gte('updated_at',new Date(clock()-30*60*1000).toISOString()).limit(1),deadline,{retry:true,op:'window_prices_freshness_check'});
     recordRead('window_prices',rows);
     return rows?.length>0;
   }
@@ -308,7 +317,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
     try {
       if(cp.phase==='audit'){
-        const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline);
+        const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline,{op:'claim_flight_price_audit'});
         const row=rows?.[0];
         if(row){
           const queuedAt=Date.parse(row.created_at??row.feedback?.created_at);
@@ -321,7 +330,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
           }
           const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
-            p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline);
+            p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline,{op:'finish_flight_price_audit'});
           if(result!==true)throw new Error('Audit claim expired before completion');
           cp.auditProcessed=(cp.auditProcessed??0)+1;
           if(cp.auditProcessed>=PRIORITY_AUDIT_BATCH){cp.auditDone=true;cp.phase='roulette';}
@@ -331,7 +340,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       }
       if(cp.phase==='roulette'){
         const r=cp.roulette;
-        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_origin_cheapest_pool_latest_snapshot'});
         recordRead('daily_origin_cheapest_pool',latest);
         const latestSnapshot=latest[0]?.snapshot_at??null;
         if(r.snapshotAt!==latestSnapshot){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;
@@ -387,7 +396,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
                 airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
               await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
               const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:candidate.origin,p_dest:candidate.dest,
-                p_observed_at:replacement.updated_at}),deadline,{retry:true});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
+                p_observed_at:replacement.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
             }
           }
@@ -408,7 +417,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           if(result.status==='no_result'){r.pendingReplacement={ticket,candidateCursor:0};return{status:'progress',checkpoint:cp};}
           if(result.status==='found'){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
             const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
-            p_observed_at:patch.updated_at}),deadline,{retry:true});if(revived!==true)throw new Error('Route revival was not acknowledged');}
+            p_observed_at:patch.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
           if(result.status==='found')r.cursor++;
         }
         r.total=effectiveTickets.length;r.done=r.cursor>=r.total;
@@ -424,7 +433,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         // on every weekend-phase tick.
         const epochs=await query(()=>db.from('daily_window_candidate_epochs')
           .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
-          .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true});
+          .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_window_candidate_epochs_latest'});
         recordRead('daily_window_candidate_epochs',epochs);
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
@@ -469,17 +478,17 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         if(cp.checked[turn]===today)continue;
         const table=['app_errors','flight_price_feedback','destination_requests'][turn];
         const cutoff=turn===2?calendarMonthsAgoIso(new Date(now)):new Date(now-(turn===0?90:365)*DAY).toISOString();
-        const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true});
-        if(rows.length){await query(()=>db.from(table).delete().in('id',rows.map(r=>r.id)),deadline,{retry:true});return{status:'progress',checkpoint:cp};}
+        const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true,op:`${table}_expired_scan`});
+        if(rows.length){await query(()=>db.from(table).delete().in('id',rows.map(r=>r.id)),deadline,{retry:true,op:`${table}_expired_delete`});return{status:'progress',checkpoint:cp};}
         cp.checked[turn]=today;
-      }else if(turn===3&&cp.metricsDay!==today){await query(()=>db.rpc('collect_storage_metrics'),deadline);cp.metricsDay=today;return{status:'progress',checkpoint:cp};
+      }else if(turn===3&&cp.metricsDay!==today){await query(()=>db.rpc('collect_storage_metrics'),deadline,{op:'collect_storage_metrics'});cp.metricsDay=today;return{status:'progress',checkpoint:cp};
       }else if(turn===4&&cp.checked.plans!==today){
         const bucket=db.storage.from('price-snapshots');
-        const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true});
+        const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true,op:'plan_bucket_list'});
         const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
         const p=state?.jobs?.priority?.checkpoint;if(p?.roulette)protectedNames.add(`roulette-${p.roulette.cycle}-0.json`);if(p?.weekend)protectedNames.add(`windowrefresh-${p.weekend.dayId}-0.json`);
         const expired=rows.filter(r=>/^(main|tail|fast|roulette|windowrefresh)-\d+-\d+\.json$/.test(r.name)&&!protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
-        if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true});return{status:'progress',checkpoint:cp};}
+        if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true,op:'plan_bucket_remove_expired'});return{status:'progress',checkpoint:cp};}
         cp.checked.plans=today;
       }
     }return{status:'empty',checkpoint:cp};

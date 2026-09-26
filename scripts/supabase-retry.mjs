@@ -18,7 +18,13 @@ export function isTransientSupabaseFailure(error,status) {
   const code=String(error?.code??'');
   return [408,429,500,502,503,504,520,521,522,523,524,525,526,530].includes(Number(status??code))
     || ['40001','40P01','57014','ECONNRESET','ETIMEDOUT','EAI_AGAIN','ENOTFOUND'].includes(code)
-    || /timeout|timed out|fetch failed|network|dns resolution|gateway|temporarily unavailable|connection reset/i.test(String(error?.message??''));
+    || /timeout|timed out|fetch failed|network|dns resolution|gateway|temporarily unavailable|connection reset|socket hang up/i.test(String(error?.message??''))
+    // An empty/missing code with no other classification is exactly what a lost transport detail
+    // looks like (see the 2026-09-25/26 collector incidents: "operation failed ()", no code, no
+    // message) — treat it as transient rather than silently permanent, so it gets a bounded retry
+    // instead of failing the whole session on the first ambiguous response. A real permanent
+    // Postgres/RLS error always carries its own code (e.g. '42501'), so this never masks one.
+    || code==='';
 }
 // Only use for reads or idempotent upsert/update/delete operations. Build the query anew each time.
 export function retryAfterMs(value,now=Date.now()) {
@@ -26,7 +32,7 @@ export function retryAfterMs(value,now=Date.now()) {
   const seconds=Number(value);
   return Math.max(0,Number.isFinite(seconds)?seconds*1000:(Date.parse(value)-now)||0);
 }
-export async function withSupabaseRetry(operation,{label='Supabase operation',delays=[1000,3000,8000],sleep=delay,warn=console.warn,random=Math.random,now=Date.now}={}) {
+export async function withSupabaseRetry(operation,{label='Supabase operation',delays=[1000,3000,9000],sleep=delay,warn=console.warn,random=Math.random,now=Date.now}={}) {
   for(let attempt=0;;attempt++){
     let result;
     try {
