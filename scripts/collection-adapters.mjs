@@ -53,6 +53,31 @@ export function buildRouletteReplacementCandidates(offers,pool,allowedDests,toda
   const grouped={};for(const row of best.values())(grouped[`${row.origin}|${row.flight_type}`]??=[]).push(row);for(const rows of Object.values(grouped))rows.sort((a,b)=>Number(a.price)-Number(b.price)
     ||String(b.updated_at).localeCompare(String(a.updated_at))||Number(a.transfers??0)-Number(b.transfers??0)||String(a.departure_at).localeCompare(String(b.departure_at))||String(a.dest).localeCompare(String(b.dest)));
   return grouped;}
+// `plan.replacements` is cached and reused for every 30-minute cycle until the daily snapshot
+// changes (see the coordinator's `store.plan(...roulette-${snapshotId}...)` call), but the live
+// `daily_origin_cheapest_pool` keeps changing under it as OTHER ranks are successfully replaced
+// mid-day. A cached candidate that was free when the plan was built can already be taken by the
+// time this target's turn comes up. Re-checks the exact same identity/membership invariants
+// collection_commit_roulette's replacement guard enforces (destination not already in this
+// origin/snapshot's live pool, not the ticket's own destination, in-horizon dates, matching
+// flight type/transfers) against a FRESH read, so a now-stale candidate is caught and skipped
+// (advance to the next candidate, exactly like a provider no_result) before spending a TP request
+// or a doomed RPC round-trip on it — never by assuming it is invalid merely because it is old.
+export function rouletteCandidateStillEligible(candidate,target,livePoolDests,today){
+  return Boolean(candidate)&&candidate.dest!==target.dest&&candidate.flight_type===target.flight_type
+    &&!livePoolDests.has(`${candidate.origin}|${candidate.dest}`)
+    &&typeof candidate.departure_at==='string'&&candidate.departure_at>=today
+    &&typeof candidate.return_at==='string'&&candidate.return_at>candidate.departure_at
+    &&(candidate.flight_type!=='direct'||Number(candidate.transfers)===0);
+}
+// The one Postgres exception collection_commit_roulette raises for a candidate this function
+// could not have caught in advance (a genuine race lost against another fenced attempt between
+// our fresh read above and the commit). Matched on the exact op AND exact message — never a bare
+// P0001, which several distinct, still-fatal exceptions in the same function also use (invalid
+// roulette ticket, invalid confirmed fare, lease lost, target changed before replacement/sync).
+export function isStaleRouletteReplacementRejection(error){
+  return error?.dbOp==='collection_commit_roulette'&&error?.dbMessage==='invalid or stale roulette replacement';
+}
 
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
@@ -86,7 +111,14 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const result = retry ? await withSupabaseRetry(attempt, retryBudget(deadline)) : await attempt();
     if (result.error) {
       logDbError({ op, error: result.error, status: result.status, attempt: attempts });
-      throw new Error(`Collection database operation failed: ${op} (${dbErrorCode(result.error)})`);
+      const failure = new Error(`Collection database operation failed: ${op} (${dbErrorCode(result.error)})`);
+      // Same safe-to-log text db-error.mjs already logs (never request secrets), attached so a
+      // caller can react to one exact, known Postgres exception without pattern-matching the
+      // formatted message string or handling every error sharing this op/code as if it were that
+      // one case (a bare P0001 covers several distinct raised exceptions in collection_commit_roulette).
+      failure.dbOp = op; failure.dbCode = dbErrorCode(result.error);
+      failure.dbMessage = typeof result.error?.message === 'string' ? result.error.message : null;
+      throw failure;
     }
     return result.data;
   }
@@ -386,8 +418,14 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           r.cursor++;delete r.pendingReplacement;};
         if(r.pendingReplacement){
           const target=r.pendingReplacement.ticket,candidates=plan.replacements[`${target.origin}|${target.flight_type}`]??[];
+          // Fresh, cheap (per-origin, <=10 rows), read-committed truth of what this snapshot's
+          // pool currently holds for this origin — the cached `candidates` list can be hours
+          // stale against it (see rouletteCandidateStillEligible above).
+          const livePool=await load('daily_origin_cheapest_pool','origin,dest',['dest'],
+            q=>q.eq('snapshot_at',plan.snapshotAt).eq('origin',target.origin),deadline);
+          const livePoolDests=new Set([...(r.usedReplacementDests??[]),...livePool.map(row=>`${row.origin}|${row.dest}`)]);
           let candidate=candidates[r.pendingReplacement.candidateCursor];
-          while(candidate&&(r.usedReplacementDests??[]).includes(`${candidate.origin}|${candidate.dest}`))candidate=candidates[++r.pendingReplacement.candidateCursor];
+          while(candidate&&!rouletteCandidateStillEligible(candidate,target,livePoolDests,today))candidate=candidates[++r.pendingReplacement.candidateCursor];
           if(!candidate){
             await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement:null}},deadline);
             r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
@@ -405,7 +443,25 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               const replacement=withPriceProvenance([{...candidate,...outcome,price:outcome.price,updated_at:new Date(clock()).toISOString(),
                 market:marketForOrigin(candidate.origin),transfers:Number.isInteger(source?.transfers)?source.transfers:candidate.transfers,
                 airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-              await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
+              try{
+                await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
+              }catch(error){
+                // The one race our fresh read above cannot fully close: another fenced attempt
+                // takes this exact dest between our read and this commit. Never fatal to the run —
+                // this candidate is reconciled as rejected (not confirmed, nothing deleted) and the
+                // walk moves on to the next one, bounded by the same candidates array every other
+                // rejection already advances through. Any other exception (lease lost, invalid
+                // ticket/fare, target changed under an unrelated fenced attempt, ...) stays fatal.
+                if(!isStaleRouletteReplacementRejection(error))throw error;
+                // Same shape as an ordinary provider no_result on a candidate (line above): the
+                // target itself is not yet resolved, so the phase stays 'roulette' and this cycle
+                // keeps walking the same candidates array on its next tick — never a full detour
+                // through 'weekend' just to come back, and never the fatal abort this candidate
+                // used to cause.
+                r.staleReplacementRejections=(r.staleReplacementRejections??0)+1;
+                r.pendingReplacement.candidateCursor++;
+                return{status:'progress',checkpoint:cp};
+              }
               const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:candidate.origin,p_dest:candidate.dest,
                 p_observed_at:replacement.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;

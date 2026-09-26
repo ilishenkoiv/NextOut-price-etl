@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 // The selection owner reads its service key at import time, so set it before importing.
 process.env.SUPABASE_SERVICE_KEY ??= 'test-service-key';
 const { main: publishSnapshot } = await import('./snapshot-daily-origin-cheapest.mjs');
-const { createAdapters } = await import('./collection-adapters.mjs');
+const { createAdapters, rouletteCandidateStillEligible, isStaleRouletteReplacementRejection } = await import('./collection-adapters.mjs');
 
 // A thenable that resolves a PostgREST-shaped { data, error } result.
 const settle = (result) => ({ then: (onFulfilled, onRejected) => Promise.resolve(result).then(onFulfilled, onRejected) });
@@ -129,14 +129,17 @@ test('atomic publication failure leaves no completion write and a later catch-up
 
 // Recording double for the maintenance adapter: rpc() and a chainable from() that flags
 // any pool-table write. store.plan short-circuits to the supplied tickets.
-function maintenanceHarness(tickets, response, { lease = async () => true, replacements = {}, allowedDests = ['BCN','ATH','FCO'], latestSnapshot='2027-01-05T03:30:00Z' } = {}) {
+function maintenanceHarness(tickets, response, { lease = async () => true, replacements = {}, allowedDests = ['BCN','ATH','FCO'], latestSnapshot='2027-01-05T03:30:00Z', poolRows, rpcError } = {}) {
   const calls = [];
   const poolWrites = [];
+  const pool = poolRows ?? [{snapshot_at:latestSnapshot}];
   const db = {
-    rpc: (name, args) => { calls.push({ name, args }); return settle({ data: true, error: null }); },
+    rpc: (name, args) => { calls.push({ name, args });
+      const error = rpcError ? rpcError(name, args) : null;
+      return settle(error ? { data: null, error } : { data: true, error: null }); },
     from(table) {
       const chain = new Proxy({}, { get: (_, key) => {
-        if (key === 'then') { const p = Promise.resolve({ data: table==='daily_origin_cheapest_pool'?[{snapshot_at:latestSnapshot}]:[], error: null }); return p.then.bind(p); }
+        if (key === 'then') { const p = Promise.resolve({ data: table==='daily_origin_cheapest_pool'?pool:[], error: null }); return p.then.bind(p); }
         if (['insert', 'upsert', 'update', 'delete'].includes(key) && table === 'daily_origin_cheapest_pool') {
           return (...a) => { poolWrites.push({ key, a }); return chain; };
         }
@@ -148,9 +151,10 @@ function maintenanceHarness(tickets, response, { lease = async () => true, repla
   };
   const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease, plan: async () => ({ tickets,replacements,allowedDests,snapshotAt:latestSnapshot }), runId: '1' };
   let requests = 0;
-  const provider = { request: async url => { requests += 1; return response(requests,url); } };
+  let currentResponse = response;
+  const provider = { request: async url => { requests += 1; return currentResponse(requests,url); } };
   const adapters = createAdapters({ db, store, provider, clock: () => 1_700_000_000_000, wave: 0 });
-  return { adapters, calls, poolWrites, get requests() { return requests; } };
+  return { adapters, calls, poolWrites, get requests() { return requests; }, setResponse: fn => { currentResponse = fn; } };
 }
 
 const rouletteTicket = (dest, rank) => ({ origin: 'BER', dest, flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17', rank, snapshot_at:'2027-01-05T03:30:00Z' });
@@ -219,6 +223,91 @@ test('a technical error while checking a replacement preserves the target and de
   const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
   assert.equal(h.calls.length,0);assert.equal(second.checkpoint.roulette.cursor,1);assert.equal(second.checkpoint.roulette.exhausted,undefined);
   assert.equal(second.checkpoint.roulette.technicalDeferred[0].stage,'replacement');
+});
+
+// ---- 2026-09-26 incident: collection_commit_roulette P0001 "invalid or stale roulette
+// replacement" blocked ALL downstream collection forever, because the cached candidate list is a
+// daily artifact (reused across every 30-minute cycle) while the live pool changes under it as
+// other ranks get replaced, and a rejected commit was unconditionally fatal to the whole run with
+// no cursor advance to retry the exact same doomed candidate on. ----
+
+test('rouletteCandidateStillEligible rejects a candidate whose destination is already the live pool for this origin/snapshot',()=>{
+  const target={origin:'BER',dest:'BCN',flight_type:'any'};
+  const takenAlready={origin:'BER',dest:'ATH',flight_type:'any',departure_at:'2027-01-10',return_at:'2027-01-17',transfers:1};
+  assert.equal(rouletteCandidateStillEligible(takenAlready,target,new Set(['BER|ATH']),'2027-01-01'),false,'already in the live pool');
+  assert.equal(rouletteCandidateStillEligible(takenAlready,target,new Set(),'2027-01-01'),true,'free candidate stays eligible');
+  assert.equal(rouletteCandidateStillEligible({...takenAlready,dest:'BCN'},target,new Set(),'2027-01-01'),false,'never re-replace with the ticket\'s own destination');
+  assert.equal(rouletteCandidateStillEligible({...takenAlready,departure_at:'2026-12-31'},target,new Set(),'2027-01-01'),false,'departure fell out of the horizon');
+  const directTarget={...target,flight_type:'direct'};
+  assert.equal(rouletteCandidateStillEligible({...takenAlready,flight_type:'direct',transfers:1},directTarget,new Set(),'2027-01-01'),false,'direct candidate must have zero transfers');
+  assert.equal(rouletteCandidateStillEligible({...takenAlready,flight_type:'direct',transfers:0},directTarget,new Set(),'2027-01-01'),true,'zero-transfer direct candidate is eligible');
+});
+
+test('isStaleRouletteReplacementRejection matches only the exact op+message, never a bare P0001 code',()=>{
+  assert.equal(isStaleRouletteReplacementRejection({dbOp:'collection_commit_roulette',dbCode:'P0001',dbMessage:'invalid or stale roulette replacement'}),true);
+  assert.equal(isStaleRouletteReplacementRejection({dbOp:'collection_commit_roulette',dbCode:'P0001',dbMessage:'invalid roulette ticket'}),false,'a different P0001 exception from the same function stays fatal');
+  assert.equal(isStaleRouletteReplacementRejection({dbOp:'collection_revive_route',dbCode:'P0001',dbMessage:'invalid or stale roulette replacement'}),false,'wrong op');
+  assert.equal(isStaleRouletteReplacementRejection(new Error('unrelated')),false);
+});
+
+test('a candidate already taken in the live pool is reconciled and skipped before spending a provider request',async()=>{
+  const target=rouletteTicket('BCN',1);
+  const stale={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const fresh={...rouletteTicket('FCO',9),month:'2027-01',market:'de',nights:7,price:150,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const emptyResponse=()=>({kind:'ok',json:{success:true,data:[]}});
+  const foundFco=(_n,url)=>{const destination=new URL(url).searchParams.get('destination');
+    return{kind:'ok',json:{success:true,data:[{origin:'BER',destination,departure_at:'2027-01-10T06:00:00Z',return_at:'2027-01-17T20:00:00Z',price:150,transfers:1,currency:'EUR'}]}};};
+  const h=maintenanceHarness([target],emptyResponse,{replacements:{'BER|any':[stale,fresh]},
+    poolRows:[{snapshot_at:'2027-01-05T03:30:00Z',origin:'BER',dest:'ATH'}]});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  assert.equal(first.checkpoint.roulette.pendingReplacement.candidateCursor,0);
+  h.setResponse(foundFco);
+  const before=h.requests;
+  const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(h.requests-before,1,'the already-taken ATH candidate never reached the provider; only FCO did');
+  const call=h.calls.find(c=>c.name==='collection_commit_roulette'&&c.args.p_result.replacement);
+  assert.equal(call.args.p_result.replacement.dest,'FCO','skipped straight to the next eligible candidate');
+  assert.equal(second.checkpoint.roulette.cursor,1);
+  assert.equal(second.checkpoint.phase,'weekend','downstream phases are not blocked');
+});
+
+test('an RPC-rejected stale replacement is reconciled non-fatally: not confirmed, not deleted, cursor advances to the next candidate',async()=>{
+  const target=rouletteTicket('BCN',1);
+  const raced={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const next={...rouletteTicket('FCO',9),month:'2027-01',market:'de',nights:7,price:150,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const response=(_n,url)=>{const destination=new URL(url).searchParams.get('destination');
+    return{kind:'ok',json:{success:true,data:[{origin:'BER',destination,departure_at:'2027-01-10T06:00:00Z',return_at:'2027-01-17T20:00:00Z',price:destination==='ATH'?135:150,transfers:1,currency:'EUR'}]}};};
+  let rejectNext=true;
+  const h=maintenanceHarness([target],()=>({kind:'ok',json:{success:true,data:[]}}),{replacements:{'BER|any':[raced,next]},
+    rpcError:(name,args)=>{if(name==='collection_commit_roulette'&&args.p_result?.replacement?.dest==='ATH'&&rejectNext){rejectNext=false;
+      return{code:'P0001',message:'invalid or stale roulette replacement'};} return null;}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  h.setResponse(response);
+  const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  // Rejected: no confirmed replacement recorded for it, no revival call, walk stays pending on the same target.
+  assert.equal(h.calls.filter(c=>c.name==='collection_revive_route').length,0);
+  assert.equal(second.checkpoint.roulette.staleReplacementRejections,1);
+  assert.equal(second.checkpoint.roulette.pendingReplacement.candidateCursor,1,'cursor moved past the rejected candidate');
+  assert.equal(second.checkpoint.roulette.usedReplacementDests,undefined,'a rejected candidate is never marked used/confirmed');
+  assert.equal(second.checkpoint.phase,'roulette','the run is not aborted (same as an ordinary candidate no_result); the walk keeps going');
+  assert.equal(second.checkpoint.roulette.done,false);
+  // Next step resolves the walk with the next candidate, unaffected by the earlier rejection.
+  const third=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:second.checkpoint},deadline:1_700_000_200_000});
+  const confirmed=h.calls.find(c=>c.name==='collection_commit_roulette'&&c.args.p_result.replacement?.dest==='FCO');
+  assert.ok(confirmed,'the walk recovers and confirms the next candidate instead of retrying the rejected one forever');
+  assert.equal(third.checkpoint.roulette.cursor,1);assert.equal(third.checkpoint.roulette.pendingReplacement,undefined);
+});
+
+test('an unrelated fatal roulette exception (e.g. lease lost) is never swallowed by the stale-replacement reconciliation',async()=>{
+  const target=rouletteTicket('BCN',1);
+  const candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const response=()=>({kind:'ok',json:{success:true,data:[{origin:'BER',destination:'ATH',departure_at:'2027-01-10T06:00:00Z',return_at:'2027-01-17T20:00:00Z',price:135,transfers:1,currency:'EUR'}]}});
+  const h=maintenanceHarness([target],()=>({kind:'ok',json:{success:true,data:[]}}),{replacements:{'BER|any':[candidate]},
+    rpcError:name=>name==='collection_commit_roulette'?{code:'P0001',message:'invalid roulette ticket'}:null});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  h.setResponse(response);
+  await assert.rejects(()=>h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000}),
+    /invalid roulette ticket|P0001/);
 });
 
 test('refresh owner issues exactly one provider request per saved ticket', async () => {
