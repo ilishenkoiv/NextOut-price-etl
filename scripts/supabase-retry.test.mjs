@@ -1,7 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {withSupabaseRetry,canCheckpointWindow,retryMetadataFetch} from './supabase-retry.mjs';
+import {withSupabaseRetry,canCheckpointWindow,retryMetadataFetch,isTransientSupabaseFailure} from './supabase-retry.mjs';
 import {createClient} from '@supabase/supabase-js';
+
+test('classifier: empty/missing code is transient (an ambiguous, code-less failure), a real Postgres code is not', () => {
+  assert.equal(isTransientSupabaseFailure({code:''}),true);
+  assert.equal(isTransientSupabaseFailure({}),true);
+  assert.equal(isTransientSupabaseFailure({code:'42501',message:'permission denied'},403),false);
+  assert.equal(isTransientSupabaseFailure({code:'23505',message:'duplicate key'},409),false);
+});
+test('classifier: transport-level messages (fetch failed, ECONNRESET, ETIMEDOUT, socket hang up) are transient', () => {
+  assert.equal(isTransientSupabaseFailure({code:'ECONNRESET'}),true);
+  assert.equal(isTransientSupabaseFailure({code:'ETIMEDOUT'}),true);
+  assert.equal(isTransientSupabaseFailure({code:'',message:'fetch failed'}),true);
+  assert.equal(isTransientSupabaseFailure({code:'',message:'socket hang up'}),true);
+});
+test('classifier: HTTP 5xx/408/429 are transient regardless of body; other 4xx with a code are not', () => {
+  for (const status of [408,429,500,502,503,504]) assert.equal(isTransientSupabaseFailure({code:'x'},status),true);
+  assert.equal(isTransientSupabaseFailure({code:'23514',message:'check constraint'},400),false);
+});
 
 test('real PostgREST builder preserves Retry-After and uses only the outer attempts',async()=>{
   let calls=0;const waits=[];
