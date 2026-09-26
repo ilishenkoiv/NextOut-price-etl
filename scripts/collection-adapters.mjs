@@ -53,6 +53,37 @@ export function buildRouletteReplacementCandidates(offers,pool,allowedDests,toda
   const grouped={};for(const row of best.values())(grouped[`${row.origin}|${row.flight_type}`]??=[]).push(row);for(const rows of Object.values(grouped))rows.sort((a,b)=>Number(a.price)-Number(b.price)
     ||String(b.updated_at).localeCompare(String(a.updated_at))||Number(a.transfers??0)-Number(b.transfers??0)||String(a.departure_at).localeCompare(String(b.departure_at))||String(a.dest).localeCompare(String(b.dest)));
   return grouped;}
+// `plan.replacements` is cached and reused for every 30-minute cycle until the daily snapshot
+// changes (see the coordinator's `store.plan(...roulette-${snapshotId}...)` call), but the live
+// `daily_origin_cheapest_pool` keeps changing under it as OTHER ranks are successfully replaced
+// mid-day. A cached candidate that was free when the plan was built can already be taken by the
+// time this target's turn comes up. Re-checks the exact same identity/membership invariants
+// collection_commit_roulette's replacement guard enforces (destination not already in this
+// origin/snapshot's live pool, not the ticket's own destination, in-horizon dates, matching
+// flight type/transfers) against a FRESH read, so a now-stale candidate is caught and skipped
+// (advance to the next candidate, exactly like a provider no_result) before spending a TP request
+// or a doomed RPC round-trip on it — never by assuming it is invalid merely because it is old.
+export function rouletteCandidateStillEligible(candidate,target,livePoolDests,today){
+  return Boolean(candidate)&&candidate.dest!==target.dest&&candidate.flight_type===target.flight_type
+    &&!livePoolDests.has(`${candidate.origin}|${candidate.dest}`)
+    &&typeof candidate.departure_at==='string'&&candidate.departure_at>=today
+    &&typeof candidate.return_at==='string'&&candidate.return_at>candidate.departure_at
+    &&(candidate.flight_type!=='direct'||Number(candidate.transfers)===0);
+}
+// The one Postgres exception collection_commit_roulette raises for a candidate our own
+// pre-commit checks could not have ruled out in advance. Matched on the exact op AND exact
+// message — never a bare P0001, which several distinct, still-fatal exceptions in the same
+// function also use (invalid roulette ticket, invalid confirmed fare, lease lost, target changed
+// before replacement/sync). This single message covers many distinct validation predicates in
+// the function (destination already in the live pool, price/date/transfer integrity, the
+// observation-freshness window, allowed-destination membership, ...), so from the client alone a
+// match here is NOT proof that this specific candidate is genuinely unavailable — it may equally
+// reflect a technical/data problem with our own submitted observation. Treat every match as an
+// uncertain, technical rejection (see the deferTechnical call at its one call site), never as a
+// confirmed "no alternative" verdict.
+export function isRouletteReplacementRejection(error){
+  return error?.dbOp==='collection_commit_roulette'&&error?.dbMessage==='invalid or stale roulette replacement';
+}
 
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
@@ -86,7 +117,14 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const result = retry ? await withSupabaseRetry(attempt, retryBudget(deadline)) : await attempt();
     if (result.error) {
       logDbError({ op, error: result.error, status: result.status, attempt: attempts });
-      throw new Error(`Collection database operation failed: ${op} (${dbErrorCode(result.error)})`);
+      const failure = new Error(`Collection database operation failed: ${op} (${dbErrorCode(result.error)})`);
+      // Same safe-to-log text db-error.mjs already logs (never request secrets), attached so a
+      // caller can react to one exact, known Postgres exception without pattern-matching the
+      // formatted message string or handling every error sharing this op/code as if it were that
+      // one case (a bare P0001 covers several distinct raised exceptions in collection_commit_roulette).
+      failure.dbOp = op; failure.dbCode = dbErrorCode(result.error);
+      failure.dbMessage = typeof result.error?.message === 'string' ? result.error.message : null;
+      throw failure;
     }
     return result.data;
   }
@@ -386,8 +424,50 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           r.cursor++;delete r.pendingReplacement;};
         if(r.pendingReplacement){
           const target=r.pendingReplacement.ticket,candidates=plan.replacements[`${target.origin}|${target.flight_type}`]??[];
+          // Reconcile before ever picking a candidate: a resumed/replayed pending target may
+          // already have been resolved by a prior attempt that crashed after
+          // collection_commit_roulette's RPC succeeded but before this checkpoint/revival was
+          // saved. That RPC's own event-key guard silently returns true for ANY replacement
+          // payload once this exact old ticket's slot is resolved — an RPC "true" on a replay can
+          // never prove the candidate WE are about to submit is the one that was actually
+          // applied. Look up the authoritative audit row for this exact old-ticket identity
+          // (matched on the recorded old_ticket fields, never a client-reconstructed event key —
+          // snapshot_at is a timestamptz and Postgres's own text formatting of it is not something
+          // to reproduce client-side) before choosing another candidate.
+          const audit=await load('roulette_pool_replacements','old_ticket,new_ticket,outcome',[],
+            q=>q.eq('snapshot_at',target.snapshot_at).eq('origin',target.origin).eq('rank',target.rank),deadline);
+          const resolved=audit.find(row=>row.old_ticket?.flight_type===target.flight_type&&row.old_ticket?.dest===target.dest
+            &&row.old_ticket?.departure_at===target.departure_at&&row.old_ticket?.return_at===target.return_at);
+          if(resolved){
+            if(resolved.outcome==='replaced'&&resolved.new_ticket){
+              const applied=resolved.new_ticket,usedKey=`${applied.origin}|${applied.dest}`;
+              if(!(r.usedReplacementDests??[]).includes(usedKey)){
+                // Authoritative identity straight from the audit row; the observation time comes
+                // from the offers row that same commit wrote — never a freshly invented
+                // timestamp for a candidate we did not just confirm ourselves.
+                const [confirmed]=await load('offers','updated_at',[],q=>q.eq('origin',applied.origin).eq('dest',applied.dest)
+                  .eq('flight_type',applied.flight_type).eq('departure_at',applied.departure_at).eq('return_at',applied.return_at),deadline);
+                if(!confirmed?.updated_at)throw new Error('Applied roulette replacement is missing its recorded offer');
+                const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:applied.origin,p_dest:applied.dest,
+                  p_observed_at:confirmed.updated_at}),deadline,{retry:true,op:'collection_revive_route'});
+                if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
+                r.usedReplacementDests=[...(r.usedReplacementDests??[]),usedKey];
+              }
+              r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
+            }else{
+              r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
+            }
+            r.total=effectiveTickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
+            return{status:'progress',checkpoint:cp};
+          }
+          // Fresh, cheap (per-origin, <=10 rows), read-committed truth of what this snapshot's
+          // pool currently holds for this origin — the cached `candidates` list can be hours
+          // stale against it (see rouletteCandidateStillEligible above).
+          const livePool=await load('daily_origin_cheapest_pool','origin,dest',['dest'],
+            q=>q.eq('snapshot_at',plan.snapshotAt).eq('origin',target.origin),deadline);
+          const livePoolDests=new Set([...(r.usedReplacementDests??[]),...livePool.map(row=>`${row.origin}|${row.dest}`)]);
           let candidate=candidates[r.pendingReplacement.candidateCursor];
-          while(candidate&&(r.usedReplacementDests??[]).includes(`${candidate.origin}|${candidate.dest}`))candidate=candidates[++r.pendingReplacement.candidateCursor];
+          while(candidate&&!rouletteCandidateStillEligible(candidate,target,livePoolDests,today))candidate=candidates[++r.pendingReplacement.candidateCursor];
           if(!candidate){
             await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement:null}},deadline);
             r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
@@ -405,7 +485,23 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               const replacement=withPriceProvenance([{...candidate,...outcome,price:outcome.price,updated_at:new Date(clock()).toISOString(),
                 market:marketForOrigin(candidate.origin),transfers:Number.isInteger(source?.transfers)?source.transfers:candidate.transfers,
                 airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-              await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
+              try{
+                await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
+              }catch(error){
+                // Never fatal to the run. But this rejection message covers many distinct
+                // validation predicates (see isRouletteReplacementRejection above) — it is NOT
+                // proof that no alternative exists, only that THIS commit attempt failed for some
+                // uncertain reason. Do not fall through to a false replacement:null/exhausted
+                // conclusion, and do not assume it is safe to keep walking the same cached
+                // candidate list. Defer the whole target as a technical failure (bounded,
+                // non-fatal, retried from a fresh live-pool read next cycle) — the same treatment
+                // an ordinary provider error already gets just above. Any other exception (lease
+                // lost, invalid ticket/fare, target changed under an unrelated fenced attempt,
+                // ...) stays fatal.
+                if(!isRouletteReplacementRejection(error))throw error;
+                deferTechnical(target,'replacement');
+                return{status:'progress',checkpoint:cp};
+              }
               const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:candidate.origin,p_dest:candidate.dest,
                 p_observed_at:replacement.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
