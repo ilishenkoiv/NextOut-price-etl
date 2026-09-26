@@ -58,7 +58,8 @@ const freshOffer = {
 test('selection owner rebuilds the pool when today has no snapshot yet', async () => {
   const db = selectionDb({ offers: [freshOffer] });
   const result = await publishSnapshot({ db, snapshotAt: '2027-01-05T12:00:00.000Z', expansionWave: 0 });
-  assert.deepEqual(result, { rebuilt: true, observedOn: '2027-01-05', snapshotAt: '2027-01-05T12:00:00.000Z' });
+  assert.equal(result.rebuilt, true); assert.equal(result.observedOn, '2027-01-05'); assert.equal(result.snapshotAt, '2027-01-05T12:00:00.000Z');
+  assert.equal(result.rank1Rows, 1); assert.equal(result.poolRows, 1);
   assert.equal(db.writes.length,1);assert.equal(db.writes[0].name,'publish_daily_cheapest_selection');
   assert.equal(db.writes[0].args.p_pool.length,1);assert.equal(db.writes[0].args.p_rank1.length,1);
   assert.equal(db.writes[0].args.p_pool[0].destination_id,'barcelona');
@@ -329,7 +330,7 @@ test('selection is owned by the coordinator pre-phase, not by a collector adapte
   assert.doesNotMatch(runCollection, poolWrite, 'the coordinator uses guarded publication RPCs, not table writes');
   assert.doesNotMatch(adapters, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m, 'main does not import the selection module');
   assert.match(runCollection, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
-  assert.match(runCollection, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule\}\)/);
+  assert.match(runCollection, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline\}\)/);
   assert.doesNotMatch(runCollection, /publishEndOfSessionPool|shouldPublishEndOfSession/);
 });
 
@@ -344,4 +345,67 @@ test('manual nightly selection can publish the guarded rollout epoch while globa
   const workflow=readFileSync(new URL('../.github/workflows/nightly-cheapest-selection.yml',import.meta.url),'utf8');
   assert.match(workflow,/workflow_dispatch:/);assert.doesNotMatch(workflow,/^\s*schedule:/m);
   assert.match(workflow,/snapshot-daily-window-candidates\.mjs/);
+});
+
+// ---- Select -> point-refresh -> publish (no freshness wait) ---------------------------
+
+test('selection never waits for source freshness: publishes immediately even from a stale source, freshness fraction is recorded but never blocks',async()=>{
+  const staleOffer={...freshOffer,updated_at:'2027-01-04T00:00:00.000Z'}; // well past the 3h freshness window
+  const db=selectionDb({offers:[staleOffer]});
+  const result=await publishSnapshot({db,snapshotAt:'2027-01-05T12:00:00.000Z',expansionWave:0});
+  assert.equal(result.rebuilt,true,'publishes immediately despite a stale source');
+  assert.ok(result.freshFraction<1,'the fraction reflects the stale source, but never blocked the publish');
+  assert.equal(db.writes.length,1,'still exactly one atomic publish RPC');
+});
+
+test('point-refresh: given a provider, the selected ticket is confirmed via the exact-price endpoint before publish, and a found response overrides the bulk-selection price',async()=>{
+  const db=selectionDb({offers:[freshOffer]});
+  let requests=0;
+  const confirmedRow={departure_at:'2027-01-10',return_at:'2027-01-17',price:65,transfers:0};
+  const provider={request:async function(){
+    requests++;
+    return {kind:'ok',json:{success:true,data:[confirmedRow]}};
+  }};
+  const snapshotAt='2027-01-05T12:00:00.000Z';
+  const result=await publishSnapshot({db,snapshotAt,expansionWave:0,provider,refreshDeadline:Date.parse(snapshotAt)+120000});
+  assert.ok(requests>0,'the provider was called to point-refresh the selected ticket');
+  assert.equal(result.refresh.refreshed,requests);
+  const published=db.writes.find(w=>w.name==='publish_daily_cheapest_selection').args;
+  const allRows=[...published.p_pool,...published.p_rank1];
+  assert.ok(allRows.some(r=>r.price===65),'the confirmed exact price (65) replaces the bulk-selection price (120) before publish');
+});
+
+test('point-refresh: an empty (no_result) response never overwrites the selected price — the row keeps its bulk-selection price',async()=>{
+  const db=selectionDb({offers:[freshOffer]});
+  const provider={request:async()=>({kind:'ok',json:{success:true,data:[]}})};
+  const snapshotAt='2027-01-05T12:00:00.000Z';
+  const result=await publishSnapshot({db,snapshotAt,expansionWave:0,provider,refreshDeadline:Date.parse(snapshotAt)+120000});
+  assert.equal(result.refresh.misses,1);assert.equal(result.refresh.refreshed,0);
+  const published=db.writes.find(w=>w.name==='publish_daily_cheapest_selection').args;
+  const allRows=[...published.p_pool,...published.p_rank1];
+  assert.ok(allRows.every(r=>r.price===120),'the original bulk-selected price is preserved, never overwritten by an empty response');
+});
+
+test('point-refresh never reads the bulk offers table — one request per selected ticket, via the single-ticket exact-price endpoint only',async()=>{
+  const db=selectionDb({offers:[freshOffer]});
+  const urls=[];
+  const provider={request:async url=>{urls.push(String(url));return{kind:'ok',json:{success:true,data:[]}};}};
+  await publishSnapshot({db,snapshotAt:'2027-01-05T12:00:00.000Z',expansionWave:0,provider,refreshDeadline:Date.now()+120000});
+  assert.ok(urls.length>0);
+  for(const url of urls)assert.match(url,/prices_for_dates\?/,'point-refresh uses the single-ticket exact-price endpoint, never a bulk table read');
+});
+
+test('point-refresh respects its deadline: when the deadline is already past, publish still succeeds with the un-refreshed bulk-selection price (partial run)',async()=>{
+  const db=selectionDb({offers:[freshOffer]});
+  let requests=0;
+  const confirmedRow={departure_at:'2027-01-10',return_at:'2027-01-17',price:65,transfers:0};
+  const provider={request:async function(){
+    requests++;
+    return {kind:'ok',json:{success:true,data:[confirmedRow]}};
+  }};
+  const result=await publishSnapshot({db,snapshotAt:'2027-01-05T12:00:00.000Z',expansionWave:0,provider,refreshDeadline:0});
+  assert.equal(requests,0,'no provider call is attempted once the deadline has already passed');
+  assert.equal(result.rebuilt,true,'the pool still publishes (partial: un-refreshed) rather than blocking on the point-refresh');
+  const published=db.writes.find(w=>w.name==='publish_daily_cheapest_selection').args;
+  assert.ok([...published.p_pool,...published.p_rank1].every(r=>r.price===120),'un-refreshed rows keep their bulk-selection price');
 });

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   check:
-    if: vars.COLLECTION_MODE != 'coordinated'
+    if: github.event_name == 'workflow_dispatch' || vars.COLLECTION_MODE != 'coordinated'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

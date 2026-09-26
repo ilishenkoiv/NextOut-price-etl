@@ -91,3 +91,52 @@ test('window_prices date-window and freshness filtering happens server-side and 
   assert.deepEqual(published.p_candidates, expected,
     'server-side date/freshness filtering must produce the identical candidate set as the old full-table client-side filter');
 });
+
+// ---- Select -> point-refresh -> publish (no freshness wait) ---------------------------
+
+function windowDb(rows){
+  function serverTable(data){
+    const builder={select(){return builder;},gte(){return builder;},lte(){return builder;},eq(){return builder;},order(){return builder;},
+      range:(from,to)=>Promise.resolve({data:data.slice(from,to+1),error:null})};
+    return builder;
+  }
+  let published=null;
+  const db={from:(table)=>table==='window_prices'?serverTable(rows):table==='origin_regions'?serverTable([{airport:'BER',calendar_subdivision_code:'DE-BE'}]):serverTable([]),
+    rpc:(name,args)=>{published=args;return Promise.resolve({data:true,error:null});}};
+  return {db,get published(){return published;}};
+}
+
+test('selection never waits for source freshness: publishes immediately from a stale source, freshness fraction is recorded but never blocks',async()=>{
+  const { main } = await import('./snapshot-daily-window-candidates.mjs');
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');
+  const stale=row('BCN','any',150,{updated_at:'2026-09-20T20:15:00.000Z'}); // within the 36h publish window but past the 3h freshness window
+  const {db}=windowDb([stale]);
+  const result=await main({db,instant,force:true});
+  assert.equal(result.published,true,'publishes immediately despite a stale source');
+  assert.ok(result.freshFraction<1,'the fraction reflects the stale source, but never blocked the publish');
+});
+
+test('point-refresh: given a provider, the selected candidate is confirmed via the exact-price endpoint before publish, and a found response overrides the bulk-selection price',async()=>{
+  const { main } = await import('./snapshot-daily-window-candidates.mjs');
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');
+  const fresh=row('BCN','any',150,{updated_at:'2026-09-22T03:45:00.000Z'});
+  const handle=windowDb([fresh]);
+  let requests=0;
+  const confirmedRow={departure_at:'2026-10-02',return_at:'2026-10-04',price:99,transfers:1};
+  const provider={request:async function(){ requests++; return {kind:'ok',json:{success:true,data:[confirmedRow]}}; }};
+  await main({db:handle.db,instant,force:true,provider,refreshDeadline:Date.now()+120000});
+  assert.ok(requests>0,'the provider was called to point-refresh the selected candidate');
+  assert.ok(handle.published.p_candidates.some(c=>c.exact_price===99&&c.refresh_status==='fresh'),
+    'the confirmed exact price (99) replaces the bulk-selection price (150) before publish');
+});
+
+test('point-refresh: a no_result response marks the candidate unavailable without changing exact_price',async()=>{
+  const { main } = await import('./snapshot-daily-window-candidates.mjs');
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');
+  const fresh=row('BCN','any',150,{updated_at:'2026-09-22T03:45:00.000Z'});
+  const handle=windowDb([fresh]);
+  const provider={request:async()=>({kind:'ok',json:{success:true,data:[]}})};
+  await main({db:handle.db,instant,force:true,provider,refreshDeadline:Date.now()+120000});
+  assert.ok(handle.published.p_candidates.every(c=>c.exact_price===150),'the original bulk-selection price is preserved');
+  assert.ok(handle.published.p_candidates.some(c=>c.refresh_status==='unavailable'),'the no_result candidate is marked unavailable');
+});

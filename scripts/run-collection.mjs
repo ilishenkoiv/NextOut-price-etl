@@ -24,6 +24,13 @@ export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 // attempted at most once per this interval; MAIN and priority still run every time regardless.
 export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
 
+// Post-selection point-refresh budget: how long, at most, the same session spends confirming the
+// day's freshly-selected tickets via the provider (select -> point-refresh -> publish) before
+// moving on. Capped independently of the session length so a huge pool never starves MAIN/FAST.
+export const DAILY_SELECTION_REFRESH_MAX_MS = 10 * 60_000;
+// Always leave at least this much of the session for MAIN/priority/etc after selection+refresh.
+export const DAILY_SELECTION_REFRESH_RESERVE_MS = 5 * 60_000;
+
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
   for(let page=1;page<=10;page++){
@@ -67,30 +74,32 @@ export function isAutomatedTrigger(env={}){
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
 // recovery-only; no independently scheduled selection writer exists.
 export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES,
-  pilotMarketSchedule=false,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
   if(!nightlySelectionDue(instant,selectionThresholdMinutes))return{state,published:false};
   const day=berlinObservedOn(instant),snapshotAt=new Date(instant).toISOString();
   const checkpoint=state.dailySelection?.day===day?structuredClone(state.dailySelection):{
     day,rouletteDone:false,windowDone:false,startedAt:instant};
   state.dailySelection=checkpoint;await store.save(state);
   let published=false;
+  // Selection never waits for source freshness (see snapshot-daily-origin-cheapest.mjs /
+  // snapshot-daily-window-candidates.mjs): both calls below always publish from whatever has
+  // already been collected, point-refreshing the SELECTED tickets first (order: select ->
+  // point-refresh -> publish). Exactly one selection per Berlin day: rouletteDone/windowDone,
+  // once true, are never re-attempted for the same `day`.
   if(!checkpoint.rouletteDone){
     if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
-    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule});
-    // sources_not_fresh (pilot only): sources have not shown a fresh post-pause pass yet — this
-    // is NOT "done for the day". Leave rouletteDone false so the next due cycle retries; never
-    // publish (or mark complete) a pool built from stale pre-pause prices.
-    if(result?.reason!=='sources_not_fresh'){
-      checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
-    } else checkpoint.rouletteSourcesNotFreshAt=Date.now();
+    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider,refreshDeadline});
+    checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
+    checkpoint.rouletteFreshFraction=result?.freshFraction??null;checkpoint.rouletteRefresh=result?.refresh??null;
+    checkpoint.rouletteRank1Rows=result?.rank1Rows??null;checkpoint.roulettePoolRows=result?.poolRows??null;
     await store.save(state);published ||= checkpoint.roulettePublished===true;
   }
   if(!checkpoint.windowDone){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
-    const result=await publishWindows({db,instant,wave,pilotMarketSchedule});
-    if(result?.reason!=='sources_not_fresh'){
-      checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
-    } else checkpoint.windowSourcesNotFreshAt=Date.now();
+    const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider,refreshDeadline});
+    checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
+    checkpoint.windowFreshFraction=result?.freshFraction??null;checkpoint.windowRefresh=result?.refresh??null;
+    checkpoint.windowCandidateRows=result?.candidateRows??null;
     await store.save(state);published ||= checkpoint.windowPublished===true;
     if(checkpoint.windowPublished&&state.jobs.priority){
       state.jobs.priority.done=false;state.jobs.priority.completedAt=null;
@@ -100,6 +109,11 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   }
   if(checkpoint.rouletteDone&&checkpoint.windowDone)checkpoint.completedAt=Date.now();
   await store.save(state);
+  if(checkpoint.rouletteDone||checkpoint.windowDone)console.log(JSON.stringify({event:'daily_selection_published',day,published,
+    roulette:{published:checkpoint.roulettePublished,freshFraction:checkpoint.rouletteFreshFraction,rank1Rows:checkpoint.rouletteRank1Rows,
+      poolRows:checkpoint.roulettePoolRows,refresh:checkpoint.rouletteRefresh},
+    window:{published:checkpoint.windowPublished,freshFraction:checkpoint.windowFreshFraction,candidateRows:checkpoint.windowCandidateRows,
+      refresh:checkpoint.windowRefresh}}));
   return{state,published};
 }
 
@@ -187,6 +201,10 @@ export async function main(env=process.env){
     // Published once per regular due session — every ~30 minutes at worst, well inside the
     // 120-minute ceiling this same contract publishes, so the app never reads a stale pilot flag.
     await publishPilotState(db,env);
+    // Built here (before daily selection) so the same provider/lease serve both the immediate
+    // post-selection point-refresh below and the regular engine loop further down.
+    const sessionEnd=Date.now()+minutes*60000;
+    const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
     // A daily-selection error must never take down the whole session: priority and MAIN below
     // still need to run regardless of this call's outcome. The failure is checkpointed with its
     // message and timestamp, and dailySelectionRetryThrottled keeps a persistently failing
@@ -195,16 +213,19 @@ export async function main(env=process.env){
       console.log(JSON.stringify({event:'daily_selection_retry_throttled',source:triggerSource,lastError:state.dailySelection.lastError}));
     }else{
       try{
-        await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule});
+        // Bounded, independent of the overall session length: at most DAILY_SELECTION_REFRESH_MAX_MS
+        // for the post-selection point-refresh sweep, and always leaving
+        // DAILY_SELECTION_REFRESH_RESERVE_MS of this session for MAIN/priority afterward.
+        const refreshDeadline=Math.min(Date.now()+DAILY_SELECTION_REFRESH_MAX_MS,sessionEnd-DAILY_SELECTION_REFRESH_RESERVE_MS);
+        await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline});
         if(state.dailySelection?.lastError){delete state.dailySelection.lastError;await store.save(state);}
       }catch(error){
         state.dailySelection={...(state.dailySelection||{}),lastError:{message:error.message,at:Date.now()}};
         await store.save(state);
-        console.error(JSON.stringify({event:'daily_selection_failed',source:triggerSource,error:error.message}));
+        console.error(JSON.stringify({event:'daily_selection_failed',source:triggerSource,day:berlinObservedOn(Date.now()),error:error.message}));
       }
     }
-    const end=Date.now()+minutes*60000;
-    const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+    const end=sessionEnd;
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
     engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,guaranteeDailyMain,
       handlers:createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state})});

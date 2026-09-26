@@ -178,6 +178,33 @@ test('an empty maintenance queue advances to reserve and retries later', async (
   assert.deepEqual(calls, ['maintenance', 'main', 'main']);
 });
 
+// The nightly maintenance block (owner spec 2026-09-26) preempts MAIN exactly like priority does,
+// via the optional handlers.maintenance.isDue(instant, checkpoint) hook.
+test("a due maintenance block preempts MAIN — MAIN yields for the block's whole duration", async () => {
+  const calls = [];
+  const state = freshScheduleState(); state.frame = { cycle: 0, phase: 2, spentMs: 0 }; // mid main's slot
+  const engine = new SequentialSchedule({ state, clock: () => 10 * 60000, lease: async () => true, save: async () => {},
+    handlers: {
+      maintenance: { maxUnitMs: 100, isDue: () => true, step: async () => { calls.push('maintenance'); return { status: 'progress', checkpoint: {} }; } },
+      main: { maxUnitMs: 100, step: async () => { calls.push('main'); return { status: 'progress', checkpoint: 1 }; } },
+    } });
+  await engine.tick();
+  await engine.tick();
+  assert.deepEqual(calls, ['maintenance', 'maintenance']); // main never runs while the block is due
+});
+
+test('maintenance.isDue is optional — a plain maintenance handler (no isDue) keeps the legacy SLOTS-driven behavior', async () => {
+  const calls = [];
+  const state = freshScheduleState(); state.frame = { cycle: 0, phase: 2, spentMs: 0 };
+  const engine = new SequentialSchedule({ state, clock: () => 10 * 60000, lease: async () => true, save: async () => {},
+    handlers: {
+      maintenance: { maxUnitMs: 100, step: async () => { calls.push('maintenance'); return { status: 'progress', checkpoint: {} }; } },
+      main: { maxUnitMs: 100, step: async () => { calls.push('main'); return { status: 'progress', checkpoint: 1 }; } },
+    } });
+  await engine.tick();
+  assert.deepEqual(calls, ['main']); // main's own slot runs normally; maintenance untouched by isDue absence
+});
+
 // ── Daily-main guarantee: mainAtRisk + tail-yields-to-main (guaranteeDailyMain) ──────────────
 const MINMS = 60000;
 // A tail-slot clock (cycle 12, minute 50) with an at-risk main pass started 23h earlier.

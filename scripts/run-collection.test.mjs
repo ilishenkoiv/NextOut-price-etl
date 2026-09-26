@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger,
-  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS } from './run-collection.mjs';
+  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS,
+  DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './run-collection.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
 import { berlinObservedOn } from './snapshot-daily-origin-cheapest.mjs';
 
@@ -11,7 +12,7 @@ const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'u
 test('daily selection is a checkpointed coordinator pre-phase, never an end-of-session republish', () => {
   assert.match(source, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
   assert.match(source, /^\s*import[^\n]*snapshot-daily-window-candidates/m);
-  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule\}\)/);
+  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline\}\)/);
   assert.doesNotMatch(source, /export\s+(?:async\s+)?function\s+(?:publishEndOfSessionPool|shouldPublishEndOfSession)/, 'end-of-session republish is gone');
   assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)/, 'the coordinator does not query/write the pool tables directly');
 });
@@ -46,36 +47,54 @@ test('due daily selection is serialized by the lease and fenced after each check
     publishRoulette:async()=>{throw new Error('already checkpointed');},publishWindows:async()=>{throw new Error('already checkpointed');}});
 });
 
-test('morning transition (pilot): sources not fresh yet → no publish, not marked done, next due cycle retries',async()=>{
+test('the provider and its point-refresh deadline are threaded into both publish paths, and a daily_selection_published line is logged with counts',async()=>{
+  const instant=Date.parse('2026-09-23T07:00:00Z');
+  const state={version:1,jobs:{}};
+  const store={lease:async()=>true,save:async()=>{}};
+  const fakeProvider={requests:0};
+  const seen=[];
+  const logs=[];const originalLog=console.log;console.log=(...args)=>logs.push(args.map(String).join(' '));
+  try{
+    await runDueDailySelection({state,store,db:{},instant,wave:0,provider:fakeProvider,refreshDeadline:instant+123456,
+      publishRoulette:async args=>{seen.push(args);return{rebuilt:true,freshFraction:0.8,refresh:{attempted:3,refreshed:2,misses:1,errors:0,total:3},rank1Rows:5,poolRows:20};},
+      publishWindows:async args=>{seen.push(args);return{published:true,freshFraction:0.7,refresh:{attempted:4,refreshed:4,misses:0,errors:0,total:4},candidateRows:9};}});
+  }finally{console.log=originalLog;}
+  assert.equal(seen[0].provider,fakeProvider);assert.equal(seen[0].refreshDeadline,instant+123456);
+  assert.equal(seen[1].provider,fakeProvider);assert.equal(seen[1].refreshDeadline,instant+123456);
+  const line=logs.find(l=>l.includes('daily_selection_published'));
+  assert.ok(line,'a daily_selection_published line is logged');
+  const parsed=JSON.parse(line);
+  assert.equal(parsed.roulette.refresh.refreshed,2);assert.equal(parsed.roulette.freshFraction,0.8);assert.equal(parsed.roulette.poolRows,20);
+  assert.equal(parsed.window.refresh.refreshed,4);assert.equal(parsed.window.freshFraction,0.7);assert.equal(parsed.window.candidateRows,9);
+});
+
+test('morning transition (pilot): selection never waits for source freshness — publishes and marks the day done on the very first due cycle',async()=>{
   const instant=Date.parse('2026-09-24T05:05:00Z'); // 07:05 Berlin — pilot threshold just reached
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:123,checkpoint:{phase:'done'}}}};
   const store={lease:async()=>true,save:async()=>{}};
   const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
-    publishRoulette:async()=>({rebuilt:false,reason:'sources_not_fresh'}),
-    publishWindows:async()=>({published:false,reason:'sources_not_fresh'})});
-  assert.equal(result.published,false);
-  assert.equal(state.dailySelection.rouletteDone,false,'not marked done — must retry, never treated as today\'s finished selection');
-  assert.equal(state.dailySelection.windowDone,false);
-  assert.equal(state.dailySelection.completedAt,undefined,'the day is not complete while sources are not fresh');
-  assert.ok(state.dailySelection.rouletteSourcesNotFreshAt);
-  assert.ok(state.dailySelection.windowSourcesNotFreshAt);
-  // priority's checkpoint must NOT be reset to the 'roulette' phase — nothing was actually published.
-  assert.equal(state.jobs.priority.done,true);
-  assert.equal(state.jobs.priority.checkpoint.phase,'done');
+    publishRoulette:async()=>({rebuilt:true,freshFraction:0.4}),
+    publishWindows:async()=>({published:true,freshFraction:0.4})});
+  assert.equal(result.published,true);
+  assert.equal(state.dailySelection.rouletteDone,true,'published immediately — never waits for a freshness threshold');
+  assert.equal(state.dailySelection.windowDone,true);
+  assert.ok(state.dailySelection.completedAt,'the day completes on the very first due cycle');
+  // The low freshness fraction is recorded for observability only — it never blocked the publish.
+  assert.equal(state.dailySelection.rouletteFreshFraction,0.4);
+  assert.equal(state.dailySelection.windowFreshFraction,0.4);
 });
 
-test('morning transition (pilot): a later due cycle, once sources ARE fresh, publishes and marks the day done',async()=>{
-  const instant=Date.parse('2026-09-24T05:35:00Z'); // 07:35 Berlin, a later due cycle same day
-  // Simulates state already carrying the earlier not-ready attempt's markers.
+test('exactly one selection per Berlin day: a second due cycle the same day never re-invokes either publish path',async()=>{
+  const instant=Date.parse('2026-09-24T05:35:00Z');
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:123,checkpoint:{phase:'done'}}},
-    dailySelection:{day:'2026-09-24',rouletteDone:false,windowDone:false,startedAt:instant-1800000,rouletteSourcesNotFreshAt:instant-1800000}};
+    dailySelection:{day:'2026-09-24',rouletteDone:true,windowDone:true,completedAt:instant-1800000,startedAt:instant-1800000}};
   const store={lease:async()=>true,save:async()=>{}};
   const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
-    publishRoulette:async()=>({rebuilt:true}),publishWindows:async()=>({published:true})});
-  assert.equal(result.published,true);
+    publishRoulette:async()=>{throw new Error('must not re-run: already selected today');},
+    publishWindows:async()=>{throw new Error('must not re-run: already selected today');}});
+  assert.equal(result.published,false);
   assert.equal(state.dailySelection.rouletteDone,true);
   assert.equal(state.dailySelection.windowDone,true);
-  assert.ok(state.dailySelection.completedAt);
 });
 
 test('day boundary: yesterday\'s completed selection does not block today\'s — both roulette and carousel/window rebuild for the new Berlin day',async()=>{
@@ -93,28 +112,24 @@ test('day boundary: yesterday\'s completed selection does not block today\'s —
   assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
 });
 
-test('asymmetric retry: roulette sources fresh and published while window sources are not — only window retries next cycle, roulette is never re-published',async()=>{
+test('order within one call: roulette publishes before window is even attempted (select -> point-refresh -> publish, per path, in sequence)',async()=>{
   const instant=Date.parse('2026-09-24T05:05:00Z');
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
   const store={lease:async()=>true,save:async()=>{}};
   const calls=[];
-  const first=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
-    publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true};},
-    publishWindows:async()=>{calls.push('window');return{published:false,reason:'sources_not_fresh'};}});
-  assert.equal(state.dailySelection.rouletteDone,true,'roulette published — done for the day');
-  assert.equal(state.dailySelection.windowDone,false,'window not ready — must retry, never marked done from a not-fresh result');
-  assert.equal(first.published,true,'the roulette publish alone already counts as progress this cycle');
-  const later=Date.parse('2026-09-24T05:35:00Z');
-  const second=await runDueDailySelection({state,store,db:{},instant:later,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
-    publishRoulette:async()=>{calls.push('roulette-again');return{rebuilt:true};},
-    publishWindows:async()=>{calls.push('window-again');return{published:true};}});
-  assert.deepEqual(calls,['roulette','window','window-again'],'roulette is never re-invoked once done for the day — only the still-pending window path retries');
-  assert.equal(second.published,true);
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+    publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true,freshFraction:1,refresh:{attempted:10,refreshed:9,misses:1,errors:0,total:10}};},
+    publishWindows:async()=>{calls.push('window');return{published:true,freshFraction:1,refresh:{attempted:5,refreshed:5,misses:0,errors:0,total:5}};}});
+  assert.deepEqual(calls,['roulette','window'],'roulette (select+refresh+publish) completes fully before window starts');
+  assert.equal(result.published,true);
+  assert.equal(state.dailySelection.rouletteDone,true);
   assert.equal(state.dailySelection.windowDone,true);
-  assert.ok(state.dailySelection.completedAt,'the day only completes once BOTH independently-gated paths are done');
+  assert.ok(state.dailySelection.completedAt,'the day completes once both paths are done, in one due cycle');
+  assert.equal(state.dailySelection.rouletteRefresh.refreshed,9);
+  assert.equal(state.dailySelection.windowRefresh.refreshed,5);
 });
 
-test('legacy (pilotMarketSchedule unset) never receives a sources_not_fresh reason and behaves exactly as before',async()=>{
+test('legacy (pilotMarketSchedule unset) behaves exactly as the pilot path — both always publish immediately, no freshness gate either way',async()=>{
   const instant=Date.parse('2026-09-23T02:30:00Z'); // 03:30 Berlin, legacy threshold
   const state={version:1,jobs:{}};
   const store={lease:async()=>true,save:async()=>{}};
@@ -151,12 +166,17 @@ test('pilot state is published under the same claimed lease for both the regular
   assert.doesNotMatch(notDueExit, /publishPilotState/, 'the cheap 5-minute not_due heartbeat must not gain a new write');
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
   assert.match(offCycleBlock, /await publishPilotState\(db,env\)/, 'off-cycle attempts publish too, not just regular due sessions');
-  const dueSelectionCallIndex = source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule})');
+  const dueSelectionCallIndex = source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline})');
   const regularPublishIndex = source.lastIndexOf('await publishPilotState(db,env)', dueSelectionCallIndex);
   const betweenPublishAndSelection = source.slice(regularPublishIndex, dueSelectionCallIndex);
   assert.ok(regularPublishIndex > -1, 'the regular due session publishes pilot state before running daily selection');
-  assert.doesNotMatch(betweenPublishAndSelection, /new SequentialSchedule|new CollectionProvider/,
-    'nothing else runs between the regular publish and the (possibly throttled/caught) daily selection attempt');
+  // The provider is now constructed here too — it is passed into runDueDailySelection so the same
+  // session can point-refresh the day's freshly-selected tickets immediately after selection
+  // (select -> point-refresh -> publish). The full engine, however, must still not start early.
+  assert.doesNotMatch(betweenPublishAndSelection, /new SequentialSchedule/,
+    'the engine loop does not start before the (possibly throttled/caught) daily selection attempt');
+  assert.match(betweenPublishAndSelection, /new CollectionProvider/,
+    'the provider is built before daily selection so its point-refresh pass can use it');
 });
 
 test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN_MINUTES unset/0 → immediate not_due, no engine)', () => {
@@ -294,4 +314,9 @@ test('every coordinator run logs a final egress_summary line and resets the coun
     'resetEgress must run at the very start of every coordinator invocation');
   assert.match(source,/finally\{[\s\S]*console\.log\(JSON\.stringify\(egressSummary\(\)\)\);[\s\S]*\}/,
     'egress_summary must be logged in the finally block so it always runs, including on early returns and thrown errors');
+});
+
+test('post-selection point-refresh budget: 10-minute cap, 5-minute reserve for MAIN/priority', () => {
+  assert.equal(DAILY_SELECTION_REFRESH_MAX_MS, 10 * 60_000);
+  assert.equal(DAILY_SELECTION_REFRESH_RESERVE_MS, 5 * 60_000);
 });
