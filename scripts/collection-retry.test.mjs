@@ -67,7 +67,7 @@ test('HTTP 5xx is retried', async () => {
 
 test('permanent Postgres/RLS error is not retried and surfaces honestly', async () => {
   const { adapters, log } = adaptersWith({ behaviours: [{ status: 403, error: { code: '42501', message: 'permission denied' } }] });
-  await assert.rejects(() => adapters.fast.step({ job, deadline: 200000 }), /Collection database operation failed \(42501\)/);
+  await assert.rejects(() => adapters.fast.step({ job, deadline: 200000 }), /Collection database operation failed: window_prices \(42501\)/);
   assert.equal(countFrom(log, 'window_prices'), 1); // single attempt, no retry storm
 });
 

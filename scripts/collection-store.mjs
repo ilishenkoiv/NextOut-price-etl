@@ -1,13 +1,33 @@
+import { withSupabaseRetry } from './supabase-retry.mjs';
+import { logDbError, dbErrorCode } from './db-error.mjs';
+
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 // Service-role-only durable state. The SQL functions compare owner + fencing
 // token atomically, so an old runner cannot replace a new runner's checkpoint.
 export class CollectionStore {
-  constructor(db, owner, runId) { this.db = db; this.owner = owner; this.runId = runId; this.token = null; this.renewedAt = 0; this.plans = new Map(); }
-  async rpc(name, args = {}) {
-    const { data, error } = await this.db.rpc(name, args);
-    if (error) throw new Error(`Collection storage operation failed: ${name} (${error.code ?? 'unknown'})`);
-    return data;
+  constructor(db, owner, runId, { sleep = delay, random = Math.random, now = Date.now } = {}) {
+    this.db = db; this.owner = owner; this.runId = runId; this.token = null; this.renewedAt = 0; this.plans = new Map();
+    this.sleep = sleep; this.random = random; this.now = now;
   }
-  async inspect() { return this.rpc('collection_state_inspect'); }
+  // `idempotent` gates retry, not the classifier: collection_state_claim is a queue-pop-like
+  // compare-and-swap (a blind retry after a successful-but-lost response would see its own new
+  // owner and misreport "another runner owns the lease") and is never retried here. Renew/save/
+  // release are fenced updates keyed by (owner,fence) — replaying the same call after a lost
+  // response is a safe no-op, so those pass idempotent:true. See db-error.mjs for what gets logged.
+  async rpc(name, args = {}, { idempotent = false } = {}) {
+    let attempts = 0;
+    const attempt = async () => { attempts++; return this.db.rpc(name, args); };
+    const result = idempotent
+      ? await withSupabaseRetry(attempt, { label: name, delays: [1000, 3000, 9000], sleep: this.sleep, random: this.random, now: this.now, warn: () => {} })
+      : await attempt();
+    if (result.error) {
+      logDbError({ op: name, error: result.error, status: result.status, attempt: attempts });
+      throw new Error(`Collection storage operation failed: ${name} (${dbErrorCode(result.error)})`);
+    }
+    return result.data;
+  }
+  async inspect() { return this.rpc('collection_state_inspect', {}, { idempotent: true }); }
   async claim(previousOwner = null) {
     const result = await this.rpc('collection_state_claim', {
       p_owner: this.owner, p_run_id: this.runId, p_previous_owner: previousOwner,
@@ -20,7 +40,7 @@ export class CollectionStore {
   async lease() {
     if (this.token == null) return false;
     if (Date.now() - this.renewedAt < 15_000) return true;
-    const ok = await this.rpc('collection_state_renew', this.args()) === true;
+    const ok = await this.rpc('collection_state_renew', this.args(), { idempotent: true }) === true;
     if (ok) this.renewedAt = Date.now();
     return ok;
   }
@@ -41,9 +61,9 @@ export class CollectionStore {
     this.plans.set(key, value); return value;
   }
   async save(state) {
-    if (!await this.rpc('collection_state_save', { ...this.args(), p_state: state })) throw new Error('Checkpoint rejected: collection lease lost');
+    if (!await this.rpc('collection_state_save', { ...this.args(), p_state: state }, { idempotent: true })) throw new Error('Checkpoint rejected: collection lease lost');
   }
-  async release() { return this.rpc('collection_state_release', this.args()); }
+  async release() { return this.rpc('collection_state_release', this.args(), { idempotent: true }); }
 }
 
 export async function oldRunnerHasStopped(previous, { repository, token, fetchImpl = fetch, now = Date.now() }) {
