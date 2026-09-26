@@ -202,7 +202,14 @@ export class SequentialSchedule {
       // so an already-safe or done main lets tail keep its own cursor and run normally.
       const tailYieldsToMain = phase.task==='tail' && this.guaranteeDailyMain
         && mainAtRisk(working, this.clock(), { margin: this.mainDeadlineReserve });
-      const candidates=priorityDue?['priority']:(reserve?['fast','main','tail','maintenance']:(tailYieldsToMain?['main','tail']:[phase.task]));
+      // The nightly maintenance block (03:00-05:45 Berlin) preempts every lower task exactly like
+      // priority does, but never priority itself: one bounded, checkpointed block replaces the old
+      // "one turn every cycle, all day" rotation, and MAIN must yield for its whole duration.
+      // isDue is optional — only the maintenance handler implements it; every other handler is
+      // unaffected (this evaluates to false and falls through to the normal SLOTS-driven pick).
+      const maintenanceDueNow = Boolean(this.handlers.maintenance) && typeof this.handlers.maintenance.isDue === 'function'
+        && this.handlers.maintenance.isDue(this.clock(), working.jobs?.maintenance?.checkpoint ?? null);
+      const candidates=priorityDue?['priority']:(maintenanceDueNow?['maintenance']:(reserve?['fast','main','tail','maintenance']:(tailYieldsToMain?['main','tail']:[phase.task])));
       for(const task of candidates){
         const adapter = this.handlers[task];
         if (!adapter) continue;

@@ -3,10 +3,11 @@
 import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { computeAllWindows } from './collection-windows.mjs';
-import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, pilotSourcesReady } from './snapshot-daily-origin-cheapest.mjs';
+import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, freshOriginFraction, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { recordRead } from './collection-egress.mjs';
+import { pointRefreshTickets, ticketKey } from './daily-selection-refresh.mjs';
 
 const PAGE=1000,CONTRACT_VERSION=1;
 const addDays=(iso,n)=>{const d=new Date(iso+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
@@ -50,8 +51,13 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
 async function loadAll(db,table,columns,order,filter){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);if(filter)q=filter(q);for(const col of order)q=q.order(col,{ascending:true});
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
 
-export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',pilotMarketSchedule=false}={}){
-  const today=berlinObservedOn(instant);if(!force&&!nightlySelectionDue(instant))return{published:false,reason:'not_due',observedOn:today};
+export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now}={}){
+  const today=berlinObservedOn(instant);
+  // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — see the
+  // matching comment in snapshot-daily-origin-cheapest.mjs's main().
+  const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
+  if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
   // Same date window (min..max) and freshness cutoff (36h) that selectDailyWindowCandidates
@@ -63,17 +69,32 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
       q=>q.gte('departure_at',windowMin).lte('departure_at',windowMax).gte('updated_at',freshCutoffIso)),
     loadAll(client,'public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date']),
     loadAll(client,'origin_regions','airport,calendar_subdivision_code',['airport'])]);
-  // PILOT ONLY: same principle as the roulette pool (snapshot-daily-origin-cheapest.mjs) — time
-  // alone (nightlySelectionDue) does not prove the post-pause 07:00 pass has landed. A delay or
-  // error there must not publish today's carousel candidates from stale pre-pause window_prices.
-  if(pilotMarketSchedule&&!force&&!pilotSourcesReady(rows,instant,publishedSnapshotOrigins()))
-    return{published:false,reason:'sources_not_fresh',observedOn:today};
+  // Selection never waits for freshness — this is observability only (see the
+  // daily_selection_published event below), same as the roulette pool.
+  const freshFraction=freshOriginFraction(rows,instant,publishedSnapshotOrigins());
   const regions=[...new Set(originRegions.map(r=>r.calendar_subdivision_code).filter(Boolean))].sort();const snapshotAt=new Date(instant).toISOString();
   const candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,wave});if(!candidates.length)throw new Error('Daily window candidate selection is empty');
+  // Point-refresh: confirm the SELECTED carousel candidates' exact prices before publishing
+  // (order: select -> point-refresh -> publish). Sequential, normal pace, never re-reads
+  // window_prices. An unconfirmed 'no_result' marks the row unavailable without touching
+  // exact_price (existing collection_commit_window_candidate write rule); a row the deadline is
+  // reached before reaching keeps its selection-time value untouched, to be confirmed later by
+  // the ordinary scheduled cadence.
+  let refresh={attempted:0,refreshed:0,misses:0,errors:0,total:0};
+  if(provider){
+    const {confirmed,missed,...stats}=await pointRefreshTickets(candidates,{provider,clock,deadline:refreshDeadline,sourceTable:'window_prices'});
+    refresh=stats;
+    for(let i=0;i<candidates.length;i++){
+      const key=ticketKey(candidates[i]),c=confirmed.get(key);
+      if(c)candidates[i]={...candidates[i],exact_price:c.price,transfers:c.transfers,airline:c.airline,
+        exact_observed_at:c.updated_at,refresh_status:'fresh',refresh_checked_at:c.updated_at,last_error_kind:null,price_source:c.price_source??candidates[i].price_source};
+      else if(missed.has(key))candidates[i]={...candidates[i],refresh_status:'unavailable',refresh_checked_at:new Date(clock()).toISOString()};
+    }
+  }
   const{data,error}=await client.rpc('publish_daily_window_candidates',{p_observed_on:today,p_snapshot_at:snapshotAt,p_candidates:candidates});if(error)throw error;
-  const requestGroups=new Set(candidates.map(routeKey)).size;console.log(JSON.stringify({event:'daily_window_candidates',published:data===true,observedOn:today,snapshotAt,
-    candidateRows:candidates.length,requestGroups,origins:new Set(candidates.map(r=>r.origin)).size}));
-  return{published:data===true,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups};
+  const requestGroups=new Set(candidates.map(routeKey)).size;console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published:data===true,observedOn:today,snapshotAt,
+    candidateRows:candidates.length,requestGroups,origins:new Set(candidates.map(r=>r.origin)).size,freshFraction,refresh}));
+  return{published:data===true,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh};
 }
 
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main();

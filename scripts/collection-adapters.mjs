@@ -12,6 +12,8 @@ import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedb
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { originDueThisCycle } from './priority-market-schedule.mjs';
+import { maintenanceDue, maintenanceMustStop, isQuarterlyMaintenanceDay } from './maintenance-window.mjs';
+import { retentionCutoff, shouldDeleteSnapshot, positiveDays, SNAPSHOT_RETENTION_DAYS, PROGRESS_RETENTION_DAYS } from './price-storage-retention.mjs';
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
@@ -110,6 +112,27 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const accepted=await query(() => db.rpc(name, { ...store.args(), ...payload }), deadline, { retry: true, op: name });
     if(accepted!==true)throw new Error('Collection write was not acknowledged');
     return accepted;
+  }
+
+  // Claims and completes ONE flight_price_audits row, or returns claimed:false when the queue is
+  // empty. Shared by the priority phase's one-per-cycle trickle audit and the nightly maintenance
+  // block's full drain (see check-flight-price-feedback.mjs's standalone main(), which this
+  // mirrors without that script's GitHub-idle polling — the coordinator already owns the lease).
+  async function claimAndFinishOneAudit(deadline, today) {
+    const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline,{op:'claim_flight_price_audit'});
+    const row=rows?.[0];
+    if(!row)return{claimed:false};
+    const ticket=ticketFromFeedback(row.feedback,today);let outcome={status:'not_requested',detail:'missing_exact_context'};
+    if(ticket){
+      const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.depart,return_at:ticket.ret,
+        direct:String(ticket.mode==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
+      const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
+      outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
+    }
+    const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
+      p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline,{op:'finish_flight_price_audit'});
+    if(result!==true)throw new Error('Audit claim expired before completion');
+    return{claimed:true,queuedAt:Date.parse(row.created_at??row.feedback?.created_at)};
   }
 
   const main = {
@@ -317,21 +340,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
     try {
       if(cp.phase==='audit'){
-        const rows=await query(()=>db.rpc('claim_flight_price_audit'),deadline,{op:'claim_flight_price_audit'});
-        const row=rows?.[0];
-        if(row){
-          const queuedAt=Date.parse(row.created_at??row.feedback?.created_at);
-          if(Number.isFinite(queuedAt))cp.auditOldestWaitMs=Math.max(cp.auditOldestWaitMs??0,now-queuedAt);
-          const ticket=ticketFromFeedback(row.feedback,today);let outcome={status:'not_requested',detail:'missing_exact_context'};
-          if(ticket){
-            const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.depart,return_at:ticket.ret,
-              direct:String(ticket.mode==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
-            const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-            outcome=response.kind==='ok'?classifyResponse(response.json,ticket):{status:'error',detail:'provider_error'};
-          }
-          const result=await query(()=>db.rpc('finish_flight_price_audit',{p_feedback_id:row.feedback_id,p_claim_token:row.claim_token,
-            p_status:outcome.status,p_price:outcome.price??null,p_detail:outcome.detail,p_run_id:store.runId}),deadline,{op:'finish_flight_price_audit'});
-          if(result!==true)throw new Error('Audit claim expired before completion');
+        const audit=await claimAndFinishOneAudit(deadline,today);
+        if(audit.claimed){
+          if(Number.isFinite(audit.queuedAt))cp.auditOldestWaitMs=Math.max(cp.auditOldestWaitMs??0,now-audit.queuedAt);
           cp.auditProcessed=(cp.auditProcessed??0)+1;
           if(cp.auditProcessed>=PRIORITY_AUDIT_BATCH){cp.auditDone=true;cp.phase='roulette';}
           return{status:'progress',checkpoint:cp};
@@ -468,30 +479,100 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
   }};
 
-  // Retention/metrics are kept separate and always run after priority, MAIN and TAIL.
-  const maintenance={maxUnitMs:45000,async step({job,deadline}){
-    const cp=structuredClone(job.checkpoint??{turn:0,metricsDay:null,checked:{}});cp.checked??={};
-    deadline=Math.min(deadline,clock()+35000);const now=clock();const today=berlinDay(now);
-    try{for(let scan=0;scan<5;scan++){
-      const turn=cp.turn%5;cp.turn++;
-      if(turn<3){
-        if(cp.checked[turn]===today)continue;
-        const table=['app_errors','flight_price_feedback','destination_requests'][turn];
-        const cutoff=turn===2?calendarMonthsAgoIso(new Date(now)):new Date(now-(turn===0?90:365)*DAY).toISOString();
-        const rows=await query(()=>db.from(table).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true,op:`${table}_expired_scan`});
-        if(rows.length){await query(()=>db.from(table).delete().in('id',rows.map(r=>r.id)),deadline,{retry:true,op:`${table}_expired_delete`});return{status:'progress',checkpoint:cp};}
-        cp.checked[turn]=today;
-      }else if(turn===3&&cp.metricsDay!==today){await query(()=>db.rpc('collect_storage_metrics'),deadline,{op:'collect_storage_metrics'});cp.metricsDay=today;return{status:'progress',checkpoint:cp};
-      }else if(turn===4&&cp.checked.plans!==today){
-        const bucket=db.storage.from('price-snapshots');
-        const rows=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true,op:'plan_bucket_list'});
-        const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
-        const p=state?.jobs?.priority?.checkpoint;if(p?.roulette)protectedNames.add(`roulette-${p.roulette.cycle}-0.json`);if(p?.weekend)protectedNames.add(`windowrefresh-${p.weekend.dayId}-0.json`);
-        const expired=rows.filter(r=>/^(main|tail|fast|roulette|windowrefresh)-\d+-\d+\.json$/.test(r.name)&&!protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
-        if(expired.length){await query(()=>bucket.remove(expired),deadline,{retry:true,op:'plan_bucket_remove_expired'});return{status:'progress',checkpoint:cp};}
-        cp.checked.plans=today;
+  // Nightly maintenance block (owner spec 2026-09-26): due once per Berlin day at 03:00, must
+  // settle (or give up for the night) by 05:45 — always well before the 06:00 daily selection —
+  // capped at 15 real minutes of work. Replaces the old "one turn every 30-minute cycle, all day"
+  // rotation: outside 03:00-05:45 (or once tonight's block is done) this immediately no-ops.
+  // isDue lets the scheduling engine give this block precedence over MAIN/FAST/TAIL exactly like
+  // priority does (see collection-schedule.mjs) — MAIN yields for the block's whole duration.
+  const MAINTENANCE_JOBS = ['app_errors','flight_price_feedback','destination_requests',
+    'collect_storage_metrics','plan_bucket_expire','window_prices','price_storage','feedback_audit_drain'];
+  async function recursiveSnapshotList(bucket,prefix,deadline){
+    if(clock()+9000>=deadline)throw new CollectionYield('Snapshot listing would cross boundary');
+    const rows=await query(()=>bucket.list(prefix,{limit:1000,sortBy:{column:'name',order:'asc'}}),deadline,{retry:true,op:'price_storage_snapshot_list'});
+    const keys=[];
+    for(const item of rows){
+      const key=prefix?`${prefix}/${item.name}`:item.name;
+      if(item.id||item.metadata)keys.push(key);else keys.push(...await recursiveSnapshotList(bucket,key,deadline));
+    }
+    return keys;
+  }
+  const maintenance={maxUnitMs:45000,
+    isDue:(instant,checkpoint)=>maintenanceDue(instant,checkpoint),
+    async step({job,deadline}){
+    const cp=structuredClone(job.checkpoint??{day:null,checked:{},summary:[],blockDone:false});
+    cp.checked??={};cp.summary??=[];
+    const now=clock();const today=berlinDay(now);
+    if(cp.day!==today){cp.day=today;cp.checked={};cp.summary=[];cp.blockDone=false;}
+    // Outside 03:00-05:45 Berlin, or tonight's block already settled: cheap no-op, no DB calls.
+    // This is what replaces the old "one turn every 30-minute cycle, all day" rotation.
+    if(!maintenanceDue(now,cp))return{status:'empty',checkpoint:cp};
+    const elapsedMs=job.activeMs??0;
+    if(maintenanceMustStop(now,elapsedMs)){
+      cp.blockDone=true;
+      console.log(JSON.stringify({event:'maintenance_block',jobs:cp.summary,total_ms:elapsedMs,done:false}));
+      return{status:'done',checkpoint:cp};
+    }
+    deadline=Math.min(deadline,clock()+35000);
+    try{
+      for(const name of MAINTENANCE_JOBS){
+        if(cp.checked[name]===today)continue;
+        if(name==='price_storage'&&!isQuarterlyMaintenanceDay(today)){cp.checked[name]=today;continue;}
+        const unitStart=clock();
+        let rows=0,done=true;
+        if(['app_errors','flight_price_feedback','destination_requests'].includes(name)){
+          const cutoff=name==='destination_requests'?calendarMonthsAgoIso(new Date(now)):new Date(now-(name==='app_errors'?90:365)*DAY).toISOString();
+          const found=await query(()=>db.from(name).select('id').lt('created_at',cutoff).order('created_at').order('id').limit(100),deadline,{retry:true,op:`${name}_expired_scan`});
+          rows=found.length;
+          if(rows){await query(()=>db.from(name).delete().in('id',found.map(r=>r.id)),deadline,{retry:true,op:`${name}_expired_delete`});done=false;}
+        }else if(name==='collect_storage_metrics'){
+          await query(()=>db.rpc('collect_storage_metrics'),deadline,{op:'collect_storage_metrics'});
+        }else if(name==='plan_bucket_expire'){
+          const bucket=db.storage.from('price-snapshots');
+          const found=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true,op:'plan_bucket_list'});
+          const state=getState();const protectedNames=new Set(Object.entries(state?.jobs??{}).map(([task,j])=>`${task}-${j.id}-${j.checkpoint?.wave??wave}.json`));
+          const p=state?.jobs?.priority?.checkpoint;if(p?.roulette)protectedNames.add(`roulette-${p.roulette.cycle}-0.json`);if(p?.weekend)protectedNames.add(`windowrefresh-${p.weekend.dayId}-0.json`);
+          const expired=found.filter(r=>/^(main|tail|fast|roulette|windowrefresh)-\d+-\d+\.json$/.test(r.name)&&!protectedNames.has(r.name)&&Date.parse(r.created_at)<now-35*DAY).map(r=>'coordinator/'+r.name);
+          rows=expired.length;
+          if(rows){await query(()=>bucket.remove(expired),deadline,{retry:true,op:'plan_bucket_remove_expired'});done=false;}
+        }else if(name==='window_prices'){
+          // Ported from cleanup-window-prices.mjs (the standalone workflow no longer runs on its
+          // own schedule under coordinated mode — see .github/workflows/cleanup-window-prices.yml).
+          const found=await query(()=>db.from('window_prices').select('departure_at').lt('departure_at',today)
+            .order('departure_at',{ascending:true}).limit(500),deadline,{retry:true,op:'window_prices_expired_scan'});
+          rows=found.length;
+          if(rows){const watermark=found.at(-1).departure_at;
+            await query(()=>db.from('window_prices').delete().lt('departure_at',today).lte('departure_at',watermark),deadline,{retry:true,op:'window_prices_expired_delete'});
+            done=rows<500;}
+        }else if(name==='price_storage'){
+          // Ported from cleanup-price-storage.mjs (quarterly; gated above to only the standalone
+          // workflow's own due day — 1st of Jan/Apr/Jul/Oct, Berlin).
+          const progressCutoff=retentionCutoff(today,positiveDays(process.env.PROGRESS_RETENTION_DAYS,PROGRESS_RETENTION_DAYS));
+          const foundProgress=await query(()=>db.from('window_price_progress').select('plan_date').lt('plan_date',progressCutoff)
+            .order('plan_date',{ascending:true}).limit(500),deadline,{retry:true,op:'price_storage_progress_scan'});
+          if(foundProgress.length){const watermark=foundProgress.at(-1).plan_date;
+            await query(()=>db.from('window_price_progress').delete().lt('plan_date',progressCutoff).lte('plan_date',watermark),deadline,{retry:true,op:'price_storage_progress_delete'});
+            rows=foundProgress.length;done=foundProgress.length<500;
+          }else{
+            const snapshotCutoff=retentionCutoff(today,positiveDays(process.env.SNAPSHOT_RETENTION_DAYS,SNAPSHOT_RETENTION_DAYS));
+            const bucket=db.storage.from('price-snapshots');
+            const objects=await recursiveSnapshotList(bucket,'snapshots',deadline);
+            const expired=objects.filter(key=>shouldDeleteSnapshot(key,snapshotCutoff));
+            rows=expired.length;
+            for(let i=0;i<expired.length;i+=100)await query(()=>bucket.remove(expired.slice(i,i+100)),deadline,{retry:true,op:'price_storage_snapshot_remove'});
+          }
+        }else if(name==='feedback_audit_drain'){
+          const audit=await claimAndFinishOneAudit(deadline,today);
+          rows=audit.claimed?1:0;done=!audit.claimed;
+        }
+        cp.summary.push({name,rows,ms:clock()-unitStart});
+        if(!done)return{status:'progress',checkpoint:cp};
+        cp.checked[name]=today;
+        return{status:'progress',checkpoint:cp};
       }
-    }return{status:'empty',checkpoint:cp};
+      cp.blockDone=true;
+      console.log(JSON.stringify({event:'maintenance_block',jobs:cp.summary,total_ms:job.activeMs??0,done:true}));
+      return{status:'done',checkpoint:cp};
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
   }};
   return{priority,main,fast:windowAdapter('fast'),tail:windowAdapter('tail'),maintenance};

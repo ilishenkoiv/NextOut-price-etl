@@ -17,6 +17,11 @@ name: Daily window_prices cleanup
 # Scheduled maintenance is restricted to 00:00–06:00 Europe/Berlin. The runtime gate below catches
 # delayed GitHub schedules and daytime manual dispatches. Maintenance is serialized, and the gate
 # refuses to start while either price collector or the roulette refresh is active/queued.
+#
+# Under coordinated mode, this cleanup is owned by the coordinator's nightly maintenance block
+# (03:00-05:45 Berlin, see scripts/collection-adapters.mjs) — the scheduled trigger is skipped
+# below (job-level `if`); a manual workflow_dispatch still runs (falls through the bash gate's own
+# COLLECTION_MODE=coordinated short-circuit, unchanged).
 on:
   schedule:
     - cron: '22 1 * * *'
@@ -37,6 +42,7 @@ env:
 
 jobs:
   cleanup:
+    if: github.event_name == 'workflow_dispatch' || vars.COLLECTION_MODE != 'coordinated'
     name: Delete window_prices rows with a past departure date
     runs-on: ubuntu-latest
     timeout-minutes: 10
