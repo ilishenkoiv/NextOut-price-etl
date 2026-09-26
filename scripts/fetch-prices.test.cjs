@@ -135,6 +135,53 @@ describe('fetch-prices.mjs — an honest empty answer must not delete offers', (
   });
 });
 
+// §variant-timestamps / §fare-preservation (owner spec 2026-09-26, two same-day fixes after
+// review): the per-variant fare+checked_at row must ride in the SAME priceBuf.push call as
+// updated_at — a separate later write would break the "same instant" guarantee and could land
+// outside the success guard entirely. It must ALWAYS supply all four keys (never omit one):
+// postgrest-js's array upsert unions every row's keys into one `columns=` list for the whole
+// batch, so an omitted key on one row is not safe merely because THIS row's cell wasn't answered
+// — see prices-upsert-request.test.mjs for the real-request proof. A failed/untouched sibling
+// must carry forward BOTH its baseline fare and its baseline checked_at, never cleared, never
+// freshened by another variant's observation.
+describe('fetch-prices.mjs — variant fare+checked_at ride the same guarded push as the price row', () => {
+  it('imports the pure row-builder helper', () => {
+    assert.match(SRC, /import\s*\{\s*buildVariantPriceRow\s*\}\s*from\s*['"]\.\/price-variant-timestamps\.mjs['"]/);
+  });
+
+  it('no longer imports either old, narrower helper name', () => {
+    assert.doesNotMatch(SRC, /variantCheckedAtPatch/);
+    assert.doesNotMatch(SRC, /variantCheckedAtRow\b/);
+  });
+
+  it('no longer forces the sibling fare to null via the old direct/any ternary', () => {
+    assert.doesNotMatch(SRC, /direct:\s*res\.min,\s*any:\s*null\s*\}\s*:\s*\{\s*direct:\s*null,\s*any:\s*res\.min/);
+  });
+
+  it('spreads buildVariantPriceRow(answered, variantPrice, checkedAtIso, prev) inside the priceBuf.push object literal', () => {
+    const site = pushSites().find((s) => s.buf === 'priceBuf');
+    assert.ok(site, 'no priceBuf.push( found');
+    // The push spans multiple source lines; scan forward to its balanced closing to grab the
+    // whole object literal rather than assuming a fixed line count.
+    let depth = 0;
+    let end = site.index;
+    for (let i = site.index; i < LINES.length; i += 1) {
+      for (const ch of LINES[i]) {
+        if (ch === '(') depth += 1;
+        if (ch === ')') depth -= 1;
+      }
+      if (depth <= 0 && i > site.index) { end = i; break; }
+    }
+    const block = LINES.slice(site.index, end + 1).join('\n');
+    assert.match(block, /\.\.\.variantRow\s*,/);
+    assert.match(SRC, /const variantRow = buildVariantPriceRow\(\s*answered\s*,\s*variantPrice\s*,\s*checkedAtIso\s*,\s*prev\s*\)/);
+  });
+
+  it('the baseline read now also selects both checked_at columns (needed to carry an unanswered variant forward)', () => {
+    assert.match(SRC, /\.select\('origin,dest,month,direct,any_stops,direct_checked_at,any_checked_at'\)/);
+  });
+});
+
 describe('fetch-prices.mjs — baseline read resilience', () => {
   it('retries transient baseline failures before aborting the run', () => {
     assert.match(SRC, /const BASELINE_READ_RETRY_BACKOFF_MS = \[2000, 5000, 15000\]/);
