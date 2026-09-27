@@ -204,7 +204,12 @@ test('technical roulette failure mutates neither pool nor offer and never starts
   const result=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
   assert.equal(h.calls.length,0);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);assert.equal(result.checkpoint.roulette.errors,1);
   assert.equal(result.checkpoint.roulette.cursor,1,'technical failure defers to the next 30-minute pass without blocking later candidates');
-  assert.deepEqual(result.checkpoint.roulette.technicalDeferred,[{key:'BER|BCN|any|2027-01-10|2027-01-17',stage:'ticket',cycle:1}]);
+  const [deferred]=result.checkpoint.roulette.technicalDeferred;
+  assert.equal(deferred.key,'BER|BCN|any|2027-01-10|2027-01-17');assert.equal(deferred.stage,'ticket');
+  assert.equal(deferred.outcome,'technical_failure');assert.equal(deferred.providerKind,'refused');assert.equal(deferred.refusal,'tooMany');
+  assert.equal(deferred.classifierDetail,'provider_error');
+  assert.equal(deferred.cycle,1);assert.equal(deferred.attempts,1);assert.equal(deferred.ticket.rank,1);
+  assert.doesNotMatch(JSON.stringify(deferred),/token|authorization|api\.travelpayouts|success|data/i,'diagnostic contains only whitelisted scalar metadata');
 });
 
 test('a technical failure skips to the next saved refresh candidate without any storage mutation',async()=>{
@@ -226,6 +231,86 @@ test('a technical error while checking a replacement preserves the target and de
   const second=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
   assert.equal(h.calls.length,0);assert.equal(second.checkpoint.roulette.cursor,1);assert.equal(second.checkpoint.roulette.exhausted,undefined);
   assert.equal(second.checkpoint.roulette.technicalDeferred[0].stage,'replacement');
+});
+
+test('replacement technical deferral preserves candidate identity and resumes that candidate in the next eligible cycle',async()=>{
+  const target=rouletteTicket('BCN',1),candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const candidateKey='BER|ATH|any|2027-01-10|2027-01-17';
+  const response=n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'timeout'};
+  const h=maintenanceHarness([target],response,{replacements:{'BER|any':[candidate]}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const deferred=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(deferred.checkpoint.roulette.pendingReplacement,undefined,'active candidate is released so later tickets are not blocked');
+  assert.equal(deferred.checkpoint.roulette.technicalDeferred[0].candidateKey,candidateKey);
+  assert.equal(deferred.checkpoint.roulette.technicalDeferred[0].candidateCursor,0);
+  h.setResponse((_n,url)=>{const destination=new URL(url).searchParams.get('destination');
+    assert.equal(destination,'ATH','resume checks the retained candidate, never restarts at the original BCN ticket');
+    return{kind:'ok',json:{success:true,data:[{origin:'BER',destination,departure_at:'2027-01-10T06:00:00Z',return_at:'2027-01-17T20:00:00Z',price:135,transfers:1,currency:'EUR'}]}};});
+  const resumed=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint:deferred.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(h.requests,3,'one target check, one failed candidate check, one resumed candidate check');
+  assert.equal(resumed.checkpoint.roulette.replaced,1);
+  assert.deepEqual(resumed.checkpoint.roulette.technicalDeferred,[]);
+  assert.deepEqual(resumed.checkpoint.roulette.technicalOutcomes,[{
+    key:'BER|BCN|any|2027-01-10|2027-01-17',outcome:'replaced',candidateKey,cycle:2,
+  }]);
+});
+
+test('a later successful refresh resolves a compatible legacy technical deferral observably',async()=>{
+  const target=rouletteTicket('BCN',1),h=maintenanceHarness([target],foundResponse);
+  const checkpoint=priorityCp();checkpoint.roulette.done=true;
+  checkpoint.roulette.technicalDeferred=[{key:'BER|BCN|any|2027-01-10|2027-01-17',stage:'ticket',cycle:994740}];
+  const result=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint},deadline:1_700_000_200_000});
+  assert.deepEqual(result.checkpoint.roulette.technicalDeferred,[]);
+  assert.deepEqual(result.checkpoint.roulette.technicalOutcomes,[{
+    key:'BER|BCN|any|2027-01-10|2027-01-17',outcome:'refreshed',cycle:2,
+  }]);
+});
+
+test('a resumed candidate must be revalidated against the current pool before replacement',async()=>{
+  const target=rouletteTicket('BCN',1);
+  const stale={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const fresh={...rouletteTicket('FCO',9),month:'2027-01',market:'de',nights:7,price:150,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const poolRows=[{snapshot_at:'2027-01-05T03:30:00Z',origin:'BER',dest:'BCN'}];
+  const h=maintenanceHarness([target],n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'server'},
+    {replacements:{'BER|any':[stale,fresh]},poolRows});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const deferred=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(deferred.checkpoint.roulette.technicalDeferred[0].candidateKey,'BER|ATH|any|2027-01-10|2027-01-17');
+  poolRows.push({snapshot_at:'2027-01-05T03:30:00Z',origin:'BER',dest:'ATH'});
+  h.setResponse((_n,url)=>{const destination=new URL(url).searchParams.get('destination');assert.equal(destination,'FCO');return foundResponse(_n,url);});
+  const resumed=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint:deferred.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(resumed.checkpoint.roulette.replaced,1);
+  assert.equal(resumed.checkpoint.roulette.technicalOutcomes[0].candidateKey,'BER|FCO|any|2027-01-10|2027-01-17');
+});
+
+test('technical replacement becomes exhausted only after resumed candidates return confirmed no-result',async()=>{
+  const target=rouletteTicket('BCN',1),candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const h=maintenanceHarness([target],n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'network'},
+    {replacements:{'BER|any':[candidate]}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const deferred=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  h.setResponse(()=>({kind:'ok',json:{success:true,data:[]}}));
+  const confirmedEmpty=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint:deferred.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(confirmedEmpty.checkpoint.roulette.pendingReplacement.candidateCursor,1);
+  assert.equal(confirmedEmpty.checkpoint.roulette.exhausted,undefined,'technical failure itself is never exhaustion');
+  const exhausted=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint:confirmedEmpty.checkpoint},deadline:1_700_000_200_000});
+  assert.equal(exhausted.checkpoint.roulette.exhausted,1);
+  assert.deepEqual(exhausted.checkpoint.roulette.technicalOutcomes,[{
+    key:'BER|BCN|any|2027-01-10|2027-01-17',outcome:'exhausted',candidateKey:'BER|ATH|any|2027-01-10|2027-01-17',cycle:2,
+  }]);
+});
+
+test('a continuing candidate failure remains deferred with the same identity and incremented attempt',async()=>{
+  const target=rouletteTicket('BCN',1),candidate={...rouletteTicket('ATH',9),month:'2027-01',market:'de',nights:7,price:140,transfers:1,updated_at:'2027-01-01T00:00:00Z'};
+  const h=maintenanceHarness([target],n=>n===1?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'timeout'},
+    {replacements:{'BER|any':[candidate]}});
+  const first=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:priorityCp()},deadline:1_700_000_200_000});
+  const deferred=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-05',checkpoint:first.checkpoint},deadline:1_700_000_200_000});
+  const again=await h.adapters.priority.step({job:{id:2,planDate:'2027-01-05',checkpoint:deferred.checkpoint},deadline:1_700_000_200_000});
+  const [still]=again.checkpoint.roulette.technicalDeferred;
+  assert.equal(still.outcome,'technical_failure');assert.equal(still.cycle,2);assert.equal(still.firstCycle,1);assert.equal(still.attempts,2);
+  assert.equal(still.candidateKey,'BER|ATH|any|2027-01-10|2027-01-17');assert.equal(still.candidateCursor,0);
+  assert.deepEqual(again.checkpoint.roulette.technicalOutcomes,[]);
 });
 
 // ---- 2026-09-26 incident: collection_commit_roulette P0001 "invalid or stale roulette
@@ -297,7 +382,11 @@ test('an RPC-rejected replacement is deferred as an uncertain technical failure:
   assert.equal(second.checkpoint.roulette.exhausted,undefined,'never falls through to a false exhaustion verdict');
   assert.equal(second.checkpoint.roulette.usedReplacementDests,undefined,'a rejected candidate is never marked used/confirmed');
   assert.equal(second.checkpoint.roulette.errors,1);
-  assert.deepEqual(second.checkpoint.roulette.technicalDeferred,[{key:'BER|BCN|any|2027-01-10|2027-01-17',stage:'replacement',cycle:1}]);
+  const [deferred]=second.checkpoint.roulette.technicalDeferred;
+  assert.equal(deferred.key,'BER|BCN|any|2027-01-10|2027-01-17');assert.equal(deferred.stage,'replacement');
+  assert.equal(deferred.candidateKey,'BER|ATH|any|2027-01-10|2027-01-17');assert.equal(deferred.candidateCursor,0);
+  assert.equal(deferred.providerKind,'ok');assert.equal(deferred.classifierDetail,'aviasales_data_api_cached_adult_fare_eur');
+  assert.equal(deferred.storageCode,'P0001');assert.equal(deferred.storageDetail,'invalid_or_stale_replacement');
   assert.equal(second.checkpoint.roulette.cursor,1,'the ticket loop still advances — MAIN progress is preserved');
 });
 
@@ -398,9 +487,14 @@ test('a new daily snapshot invalidates only the stale roulette cursor and pendin
   const latest='2027-01-06T03:30:00Z';const tickets=[rouletteTicket('BCN',1),rouletteTicket('ATH',2)].map(t=>({...t,snapshot_at:latest}));
   const h=maintenanceHarness(tickets,foundResponse,{latestSnapshot:latest});const checkpoint=priorityCp(1);
   checkpoint.roulette.pendingReplacement={ticket:rouletteTicket('OLD',1),candidateCursor:0};
+  checkpoint.roulette.technicalDeferred=[{key:'BER|OLD|any|2027-01-10|2027-01-17',stage:'replacement',cycle:0,
+    candidateKey:'BER|FCO|any|2027-01-10|2027-01-17'}];
   const result=await h.adapters.priority.step({job:{id:1,planDate:'2027-01-06',checkpoint},deadline:1_700_000_200_000});
   assert.equal(h.calls[0].args.p_ticket.dest,'BCN');assert.equal(result.checkpoint.roulette.snapshotAt,latest);
   assert.equal(result.checkpoint.roulette.cursor,1);assert.equal(result.checkpoint.roulette.pendingReplacement,undefined);
+  assert.deepEqual(result.checkpoint.roulette.technicalDeferred,[]);
+  assert.deepEqual(result.checkpoint.roulette.technicalOutcomes,[{key:'BER|OLD|any|2027-01-10|2027-01-17',
+    outcome:'context_changed',cycle:1,candidateKey:'BER|FCO|any|2027-01-10|2027-01-17'}]);
 });
 
 test('snapshot-specific roulette plan key stays compatible with the durable store format',async()=>{

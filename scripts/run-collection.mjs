@@ -244,7 +244,9 @@ export async function main(env=process.env){
             errors:j.checkpoint?.errors,...(k==='main'?{outcomes:j.checkpoint?.outcomes,coverageComplete:j.checkpoint?.coverageComplete,
               retryRound:j.checkpoint?.retryRound??0}:{}),...(k==='priority'?{phase:j.checkpoint?.phase,
               roulette:{cursor:j.checkpoint?.roulette?.cursor,total:j.checkpoint?.roulette?.total,done:j.checkpoint?.roulette?.done,
-                snapshotAt:j.checkpoint?.roulette?.snapshotAt},
+                snapshotAt:j.checkpoint?.roulette?.snapshotAt,
+                technicalDeferred:j.checkpoint?.roulette?.technicalDeferred??[],
+                technicalOutcomes:j.checkpoint?.roulette?.technicalOutcomes??[]},
               window:{cursor:j.checkpoint?.weekend?.cursor,total:j.checkpoint?.weekend?.total,done:j.checkpoint?.weekend?.done,
                 snapshotAt:j.checkpoint?.weekend?.snapshotAt,currentDayComplete:j.checkpoint?.weekend?.currentDayComplete,
                 blockedReason:j.checkpoint?.weekend?.blockedReason,sourceObservedOn:j.checkpoint?.weekend?.sourceObservedOn}}:{})}]))}));

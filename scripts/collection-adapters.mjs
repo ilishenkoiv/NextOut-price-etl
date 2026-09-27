@@ -417,10 +417,14 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // separately blocked product/app contract; the scheduler never invents a top-N cap.
   const priority={maxUnitMs:PRIORITY_UNIT_MAX_MS,async step({job,deadline}){
     const previous=structuredClone(job.checkpoint??{});const now=clock();const today=berlinDay(now);
-    const pendingRoulette=previous.roulette&&!previous.roulette.done?previous.roulette:null;
+    const previousRoulette=previous.roulette??null;
+    const pendingRoulette=previousRoulette&&!previousRoulette.done?previousRoulette:null;
     const cp=previous.cycle===job.id?previous:{...previous,cycle:job.id,dueAt:job.id*30*60*1000,
       phase:'audit',auditDone:false,auditProcessed:0,
-      roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id}:{cycle:job.id,cursor:0,errors:0,done:false}};
+      roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id}:{cycle:job.id,cursor:0,errors:0,done:false,
+        ...(previousRoulette?.snapshotAt?{snapshotAt:previousRoulette.snapshotAt}:{}),
+        technicalDeferred:structuredClone(previousRoulette?.technicalDeferred??[]),
+        technicalOutcomes:structuredClone(previousRoulette?.technicalOutcomes??[])}};
     deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
     try {
       if(cp.phase==='audit'){
@@ -438,8 +442,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_origin_cheapest_pool_latest_snapshot'});
         recordRead('daily_origin_cheapest_pool',latest);
         const latestSnapshot=latest[0]?.snapshot_at??null;
-        if(r.snapshotAt!==latestSnapshot){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;
-          delete r.pendingReplacement;delete r.technicalDeferred;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
+        if(r.snapshotAt!==latestSnapshot){
+          const invalidated=(r.technicalDeferred??[]).map(item=>({key:item.key,outcome:'context_changed',cycle:cp.cycle,
+            ...(item.candidateKey?{candidateKey:item.candidateKey}:{})}));
+          r.technicalOutcomes=[...(r.technicalOutcomes??[]),...invalidated].slice(-220);
+          r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;r.technicalDeferred=[];
+          delete r.pendingReplacement;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
         const snapshotId=String(Math.max(0,Date.parse(latestSnapshot??'')||0));
         // Keyed only by snapshot (not r.cycle): the plan is a daily artifact, built once per
         // snapshot and reused for every 30-minute cycle until the snapshot changes (see the
@@ -465,9 +473,40 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         // stable daily set and this filter is always re-evaluated fresh every cycle.
         const effectiveTickets=pilotMarketSchedule?plan.tickets.filter(t=>originDueThisCycle(clock(),t.origin)):plan.tickets;
         const ticketPayload=ticket=>({...ticket,month:ticket.departure_at.slice(0,7),allowed_dests:plan.allowedDests,run_id:store.runId});
-        const deferTechnical=(ticket,stage)=>{const key=[ticket.origin,ticket.dest,ticket.flight_type,ticket.departure_at,ticket.return_at].join('|');
-          r.errors++;r.technicalDeferred=[...(r.technicalDeferred??[]).filter(item=>item.key!==key),{key,stage,cycle:r.cycle}];
+        const safeToken=value=>typeof value==='string'&&/^[A-Za-z0-9_.:-]{1,80}$/.test(value)?value:undefined;
+        const safeDiagnostic=(response,outcome,error)=>({
+          ...(safeToken(response?.kind)?{providerKind:safeToken(response.kind)}:{}),
+          ...(Number.isInteger(response?.status)&&response.status>=100&&response.status<=599?{httpStatus:response.status}:{}),
+          ...(safeToken(response?.refusal)?{refusal:safeToken(response.refusal)}:{}),
+          ...(safeToken(outcome?.detail)?{classifierDetail:safeToken(outcome.detail)}:{}),
+          ...(safeToken(error?.dbCode)?{storageCode:safeToken(error.dbCode)}:{}),
+          ...(isRouletteReplacementRejection(error)?{storageDetail:'invalid_or_stale_replacement'}:{}),
+        });
+        const ticketIdentity=ticket=>({origin:ticket.origin,dest:ticket.dest,flight_type:ticket.flight_type,
+          departure_at:ticket.departure_at,return_at:ticket.return_at,rank:ticket.rank,snapshot_at:ticket.snapshot_at});
+        const recordTechnicalOutcome=(ticket,outcome,{candidate=null}={})=>{const key=exactKey(ticket);
+          const deferred=(r.technicalDeferred??[]).find(item=>item.key===key);if(!deferred)return;
+          r.technicalDeferred=r.technicalDeferred.filter(item=>item.key!==key);
+          const candidateKey=candidate?exactKey(candidate):deferred.candidateKey;
+          const result={key,outcome,...(candidateKey?{candidateKey}:{}),cycle:cp.cycle};
+          r.technicalOutcomes=[...(r.technicalOutcomes??[]).filter(item=>item.key!==key),result].slice(-220);
+        };
+        const deferTechnical=(ticket,stage,{candidate=null,response=null,outcome=null,error=null}={})=>{const key=exactKey(ticket);
+          const old=(r.technicalDeferred??[]).find(item=>item.key===key),candidateCursor=r.pendingReplacement?.candidateCursor;
+          const item={key,stage,outcome:'technical_failure',cycle:cp.cycle,firstCycle:old?.firstCycle??old?.cycle??cp.cycle,
+            attempts:(old?.attempts??0)+1,ticket:ticketIdentity(ticket),...safeDiagnostic(response,outcome,error),
+            ...(candidate?{candidateKey:exactKey(candidate)}:{}),
+            ...(stage==='replacement'&&Number.isInteger(candidateCursor)?{candidateCursor}:{})};
+          r.errors++;r.technicalDeferred=[...(r.technicalDeferred??[]).filter(entry=>entry.key!==key),item];
           r.cursor++;delete r.pendingReplacement;};
+        const currentTicket=effectiveTickets[r.cursor];
+        const retained=currentTicket?(r.technicalDeferred??[]).find(item=>item.key===exactKey(currentTicket)&&item.stage==='replacement'):null;
+        if(!r.pendingReplacement&&retained?.candidateKey&&retained.ticket?.snapshot_at===plan.snapshotAt
+            &&retained.ticket.rank===currentTicket.rank){
+          const candidates=plan.replacements[`${currentTicket.origin}|${currentTicket.flight_type}`]??[];
+          const candidateCursor=candidates.findIndex(candidate=>exactKey(candidate)===retained.candidateKey);
+          if(candidateCursor>=0)r.pendingReplacement={ticket:currentTicket,candidateCursor,candidateKey:retained.candidateKey};
+        }
         if(r.pendingReplacement){
           const target=r.pendingReplacement.ticket,candidates=plan.replacements[`${target.origin}|${target.flight_type}`]??[];
           // Reconcile before ever picking a candidate: a resumed/replayed pending target may
@@ -499,8 +538,10 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
                 if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
                 r.usedReplacementDests=[...(r.usedReplacementDests??[]),usedKey];
               }
+              recordTechnicalOutcome(target,'replaced',{candidate:applied});
               r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
             }else{
+              recordTechnicalOutcome(target,'exhausted');
               r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
             }
             r.total=effectiveTickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
@@ -516,6 +557,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           while(candidate&&!rouletteCandidateStillEligible(candidate,target,livePoolDests,today))candidate=candidates[++r.pendingReplacement.candidateCursor];
           if(!candidate){
             await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement:null}},deadline);
+            recordTechnicalOutcome(target,'exhausted');
             r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
           }else{
             const params=new URLSearchParams({origin:candidate.origin,destination:candidate.dest,departure_at:candidate.departure_at,
@@ -523,7 +565,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
             const outcome=response.kind==='ok'?classifyResponse(response.json,{origin:candidate.origin,dest:candidate.dest,depart:candidate.departure_at,
               ret:candidate.return_at,mode:candidate.flight_type}):{status:'error',detail:'provider_error'};
-            if(outcome.status==='error')deferTechnical(target,'replacement');
+            if(outcome.status==='error')deferTechnical(target,'replacement',{candidate,response,outcome});
             if(outcome.status==='no_result'){r.pendingReplacement.candidateCursor++;return{status:'progress',checkpoint:cp};}
             if(outcome.status==='found'){
               const source=response.json.data.find(row=>classifyResponse({success:true,data:[row]},{origin:candidate.origin,dest:candidate.dest,
@@ -545,11 +587,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
                 // lost, invalid ticket/fare, target changed under an unrelated fenced attempt,
                 // ...) stays fatal.
                 if(!isRouletteReplacementRejection(error))throw error;
-                deferTechnical(target,'replacement');
+                deferTechnical(target,'replacement',{candidate,response,outcome,error});
                 return{status:'progress',checkpoint:cp};
               }
               const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:candidate.origin,p_dest:candidate.dest,
                 p_observed_at:replacement.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
+              recordTechnicalOutcome(target,'replaced',{candidate});
               r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
             }
           }
@@ -561,17 +604,17 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
             direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
           const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-          const result=response.kind==='ok'?classifyResponse(response.json,{origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}):{status:'error'};
+          const result=response.kind==='ok'?classifyResponse(response.json,{origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}):{status:'error',detail:'provider_error'};
           const source=Array.isArray(response.json?.data)?response.json.data.find(row=>classifyResponse({success:true,data:[row]},
             {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
           const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
             transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          if(result.status==='error')deferTechnical(ticket,'ticket');
+          if(result.status==='error')deferTechnical(ticket,'ticket',{response,outcome:result});
           if(result.status==='no_result'){r.pendingReplacement={ticket,candidateCursor:0};return{status:'progress',checkpoint:cp};}
           if(result.status==='found'){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
             const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
             p_observed_at:patch.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
-          if(result.status==='found')r.cursor++;
+          if(result.status==='found'){recordTechnicalOutcome(ticket,'refreshed');r.cursor++;}
         }
         r.total=effectiveTickets.length;r.done=r.cursor>=r.total;
         cp.phase='weekend';
