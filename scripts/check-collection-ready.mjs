@@ -18,7 +18,7 @@ export async function main(env=process.env){
     ['daily_origin_cheapest_pool','snapshot_at,origin,flight_type,rank,price_source'],
     ['daily_window_candidate_epochs','observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups,completed_at'],
     ['daily_window_candidates','observed_on,snapshot_at,origin,market,flight_type,region_codes,window_kind,departure_at,return_at,position,dest,destination_id,exact_price,exact_observed_at,refresh_status,refresh_checked_at'],
-    ['route_price_health','origin,dest,status,first_observed_at,first_confirmed_no_price_at,last_price_at,observation_pass,observation_horizon,observed_months'],
+    ['route_price_health','origin,dest,status,dead_policy,temporary_dead_until,first_observed_at,first_confirmed_no_price_at,last_price_at,observation_pass,observation_horizon,observed_months'],
   ]){
     const result=await db.from(table).select(columns).limit(0);
     if(result.error)throw new Error(`${table} schema read failed (${result.error.code??'unknown'})`);

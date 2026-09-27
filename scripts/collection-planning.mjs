@@ -1,6 +1,7 @@
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { ORIGINS_ALL } from '../src/data/origins.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { routeIsEffectivelyDead } from './route-price-health.mjs';
 import { isPriorityRoute, priorityWatchRouteKeys, PRIORITY_EXOTIC_DESTINATIONS } from './quote-integrity.mjs';
 import { planWindowDestinations } from './window-destination-plan.mjs';
 
@@ -109,9 +110,12 @@ function expansionCellOrder({ date, wave, prices, months, routes, maxDests }) {
 
 export function mainPlan({ date, wave, prices, watches, routeHealth = [], trancheDests = EXPANSION_TRANCHE_MAX_DESTS }) {
   const months = horizon(date); const set = new Set(months);
-  // Only the durable 30-day registry may suppress a route. Missing price rows, an incomplete
-  // history, network/429 failures and a single empty month are never dead evidence.
-  const deadKeys = new Set(routeHealth.filter(row => row.status === 'dead').map(row => `${row.origin}|${row.dest}`));
+  // Only the durable route-health registry may suppress a route. Missing price rows, an incomplete
+  // horizon, network/429 failures and a single empty month are never dead evidence. Temporary
+  // immediate classifications become operationally active at their fixed Berlin cutoff even if
+  // their database row has not yet received the next observation that clears the old status.
+  const planInstant=Date.parse(date+'T00:00:00Z');
+  const deadKeys = new Set(routeHealth.filter(row => routeIsEffectivelyDead(row,planInstant)).map(row => `${row.origin}|${row.dest}`));
   const priority = new Set(watchKeys(watches,wave));
   const live = []; const dead = [];
   for (const origin of ORIGINS_ALL) for (const d of catalogue(wave)) {

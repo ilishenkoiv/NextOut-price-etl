@@ -191,7 +191,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         const plan = await durablePlan('main',{...job,checkpoint:cp},async () => {
           const months = horizon(job.planDate);
           const prices = await load('prices','origin,dest,month,direct,any_stops',PRICE_ORDER,q=>q.in('month',months),unitEnd);
-          const routeHealth = await load('route_price_health','origin,dest,status',['origin','dest'],undefined,unitEnd);
+          const routeHealth = await load('route_price_health','origin,dest,status,dead_policy,temporary_dead_until',['origin','dest'],undefined,unitEnd);
           const watchRows = await watches(unitEnd);
           const holidays = await load('public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date'],q=>q.gte('date',months[0]+'-01').lt('date',nextMonth(months.at(-1))+'-01'),unitEnd);
           const regions = await load('origin_regions','airport,calendar_subdivision_code',['airport'],undefined,unitEnd);

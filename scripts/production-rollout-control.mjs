@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
+import { routeIsEffectivelyDead, TEMPORARY_DEAD_POLICY } from './route-price-health.mjs';
 
 const action=process.env.ROLLOUT_ACTION;
 const url=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
@@ -33,7 +34,7 @@ const schedulerRows=await loadRows('collection_scheduler_state','singleton,owner
 const recentPrices=await loadRows('prices','origin,dest,month,direct,any_stops,updated_at,price_source','origin.asc,dest.asc,month.asc',`&updated_at=gte.${encodeURIComponent(recentIso)}`);
 const recentWindows=await loadRows('window_prices','origin,dest,flight_type,departure_at,return_at,updated_at,price_source','origin.asc,dest.asc,flight_type.asc,departure_at.asc,return_at.asc',`&updated_at=gte.${encodeURIComponent(recentIso)}`);
 const allWindows=await loadRows('window_prices','origin,dest,flight_type,departure_at,return_at,updated_at,window_kind','origin.asc,dest.asc,flight_type.asc,departure_at.asc,return_at.asc');
-const health=counts.route_price_health?.missing?[]:await loadRows('route_price_health','origin,dest,status,first_confirmed_no_price_at,last_price_at,updated_at','origin.asc,dest.asc');
+const health=counts.route_price_health?.missing?[]:await loadRows('route_price_health','origin,dest,status,dead_policy,temporary_dead_until,first_confirmed_no_price_at,last_price_at,updated_at','origin.asc,dest.asc');
 const pool=await loadRows('daily_origin_cheapest_pool','snapshot_at,observed_on,origin,flight_type,rank,dest,price,departure_at,return_at,source_updated_at','snapshot_at.asc,origin.asc,flight_type.asc,rank.asc');
 const poolGroups={};for(const row of pool){poolGroups[row.snapshot_at]=(poolGroups[row.snapshot_at]??0)+1;}
 const latestPoolSnapshot=Object.keys(poolGroups).sort().at(-1)??null;
@@ -58,7 +59,10 @@ probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recent
   recentWindows:recentWindows.length,consumerWindowRows:consumer.length,
   consumerWindowGroups:new Set(consumer.map(r=>[r.origin,r.dest,r.departure_at,r.return_at].join('|'))).size,
   consumerOldestAgeMs:ages.length?Math.max(...ages):null,consumerNewestAgeMs:ages.length?Math.min(...ages):null,
-  routeHealthRows:health.length,routeHealthDead:health.filter(r=>r.status==='dead').length,routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
+  routeHealthRows:health.length,routeHealthStoredDead:health.filter(r=>r.status==='dead').length,
+  routeHealthEffectiveDead:health.filter(r=>routeIsEffectivelyDead(r,now)).length,
+  routeHealthExpiredTemporary:health.filter(r=>r.status==='dead'&&r.dead_policy===TEMPORARY_DEAD_POLICY&&!routeIsEffectivelyDead(r,now)).length,
+  routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
   poolRows:pool.length,poolSnapshots:Object.keys(poolGroups).length,latestPoolSnapshot,
   latestPoolRows:latestPool.length,poolFingerprint:fingerprint(pool),latestPoolFingerprint:fingerprint(latestPool),
   latestPoolDuplicateCities:duplicateCities,replacementAuditRows:replacements.length,
