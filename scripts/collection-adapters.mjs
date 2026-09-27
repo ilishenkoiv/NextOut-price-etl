@@ -33,6 +33,9 @@ export const MAIN_REQUIRED_PROVIDER_CALLS = 4;
 // budget as if it converts to cells at a flat continuous rate.
 export const MAIN_UNIT_WORK_MS = 75_000;
 export const MAIN_UNIT_ADMIT_MS = 90_000;
+// One replay of the pass's unresolved mandatory cells is allowed. A still-unresolved cell then
+// remains explicit in the final attempted-pass checkpoint; it is never reclassified as coverage.
+export const MAIN_MAX_RETRY_ROUNDS = 1;
 export function projectMainCellMs({requestMs,dbMs=0,calendarFallback=false,retryCalls=0}){
   if(![requestMs,dbMs,retryCalls].every(Number.isFinite)||requestMs<0||dbMs<0||retryCalls<0)throw new Error('Invalid MAIN projection');
   return(MAIN_REQUIRED_PROVIDER_CALLS+Number(calendarFallback)+retryCalls)*requestMs+dbMs;
@@ -203,9 +206,21 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         // so `total` and cursor/resume semantics are identical to the legacy identity ordering.
         const total = plan.cellOrder ? plan.cellOrder.length : plan.routes.length * plan.months.length;
         const expansion = new Set(expansionTargets(pinnedWave).map(item => item.iata));
+        // Existing in-flight checkpoints predate outcome accounting. Preserve their cursor without
+        // inventing evidence: already-attempted cells are explicitly legacyUnclassified. A fresh
+        // pass starts at zero and can prove coverage from its own mandatory probe outcomes.
+        const priorCursor=Number(cp.cursor??0);
+        cp.outcomes=cp.outcomes??{attempted:priorCursor,confirmedPrice:0,confirmedEmpty:0,unresolved:0,
+          legacyUnclassified:priorCursor};
+        cp.unresolvedCells=Array.isArray(cp.unresolvedCells)?cp.unresolvedCells:[];
+        cp.total=total;
+        if(cp.cursor>=total&&cp.unresolvedCells.length&&(cp.retryRound??0)<MAIN_MAX_RETRY_ROUNDS&&!Array.isArray(cp.retryQueue)){
+          cp.retryQueue=[...cp.unresolvedCells];cp.retryCursor=0;cp.retryNext=[];
+        }
         // A cursor is advanced only after the complete cell has been committed.
-        while (cp.cursor < total && clock() + 15000 < unitEnd) {
-          const cellId = plan.cellOrder ? plan.cellOrder[cp.cursor] : cp.cursor;
+        while ((cp.cursor < total||(Array.isArray(cp.retryQueue)&&cp.retryCursor<cp.retryQueue.length))&&clock() + 15000 < unitEnd) {
+          const retrying=cp.cursor>=total;
+          const cellId=retrying?cp.retryQueue[cp.retryCursor]:(plan.cellOrder ? plan.cellOrder[cp.cursor] : cp.cursor);
           const route = plan.routes[cellId % plan.routes.length];
           const month = plan.months[Math.floor(cellId / plan.routes.length)];
           const request = url => provider.request(url, unitEnd - 9000);
@@ -242,9 +257,38 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               p_has_price:hasPrice,p_is_expansion:expansion.has(route.dest)}),unitEnd,{retry:true,op:'collection_record_route_observation'});
             if(recorded!==true)throw new Error('Route price-health observation was not acknowledged');
           }
-          cp = { ...cp, cursor:cp.cursor+1, errors:cp.errors+Number(!directResult.ok)+Number(!anyResult.ok), total };
+          const mandatoryComplete=directResult.ok&&anyResult.ok;
+          const outcome=mandatoryComplete?(hasPrice?'confirmedPrice':'confirmedEmpty'):'unresolved';
+          const outcomes={...cp.outcomes};
+          if(retrying){
+            cp.retryAttempts=(cp.retryAttempts??0)+1;
+            if(mandatoryComplete){
+              outcomes.unresolved=Math.max(0,(outcomes.unresolved??0)-1);outcomes[outcome]=(outcomes[outcome]??0)+1;
+              cp.unresolvedCells=cp.unresolvedCells.filter(id=>id!==cellId);
+            }else cp.retryNext.push(cellId);
+            cp={...cp,outcomes,errors:cp.errors+Number(!directResult.ok)+Number(!anyResult.ok),retryCursor:cp.retryCursor+1};
+            if(cp.retryCursor>=cp.retryQueue.length){
+              cp.retryRound=(cp.retryRound??0)+1;
+              const remaining=[...cp.retryNext];delete cp.retryQueue;delete cp.retryCursor;delete cp.retryNext;
+              cp.unresolvedCells=remaining;
+              // A retry round is deliberately a separate bounded scheduler attempt. With the
+              // current one-round policy, unresolved cells remain explicit and the attempted pass
+              // can close without pretending they are confirmed coverage.
+              if(remaining.length&&cp.retryRound<MAIN_MAX_RETRY_ROUNDS){cp.retryQueue=remaining;cp.retryCursor=0;cp.retryNext=[];
+                return{status:'yield',checkpoint:cp};}
+              break;
+            }
+          }else{
+            outcomes.attempted=(outcomes.attempted??0)+1;outcomes[outcome]=(outcomes[outcome]??0)+1;
+            cp={...cp,outcomes,cursor:cp.cursor+1,errors:cp.errors+Number(!directResult.ok)+Number(!anyResult.ok),total,
+              ...(mandatoryComplete?{}:{unresolvedCells:[...cp.unresolvedCells,cellId]})};
+            if(cp.cursor===total&&cp.unresolvedCells.length&&(cp.retryRound??0)<MAIN_MAX_RETRY_ROUNDS){
+              cp.retryQueue=[...cp.unresolvedCells];cp.retryCursor=0;cp.retryNext=[];
+              return{status:'yield',checkpoint:cp};
+            }
+          }
         }
-        if (cp.cursor===total) {
+        if (cp.cursor===total&&(!Array.isArray(cp.retryQueue)||cp.retryCursor>=cp.retryQueue.length)) {
           // Preserve a private CSV of actual confirmed observations. Failed
           // cells retain old prices and are excluded by the observation cutoff.
           const rows=await load('prices','origin,market,dest,month,direct,any_stops,updated_at',PRICE_ORDER,
@@ -259,7 +303,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true,op:'price_snapshot_upload'});
           // The pass is complete once its private CSV is preserved. Daily selection remains the
           // coordinator pre-phase and is never coupled to MAIN completion.
-          return {status:'done',checkpoint:{...cp,stage:'complete',snapshotPath:path}};
+          const coverageComplete=(cp.outcomes.legacyUnclassified??0)===0&&(cp.outcomes.unresolved??0)===0
+            &&(cp.outcomes.confirmedPrice??0)+(cp.outcomes.confirmedEmpty??0)===total;
+          return {status:'done',checkpoint:{...cp,stage:coverageComplete?'complete':'attempted_complete',coverageComplete,snapshotPath:path}};
         }
         return { status:'progress',checkpoint:cp };
       } catch (error) {
@@ -542,10 +588,15 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
           .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_window_candidate_epochs_latest'});
         recordRead('daily_window_candidate_epochs',epochs);
-        if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
+        if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.currentDayComplete=false;w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
         const epoch=epochs[0],epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
-        if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at};
+        const currentDayEpoch=epoch.observed_on===today;
+        if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at,
+          sourceObservedOn:epoch.observed_on,currentDayComplete:currentDayEpoch,
+          ...(currentDayEpoch?{}:{blockedReason:'stale_daily_window_candidate_epoch'})};
+        else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
+          if(currentDayEpoch)delete w.blockedReason;else w.blockedReason='stale_daily_window_candidate_epoch';}
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
           const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
             ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
@@ -596,6 +647,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   const maintenance={maxUnitMs:45000,
     isDue:(instant,checkpoint)=>maintenanceDue(instant,checkpoint),
     async step({job,deadline}){
+    const stepStarted=clock();
     const cp=structuredClone(job.checkpoint??{day:null,checked:{},attempted:{},failed:{},summary:[],blockDone:false});
     cp.checked??={};cp.attempted??={};cp.failed??={};cp.summary??=[];
     const now=clock();const today=berlinDay(now);
@@ -680,10 +732,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         cp.summary.push({name,rows,ms:clock()-unitStart,...(name==='collect_storage_metrics'?{status:'SUCCESS'}:{})});
         if(!done)return{status:'progress',checkpoint:cp};
         cp.checked[name]=today;
-        return{status:'progress',checkpoint:cp};
+        if(name!==MAINTENANCE_JOBS.at(-1))return{status:'progress',checkpoint:cp};
+        break;
       }
       cp.blockDone=true;
-      console.log(JSON.stringify({event:'maintenance_block',jobs:cp.summary,total_ms:job.activeMs??0,done:true}));
+      console.log(JSON.stringify({event:'maintenance_block',jobs:cp.summary,
+        total_ms:(job.activeMs??0)+Math.max(0,clock()-stepStarted),done:true}));
       return{status:'done',checkpoint:cp};
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
   }};

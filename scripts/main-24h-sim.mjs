@@ -52,7 +52,7 @@
 // tick() itself until true idle or its own runway is exhausted, so multiple bounded main ticks
 // DO land there (see collection-schedule.test.mjs) — this file models that path exactly, using the
 // same admission math, rather than approximating it.
-import { SLOTS, CYCLE_MS, PRIORITY_MAX_CYCLE_MS, MAIN_CYCLE_MS, LOWER_PHASE_RESERVE_MS, offCycleMainBudget } from './collection-schedule.mjs';
+import { SLOTS, CYCLE_MS, PRIORITY_MAX_CYCLE_MS, MAIN_CYCLE_MS, offCycleMainBudget } from './collection-schedule.mjs';
 import { originDueThisCycle } from './priority-market-schedule.mjs';
 import { ORIGINS_ALL } from '../src/data/origins.js';
 import { MAIN_REQUIRED_PROVIDER_CALLS, MAIN_UNIT_WORK_MS, MAIN_UNIT_ADMIT_MS, projectMainCellMs } from './collection-adapters.mjs';
@@ -146,11 +146,18 @@ function cycleMainCells(cycleStart, { pilotMarketSchedule, guaranteeDailyMain, o
   // trigger, which must still respect the real safety margin before the next due cycle.
   const dueSessionUsedMin = Math.min(sessionBudgetMinutes, nominalSlotMinutes('priority') + priorityMin - priorityOverrun + fastMin + dueSessionMainMinUsed + tailMin + maintMin);
   const cycleEnd = cycleStart + CYCLE_MS;
-  const offCycleStart = cycleStart + dueSessionUsedMin * MIN;
-  let offCycleTicks = 0;
-  if (offCycleMainMinutes > 0 && offCycleStart < cycleEnd) {
-    const stopAt = offCycleMainBudget(offCycleStart, { safetyMarginMs: OFF_CYCLE_SAFETY_MARGIN_MS, maxSessionMs: offCycleMainMinutes * MIN });
-    if (stopAt) offCycleTicks = Math.max(0, Math.floor((stopAt - offCycleStart - LOWER_PHASE_RESERVE_MS) / MAIN_UNIT_ADMIT_MS));
+  // Supabase dispatches at +5/+10/+15/+20/+25, not once at the due-session exit. A trigger starts
+  // only after the prior serialized runner has released the lease. Conservatively model the one
+  // productive MAIN unit evidenced per eligible trigger: runtime can turn a productive boundary
+  // yield into a 60s retry/idle exit, so a larger hypothetical budget is NOT evidence of multiple
+  // productive units. This is an observed conservative model, not a universal hard maximum.
+  let offCycleTicks = 0,runnerBusyUntil=cycleStart+dueSessionUsedMin*MIN;
+  for(const triggerMinute of [5,10,15,20,25]){
+    const trigger=cycleStart+triggerMinute*MIN;if(trigger<runnerBusyUntil||offCycleMainMinutes<=0)continue;
+    const stopAt=offCycleMainBudget(trigger,{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:offCycleMainMinutes*MIN});
+    if(!stopAt)continue;
+    const ticks=stopAt-trigger>=MAIN_UNIT_ADMIT_MS?1:0;
+    offCycleTicks+=ticks;runnerBusyUntil=trigger+ticks*MAIN_UNIT_ADMIT_MS;
   }
   const totalTicks = dueSessionMainTicks + offCycleTicks;
   return { mainCells: totalTicks * cellsPerTick(msPerCellForTick), priorityMin, dueSessionMainTicks, offCycleTicks };

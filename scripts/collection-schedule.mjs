@@ -44,14 +44,14 @@ export function priorityCycleProjection({ auditTickets = 1, rouletteTickets = 0,
   return{requests,windowRequests,elapsedMs,lagMs:Math.max(0,elapsedMs-PRIORITY_MAX_CYCLE_MS),fitsReservedSlot:elapsedMs<=PRIORITY_MAX_CYCLE_MS};
 }
 
-export function projectMonthlyRunnerUsage({triggerMinutes,dueSessionMinutes=25,dueEveryMinutes=30,noDueSeconds=10,days=30}){
-  if(![triggerMinutes,dueSessionMinutes,dueEveryMinutes,noDueSeconds,days].every(Number.isFinite)||triggerMinutes<=0||dueSessionMinutes<=0
-    ||dueEveryMinutes<=0||noDueSeconds<0||days<=0)throw new Error('Invalid runner usage projection');
+export function projectMonthlyRunnerUsage({triggerMinutes,dueSessionMinutes=25,dueEveryMinutes=30,offCycleSeconds=70,days=30}){
+  if(![triggerMinutes,dueSessionMinutes,dueEveryMinutes,offCycleSeconds,days].every(Number.isFinite)||triggerMinutes<=0||dueSessionMinutes<=0
+    ||dueEveryMinutes<=0||offCycleSeconds<0||days<=0)throw new Error('Invalid runner usage projection');
   const totalMinutes=days*24*60,triggers=Math.ceil(totalMinutes/triggerMinutes),dueRuns=Math.ceil(totalMinutes/dueEveryMinutes);
   const noDueRuns=Math.max(0,triggers-dueRuns);
   return{triggerMinutes,triggers,dueRuns,noDueRuns,
-    rawRunnerMinutes:dueRuns*dueSessionMinutes+noDueRuns*noDueSeconds/60,
-    roundedJobMinutes:dueRuns*Math.ceil(dueSessionMinutes)+noDueRuns*Math.max(1,Math.ceil(noDueSeconds/60))};
+    rawRunnerMinutes:dueRuns*dueSessionMinutes+noDueRuns*offCycleSeconds/60,
+    roundedJobMinutes:dueRuns*Math.ceil(dueSessionMinutes)+noDueRuns*Math.max(1,Math.ceil(offCycleSeconds/60))};
 }
 
 // Capacity calculator for a supplied workload. The former 2,591-group input is now explicitly a
@@ -106,7 +106,7 @@ export function offCycleMainBudget(instant, { safetyMarginMs, maxSessionMs }) {
 }
 
 export function freshScheduleState() {
-  return { version: 1, jobs: {}, completedMain: 0, missedFast: 0, missedPriority: 0 };
+  return { version: 1, jobs: {}, completedMain: 0, completedMainCoverage: 0, missedFast: 0, missedPriority: 0 };
 }
 
 function newJob(task, id, timestamp) {
@@ -246,9 +246,12 @@ export class SequentialSchedule {
           after.jobs[task].completedAt = this.clock();
           if (task === 'main') {
             after.completedMain += 1;
+            if(after.jobs[task].checkpoint?.coverageComplete===true)
+              after.completedMainCoverage=(after.completedMainCoverage??0)+1;
             after.mainCompletions=[...(after.mainCompletions??[]),{id:job.id,startedAt:job.startedAt,completedAt:this.clock(),
               errors:after.jobs[task].checkpoint?.errors??0,wave:after.jobs[task].checkpoint?.wave??0,
-              activeMs:after.jobs[task].activeMs}].slice(-16);
+              activeMs:after.jobs[task].activeMs,coverageComplete:after.jobs[task].checkpoint?.coverageComplete===true,
+              outcomes:after.jobs[task].checkpoint?.outcomes??null,retryAttempts:after.jobs[task].checkpoint?.retryAttempts??0}].slice(-16);
           }
         }
         if(!reserve&&task===phase.task&&['done','empty','yield'].includes(result.status))after.frame={cycle,phase:after.frame.phase+1,spentMs:0,prioritySpentMs:after.frame.prioritySpentMs??0};

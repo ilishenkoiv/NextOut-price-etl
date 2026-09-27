@@ -44,6 +44,20 @@ test('migration exposes atomic daily publication, fenced price-only refresh, rea
   assert.match(verify,/rollback;\s*$/);assert.match(rollback,/rename to daily_window_candidates_rollback_20260922/);
 });
 
+test('status-contract repair changes only the publisher status predicate and provides an exact rollback',()=>{
+  const repair=readFileSync(new URL('../migrations/20260927120000_publish_daily_window_candidate_statuses.sql',import.meta.url),'utf8');
+  const rollback=readFileSync(new URL('./rollback-publish-daily-window-candidate-statuses.sql',import.meta.url),'utf8');
+  const recoveryReadback=readFileSync(new URL('./readback-window-publication-recovery.sql',import.meta.url),'utf8');
+  assert.match(repair,/coalesce\(r->>'refresh_status',''\) not in \('fresh','unavailable','failed'\)/);
+  assert.match(rollback,/r->>'refresh_status'<>'fresh'/);
+  for(const invariant of [/pg_advisory_xact_lock/,/invalid candidate ordering/,/exact_price/,/exact_observed_at/,/destination_id/,/aviasales_market_for_origin/]){
+    assert.match(repair,invariant);assert.match(rollback,invariant);
+  }
+  assert.match(repair,/notify pgrst,'reload schema';\s*$/);assert.match(rollback,/notify pgrst,'reload schema';\s*$/);
+  assert.match(recoveryReadback,/'priority_checkpoint'[\s\S]*checkpoint->'jobs'->'priority'/,
+    'recovery readback must expose the priority weekend current-day/stale status');
+});
+
 test('window_prices date-window and freshness filtering happens server-side and matches the old client-side result exactly',async()=>{
   const { main } = await import('./snapshot-daily-window-candidates.mjs');
   const instant = Date.parse('2026-09-22T04:00:00.000Z');
@@ -139,4 +153,16 @@ test('point-refresh: a no_result response marks the candidate unavailable withou
   await main({db:handle.db,instant,force:true,provider,refreshDeadline:Date.now()+120000});
   assert.ok(handle.published.p_candidates.every(c=>c.exact_price===150),'the original bulk-selection price is preserved');
   assert.ok(handle.published.p_candidates.some(c=>c.refresh_status==='unavailable'),'the no_result candidate is marked unavailable');
+});
+
+test('point-refresh: a technical error is published as failed without erasing the historical price or observation',async()=>{
+  const { main } = await import('./snapshot-daily-window-candidates.mjs');
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');
+  const observed='2026-09-22T03:45:00.000Z';const fresh=row('BCN','any',150,{updated_at:observed});
+  const handle=windowDb([fresh]);
+  const provider={request:async()=>({kind:'refused',refusal:'server'})};
+  await main({db:handle.db,instant,force:true,provider,refreshDeadline:Date.now()+120000});
+  const failed=handle.published.p_candidates.find(c=>c.refresh_status==='failed');
+  assert.equal(failed.exact_price,150);assert.equal(failed.exact_observed_at,observed);
+  assert.equal(failed.last_error_kind,'point_refresh_error');
 });

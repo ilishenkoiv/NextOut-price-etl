@@ -3,13 +3,12 @@
 // See main-24h-sim.mjs for the model, its calibration history, and its inputs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { simulateMain24h, cellsPerTick, cellsPerTickRange, hrs, reserveOf, DUE_SESSION_MAIN_TICKS_OBSERVED } from './main-24h-sim.mjs';
+import { simulateMain24h, cellsPerTick, cellsPerTickRange, DUE_SESSION_MAIN_TICKS_OBSERVED } from './main-24h-sim.mjs';
 import { MAIN_CYCLE_MS } from './collection-schedule.mjs';
 import { projectMainCellMs } from './collection-adapters.mjs';
 
 const MAIN_TOTAL = 23_952;
 const CLEAN_MS_PER_CELL = projectMainCellMs({ requestMs: 180, dbMs: 100 }); // matches main-24h-sim.mjs's calibration comment
-const SAFE_RESERVE = 0.20; // same bar collection-daily-guarantee.test.mjs uses for "safe"
 
 test('CALIBRATION: flags-off replay of the exact observed production cycle (35885635003, 2026-09-23T16:00Z, wave 43, GUARANTEE_DAILY_MAIN=true) predicts a MAIN delta close to the real 89-cell checkpoint advance, not the previous model\'s 318', () => {
   const startInstant = Date.parse('2026-09-23T16:00:00.000Z');
@@ -41,17 +40,12 @@ test('PROBLEM: today\'s defaults (both PR #24 flags off) do not finish the curre
   assert.equal(r.done, false, 'flags-off, at the evidenced 1-tick-per-due-session ceiling, does not even reach the target in 3 days — consistent with the ~8.3-day production-log estimate, not the old model\'s ~38h');
 });
 
-test('SOLUTION CANDIDATE: pilot + tail-yield + a real 20-minute off-cycle runway reaches <=24h across the whole defensible blended rate range, with the low end still meeting the 20% safe-reserve bar', () => {
-  const { low, high } = cellsPerTickRange();
-  const lowRate = simulateMain24h({ mainTotal: MAIN_TOTAL, pilotMarketSchedule: true, guaranteeDailyMain: true, offCycleMainMinutes: 20, msPerCellForTick: 75_000 / low });
-  const highRate = simulateMain24h({ mainTotal: MAIN_TOTAL, pilotMarketSchedule: true, guaranteeDailyMain: true, offCycleMainMinutes: 20, msPerCellForTick: 75_000 / high });
-  assert.ok(highRate.done && hrs(highRate.elapsedMs) <= 24, `expected the high end of the rate range to fit <=24h, got ${hrs(highRate.elapsedMs)}h`);
-  assert.ok(lowRate.done && hrs(lowRate.elapsedMs) <= 24 && reserveOf(lowRate.elapsedMs) >= SAFE_RESERVE,
-    `expected even the low end of the defensible BLENDED range to fit <=24h with a safe reserve, got ${hrs(lowRate.elapsedMs)}h / ${(reserveOf(lowRate.elapsedMs)*100).toFixed(0)}%`);
-  // This does NOT cover the fully-degraded worst case (every cell needs both calendar fallback and
-  // a retry) — see the CLI's own 'low rate'/'high rate' scenarios in main-24h-sim.mjs, which use
-  // that worst case explicitly and land at ~21.5h/10% reserve, below the safe bar. Both numbers
-  // belong in the report; neither alone is "the" answer.
+test('ACTIVE 2-minute off-cycle policy admits one bounded MAIN unit per eligible five-minute trigger, not zero and not an assumed 20-minute burst', () => {
+  const r=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:2,
+    maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
+  assert.ok(r.log.some(cycle=>cycle.offCycleTicks>0));
+  assert.ok(r.log.every(cycle=>cycle.offCycleTicks<=5),'at most one 90s unit fits each of five off-cycle triggers');
+  assert.equal(r.done,false,'the corrected active policy is not promoted to an unmeasured <24h guarantee');
 });
 
 test('distinct processed/found/no-result/error counters never double-count or exceed processed', () => {
@@ -61,8 +55,9 @@ test('distinct processed/found/no-result/error counters never double-count or ex
   assert.ok(processed <= 5000);
 });
 
-test('CEILING: increasing OFF_CYCLE_MAIN_MINUTES past what the real runway allows is inert — the ceiling is the cron-trigger runway and LOWER_PHASE_RESERVE_MS, not the configured minutes', () => {
-  const a = simulateMain24h({ mainTotal: MAIN_TOTAL, pilotMarketSchedule: true, guaranteeDailyMain: true, offCycleMainMinutes: 20, msPerCellForTick: CLEAN_MS_PER_CELL });
-  const b = simulateMain24h({ mainTotal: MAIN_TOTAL, pilotMarketSchedule: true, guaranteeDailyMain: true, offCycleMainMinutes: 60, msPerCellForTick: CLEAN_MS_PER_CELL });
-  assert.equal(a.elapsedMs, b.elapsedMs, 'off-cycle minutes beyond the real per-cycle runway are inert — configuring more does not buy more MAIN time');
+test('larger hypothetical budgets stay conservative at one evidenced productive unit per eligible trigger', () => {
+  const current=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:2,maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
+  const longer=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:20,maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
+  assert.equal(longer.log.reduce((n,c)=>n+c.offCycleTicks,0),current.log.reduce((n,c)=>n+c.offCycleTicks,0),
+    'simulation must not invent productive-yield propagation that runtime does not implement');
 });

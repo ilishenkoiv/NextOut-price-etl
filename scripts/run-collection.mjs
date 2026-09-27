@@ -195,7 +195,9 @@ export async function main(env=process.env){
       console.log(JSON.stringify({event:'off_cycle_main_advance_end',source:triggerSource,providerRequests:provider.requests,
         ticks,lastStatus,
         progress:Object.fromEntries(Object.entries(engine.state.jobs).filter(([k])=>k!=='priority')
-          .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors}]))}));
+          .map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,errors:j.checkpoint?.errors,
+            ...(k==='main'?{outcomes:j.checkpoint?.outcomes,coverageComplete:j.checkpoint?.coverageComplete,
+              retryRound:j.checkpoint?.retryRound??0}:{})}]))}));
       return;
     }
     // Published once per regular due session — every ~30 minutes at worst, well inside the
@@ -236,13 +238,16 @@ export async function main(env=process.env){
       if(Date.now()-lastReport>60000||result.status==='done'){
         console.log(JSON.stringify({task:result.task,status:result.status,cycle:result.cycle,providerRequests:provider.requests,
           completedMain:engine.state.completedMain,missedFast:engine.state.missedFast,missedPriority:engine.state.missedPriority,
+          completedMainCoverage:engine.state.completedMainCoverage??0,
           priorityLagMs:engine.state.jobs.priority?.checkpoint?.lagMs,
           progress:Object.fromEntries(Object.entries(engine.state.jobs).map(([k,j])=>[k,{done:j.done,cursor:j.checkpoint?.cursor,total:j.checkpoint?.total,
-            errors:j.checkpoint?.errors,...(k==='priority'?{phase:j.checkpoint?.phase,
+            errors:j.checkpoint?.errors,...(k==='main'?{outcomes:j.checkpoint?.outcomes,coverageComplete:j.checkpoint?.coverageComplete,
+              retryRound:j.checkpoint?.retryRound??0}:{}),...(k==='priority'?{phase:j.checkpoint?.phase,
               roulette:{cursor:j.checkpoint?.roulette?.cursor,total:j.checkpoint?.roulette?.total,done:j.checkpoint?.roulette?.done,
                 snapshotAt:j.checkpoint?.roulette?.snapshotAt},
               window:{cursor:j.checkpoint?.weekend?.cursor,total:j.checkpoint?.weekend?.total,done:j.checkpoint?.weekend?.done,
-                snapshotAt:j.checkpoint?.weekend?.snapshotAt}}:{})}]))}));
+                snapshotAt:j.checkpoint?.weekend?.snapshotAt,currentDayComplete:j.checkpoint?.weekend?.currentDayComplete,
+                blockedReason:j.checkpoint?.weekend?.blockedReason,sourceObservedOn:j.checkpoint?.weekend?.sourceObservedOn}}:{})}]))}));
         lastReport=Date.now();
       }
       if(result.status==='idle'){
@@ -254,7 +259,7 @@ export async function main(env=process.env){
     // or SIGTERM); a failed unit throws and skips straight to release. Daily selection has already
     // been checkpointed above when due, before any provider request.
     if(env.GITHUB_STEP_SUMMARY)await appendFile(env.GITHUB_STEP_SUMMARY,
-      `### Sequential collection session\n\nWave: ${wave}. Provider requests: ${provider.requests}. Main passes attempted: ${engine.state.completedMain}.\n\n`+
+      `### Sequential collection session\n\nWave: ${wave}. Provider requests: ${provider.requests}. Main passes attempted: ${engine.state.completedMain}; confirmed-coverage passes: ${engine.state.completedMainCoverage??0}.\n\n`+
       Object.entries(engine.state.jobs).map(([task,j])=>`- ${task}: ${j.done?'pass finished':'checkpoint saved'}; ${j.checkpoint?.cursor??0}/${j.checkpoint?.total??'?'} units; ${j.checkpoint?.errors??0} inconclusive responses.\n`).join('')+
       "\nA successful session is not a claim that the day's main pass or all fast refreshes met their deadlines. Check pass timestamps and error counts.\n");
   }finally{

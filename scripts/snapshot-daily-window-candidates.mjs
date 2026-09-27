@@ -82,13 +82,15 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   // the ordinary scheduled cadence.
   let refresh={attempted:0,refreshed:0,misses:0,errors:0,total:0};
   if(provider){
-    const {confirmed,missed,...stats}=await pointRefreshTickets(candidates,{provider,clock,deadline:refreshDeadline,sourceTable:'window_prices'});
+    const {confirmed,missed,errored,...stats}=await pointRefreshTickets(candidates,{provider,clock,deadline:refreshDeadline,sourceTable:'window_prices'});
     refresh=stats;
     for(let i=0;i<candidates.length;i++){
       const key=ticketKey(candidates[i]),c=confirmed.get(key);
       if(c)candidates[i]={...candidates[i],exact_price:c.price,transfers:c.transfers,airline:c.airline,
         exact_observed_at:c.updated_at,refresh_status:'fresh',refresh_checked_at:c.updated_at,last_error_kind:null,price_source:c.price_source??candidates[i].price_source};
       else if(missed.has(key))candidates[i]={...candidates[i],refresh_status:'unavailable',refresh_checked_at:new Date(clock()).toISOString()};
+      else if(errored.has(key))candidates[i]={...candidates[i],refresh_status:'failed',refresh_checked_at:new Date(clock()).toISOString(),
+        last_error_kind:'point_refresh_error'};
     }
   }
   const{data,error}=await client.rpc('publish_daily_window_candidates',{p_observed_on:today,p_snapshot_at:snapshotAt,p_candidates:candidates});if(error)throw error;
