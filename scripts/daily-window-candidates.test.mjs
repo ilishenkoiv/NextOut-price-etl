@@ -47,12 +47,15 @@ test('migration exposes atomic daily publication, fenced price-only refresh, rea
 test('status-contract repair changes only the publisher status predicate and provides an exact rollback',()=>{
   const repair=readFileSync(new URL('../migrations/20260927120000_publish_daily_window_candidate_statuses.sql',import.meta.url),'utf8');
   const rollback=readFileSync(new URL('./rollback-publish-daily-window-candidate-statuses.sql',import.meta.url),'utf8');
+  const recoveryReadback=readFileSync(new URL('./readback-window-publication-recovery.sql',import.meta.url),'utf8');
   assert.match(repair,/coalesce\(r->>'refresh_status',''\) not in \('fresh','unavailable','failed'\)/);
   assert.match(rollback,/r->>'refresh_status'<>'fresh'/);
   for(const invariant of [/pg_advisory_xact_lock/,/invalid candidate ordering/,/exact_price/,/exact_observed_at/,/destination_id/,/aviasales_market_for_origin/]){
     assert.match(repair,invariant);assert.match(rollback,invariant);
   }
   assert.match(repair,/notify pgrst,'reload schema';\s*$/);assert.match(rollback,/notify pgrst,'reload schema';\s*$/);
+  assert.match(recoveryReadback,/'priority_checkpoint'[\s\S]*checkpoint->'jobs'->'priority'/,
+    'recovery readback must expose the priority weekend current-day/stale status');
 });
 
 test('window_prices date-window and freshness filtering happens server-side and matches the old client-side result exactly',async()=>{

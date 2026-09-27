@@ -55,8 +55,9 @@ test('distinct processed/found/no-result/error counters never double-count or ex
   assert.ok(processed <= 5000);
 });
 
-test('capacity remains a policy input: a longer off-cycle budget changes admitted ticks, so it cannot be enabled from simulation alone', () => {
+test('larger hypothetical budgets stay conservative at one evidenced productive unit per eligible trigger', () => {
   const current=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:2,maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
-  const longer=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:3,maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
-  assert.ok(longer.log.reduce((n,c)=>n+c.offCycleTicks,0)>current.log.reduce((n,c)=>n+c.offCycleTicks,0));
+  const longer=simulateMain24h({mainTotal:MAIN_TOTAL,pilotMarketSchedule:true,guaranteeDailyMain:true,offCycleMainMinutes:20,maxDays:1,msPerCellForTick:CLEAN_MS_PER_CELL});
+  assert.equal(longer.log.reduce((n,c)=>n+c.offCycleTicks,0),current.log.reduce((n,c)=>n+c.offCycleTicks,0),
+    'simulation must not invent productive-yield propagation that runtime does not implement');
 });

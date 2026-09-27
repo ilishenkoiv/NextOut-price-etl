@@ -147,15 +147,16 @@ function cycleMainCells(cycleStart, { pilotMarketSchedule, guaranteeDailyMain, o
   const dueSessionUsedMin = Math.min(sessionBudgetMinutes, nominalSlotMinutes('priority') + priorityMin - priorityOverrun + fastMin + dueSessionMainMinUsed + tailMin + maintMin);
   const cycleEnd = cycleStart + CYCLE_MS;
   // Supabase dispatches at +5/+10/+15/+20/+25, not once at the due-session exit. A trigger starts
-  // only after the prior serialized runner has released the lease. The observed persisted frame is
-  // already in reserve, so each 2-minute off-cycle run admits exactly one 90s-bounded MAIN unit;
-  // subtracting LOWER_PHASE_RESERVE_MS here (the old model) incorrectly predicted zero.
+  // only after the prior serialized runner has released the lease. Conservatively model the one
+  // productive MAIN unit evidenced per eligible trigger: runtime can turn a productive boundary
+  // yield into a 60s retry/idle exit, so a larger hypothetical budget is NOT evidence of multiple
+  // productive units. This is an observed conservative model, not a universal hard maximum.
   let offCycleTicks = 0,runnerBusyUntil=cycleStart+dueSessionUsedMin*MIN;
   for(const triggerMinute of [5,10,15,20,25]){
     const trigger=cycleStart+triggerMinute*MIN;if(trigger<runnerBusyUntil||offCycleMainMinutes<=0)continue;
     const stopAt=offCycleMainBudget(trigger,{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:offCycleMainMinutes*MIN});
     if(!stopAt)continue;
-    const ticks=Math.max(0,Math.floor((stopAt-trigger)/MAIN_UNIT_ADMIT_MS));
+    const ticks=stopAt-trigger>=MAIN_UNIT_ADMIT_MS?1:0;
     offCycleTicks+=ticks;runnerBusyUntil=trigger+ticks*MAIN_UNIT_ADMIT_MS;
   }
   const totalTicks = dueSessionMainTicks + offCycleTicks;

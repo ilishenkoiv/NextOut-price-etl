@@ -29,6 +29,7 @@ select jsonb_pretty(jsonb_build_object(
     where c.snapshot_at=e.snapshot_at and nullif(btrim(c.destination_id),'') is null),
   'ordering_errors',(select n from ordering_errors),
   'daily_selection_checkpoint',(select checkpoint->'dailySelection' from public.collection_scheduler_state where singleton),
+  'priority_checkpoint',(select checkpoint->'jobs'->'priority' from public.collection_scheduler_state where singleton),
   'main_checkpoint',(select checkpoint->'jobs'->'main' from public.collection_scheduler_state where singleton),
   'fast_checkpoint',(select checkpoint->'jobs'->'fast' from public.collection_scheduler_state where singleton),
   'tail_checkpoint',(select checkpoint->'jobs'->'tail' from public.collection_scheduler_state where singleton)
