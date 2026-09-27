@@ -596,10 +596,10 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   const maintenance={maxUnitMs:45000,
     isDue:(instant,checkpoint)=>maintenanceDue(instant,checkpoint),
     async step({job,deadline}){
-    const cp=structuredClone(job.checkpoint??{day:null,checked:{},summary:[],blockDone:false});
-    cp.checked??={};cp.summary??=[];
+    const cp=structuredClone(job.checkpoint??{day:null,checked:{},attempted:{},failed:{},summary:[],blockDone:false});
+    cp.checked??={};cp.attempted??={};cp.failed??={};cp.summary??=[];
     const now=clock();const today=berlinDay(now);
-    if(cp.day!==today){cp.day=today;cp.checked={};cp.summary=[];cp.blockDone=false;}
+    if(cp.day!==today){cp.day=today;cp.checked={};cp.attempted={};cp.failed={};cp.summary=[];cp.blockDone=false;}
     // Outside 03:00-05:45 Berlin, or tonight's block already settled: cheap no-op, no DB calls.
     // This is what replaces the old "one turn every 30-minute cycle, all day" rotation.
     if(!maintenanceDue(now,cp))return{status:'empty',checkpoint:cp};
@@ -613,6 +613,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     try{
       for(const name of MAINTENANCE_JOBS){
         if(cp.checked[name]===today)continue;
+        if(name==='collect_storage_metrics'&&cp.attempted[name]===today)continue;
         if(name==='price_storage'&&!isQuarterlyMaintenanceDay(today)){cp.checked[name]=today;continue;}
         const unitStart=clock();
         let rows=0,done=true;
@@ -622,7 +623,22 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           rows=found.length;
           if(rows){await query(()=>db.from(name).delete().in('id',found.map(r=>r.id)),deadline,{retry:true,op:`${name}_expired_delete`});done=false;}
         }else if(name==='collect_storage_metrics'){
-          await query(()=>db.rpc('collect_storage_metrics'),deadline,{op:'collect_storage_metrics'});
+          try{
+            await query(()=>db.rpc('collect_storage_metrics'),deadline,{op:'collect_storage_metrics'});
+            cp.attempted[name]=today;
+          }catch(error){
+            // This append-only RPC is auxiliary telemetry. A client timeout is ambiguous: the
+            // server transaction may still commit, so record one failed attempt for this Berlin
+            // day and continue without retrying it. Boundary yields, cancellation, lease/fence
+            // loss and every failure from another operation keep their existing semantics.
+            if(error?.dbOp!==name)throw error;
+            const failure={name,status:'FAILED',code:error.dbCode??'unknown',rows:0,ms:clock()-unitStart};
+            cp.attempted[name]=today;
+            cp.failed[name]={day:today,code:failure.code};
+            cp.summary.push(failure);
+            console.log(JSON.stringify({event:'maintenance_result',...failure,day:today}));
+            return{status:'progress',checkpoint:cp};
+          }
         }else if(name==='plan_bucket_expire'){
           const bucket=db.storage.from('price-snapshots');
           const found=await query(()=>bucket.list('coordinator',{limit:100,sortBy:{column:'created_at',order:'asc'}}),deadline,{retry:true,op:'plan_bucket_list'});
@@ -661,7 +677,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const audit=await claimAndFinishOneAudit(deadline,today);
           rows=audit.claimed?1:0;done=!audit.claimed;
         }
-        cp.summary.push({name,rows,ms:clock()-unitStart});
+        cp.summary.push({name,rows,ms:clock()-unitStart,...(name==='collect_storage_metrics'?{status:'SUCCESS'}:{})});
         if(!done)return{status:'progress',checkpoint:cp};
         cp.checked[name]=today;
         return{status:'progress',checkpoint:cp};
