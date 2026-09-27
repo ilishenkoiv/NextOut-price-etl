@@ -18,7 +18,7 @@ function take(map, key) {
 
 // A minimal PostgREST-like chainable builder. Tracks whether .delete() was called on this chain
 // so select vs delete responses can be scripted independently per table.
-function makeDb(script, log) {
+function makeDb(script, log, onCall = () => {}) {
   function chain(table, mode) {
     return new Proxy(function () {}, { get: (_t, k) => {
       if (k === 'delete') return () => { log.push('delete:' + table); return chain(table, 'delete'); };
@@ -31,7 +31,7 @@ function makeDb(script, log) {
   }
   return {
     from: (t) => chain(t, 'select'),
-    rpc: (n) => { log.push('rpc:' + n); const p = Promise.resolve().then(() => take(script.rpc, n)); return { then: p.then.bind(p) }; },
+    rpc: (n) => { log.push('rpc:' + n); onCall('rpc:' + n); const p = Promise.resolve().then(() => take(script.rpc, n)); return { then: p.then.bind(p) }; },
     storage: { from: () => ({
       list: () => { log.push('storage:list'); const p = Promise.resolve().then(() => take(script.storage, 'list')); return { then: p.then.bind(p) }; },
       remove: () => { log.push('storage:remove'); const p = Promise.resolve().then(() => take(script.storage, 'remove')); return { then: p.then.bind(p) }; },
@@ -39,9 +39,9 @@ function makeDb(script, log) {
   };
 }
 
-function makeAdapters(script) {
+function makeAdapters(script,{onCall=()=>{}}={}) {
   const log = [];
-  const db = makeDb(script, log);
+  const db = makeDb(script, log, onCall);
   const store = { args: () => ({ p_owner: 'o', p_token: 1 }), lease: async () => true, runId: 'r' };
   const provider = { request: async () => ({ kind: 'ok', json: { success: true, data: [] } }) };
   let now = AT_0300;
@@ -143,4 +143,22 @@ test('price_storage runs (and only runs) on the first day of a quarter', async (
     if (result.status === 'done') break;
   }
   assert.ok(cp.summary.some((j) => j.name === 'price_storage'), 'price_storage ran on 2026-01-01 (quarter start)');
+});
+
+test('maintenance total_ms includes the final feedback-audit unit before the scheduler persists activeMs',async()=>{
+  const checked=Object.fromEntries(['app_errors','flight_price_feedback','destination_requests','collect_storage_metrics','plan_bucket_expire','window_prices','price_storage']
+    .map(name=>[name,'2026-01-15']));
+  const checkpoint={day:'2026-01-15',checked,attempted:{collect_storage_metrics:'2026-01-15'},failed:{},summary:[],blockDone:false};
+  const lines=[];const originalLog=console.log;console.log=line=>lines.push(line);
+  let now=AT_0300;
+  const db=makeDb(EMPTY_NIGHT_SCRIPT,[],name=>{if(name==='rpc:claim_flight_price_audit')now+=275;});
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r'};
+  const provider={request:async()=>({kind:'ok',json:{success:true,data:[]}})};
+  const exact=createAdapters({db,store,provider,clock:()=>now,sleep:async()=>{},random:()=>0});
+  try{
+    const result=await exact.maintenance.step({job:{id:1,planDate:'2026-01-15',checkpoint,activeMs:7000},deadline:Infinity});
+    assert.equal(result.status,'done');
+  }finally{console.log=originalLog;}
+  const summary=JSON.parse(lines.find(line=>line.includes('maintenance_block')));
+  assert.equal(summary.total_ms,7275);
 });

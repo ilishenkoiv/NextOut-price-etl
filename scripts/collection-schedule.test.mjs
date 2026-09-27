@@ -28,10 +28,10 @@ test('priority capacity is honest at maximum backlog: realistic latency fits, ti
   assert.equal(timeout.fitsReservedSlot,false);assert.ok(timeout.elapsedMs>30*60000);
 });
 
-test('monthly runner projection records 5/10/15/30-minute trigger cost with immediate no-due exits',()=>{
+test('monthly runner projection includes the measured ~70-second active off-cycle work instead of obsolete 10-second no-op exits',()=>{
   const rows=[5,10,15,30].map(triggerMinutes=>projectMonthlyRunnerUsage({triggerMinutes}));
   assert.deepEqual(rows.map(r=>[r.triggerMinutes,r.triggers,r.rawRunnerMinutes,r.roundedJobMinutes]),[
-    [5,8640,37200,43200],[10,4320,36480,38880],[15,2880,36240,37440],[30,1440,36000,36000]]);
+    [5,8640,44400,50400],[10,4320,39360,41760],[15,2880,37680,38880],[30,1440,36000,36000]]);
 });
 
 test('measured post-priority MAIN capacity preserves the mandatory daily pass with reserve',()=>{
@@ -163,6 +163,7 @@ test('completed main is counted once; fast completion does not complete main', a
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);
+  assert.equal(engine.state.completedMainCoverage,0,'an attempted pass without outcome proof is not coverage');
 });
 
 test('an empty maintenance queue advances to reserve and retries later', async () => {
@@ -281,10 +282,13 @@ test('fast is never starved: its own slot still runs fast even while main is at 
 
 test('completed main is still counted once with the guarantee on (snapshot/counting unchanged)', async () => {
   const engine = new SequentialSchedule({ clock: () => 16 * MINMS, lease: async () => true, save: async () => {},
-    guaranteeDailyMain: true, handlers: { main: { maxUnitMs: 100, step: async () => ({ status: 'done', checkpoint: { cursor: 5, total: 5, wave: 43 } }) } } });
+    guaranteeDailyMain: true, handlers: { main: { maxUnitMs: 100, step: async () => ({ status: 'done', checkpoint: {
+      cursor: 5,total: 5,wave:43,coverageComplete:true,outcomes:{attempted:5,confirmedPrice:3,confirmedEmpty:2,unresolved:0,legacyUnclassified:0} } }) } } });
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);
+  assert.equal(engine.state.completedMainCoverage,1);
+  assert.equal(engine.state.mainCompletions[0].coverageComplete,true);
 });
 
 test('nextPriorityDueAt is the exact start of the NEXT 30-minute cycle, never the current one', () => {

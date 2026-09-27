@@ -49,6 +49,8 @@ test('MAIN unconditionally collects direct=200 and any=100 and commits both inde
   // (pool rebuild) stage — that is the nightly selection owner's job.
   assert.equal(result.status,'done');
   assert.equal(result.checkpoint.stage,'complete');
+  assert.equal(result.checkpoint.coverageComplete,true);
+  assert.deepEqual(result.checkpoint.outcomes,{attempted:1,confirmedPrice:1,confirmedEmpty:0,unresolved:0,legacyUnclassified:0});
 });
 test('MAIN preserves actual direct=100 and any=200 without replacing any by the cheaper side',async()=>{
   const f=fixture(mainPlan,(_n,url)=>okFare(url.includes('direct=true')?100:200,url.includes('direct=true')?0:1));
@@ -87,6 +89,36 @@ test('positive calendar fallback may add a fare after two required empties but n
   await f.adapters.main.step({job,deadline:200000});
   assert.equal(f.requests,5);assert.equal(f.calls[0].args.p_price.any_stops,140);
   assert.equal(f.calls[0].args.p_price.price_source.variants.any.source,'calendar');
+});
+
+test('MAIN retries unresolved mandatory outcomes once and converts a later confirmed-empty result into coverage',async()=>{
+  let recovering=false;
+  const f=fixture(mainPlan,()=>recovering?{kind:'ok',json:{success:true,data:[]}}:{kind:'refused',refusal:'server'});
+  const first=await f.adapters.main.step({job,deadline:200000});
+  assert.equal(first.status,'yield');assert.equal(first.checkpoint.cursor,1);
+  assert.deepEqual(first.checkpoint.outcomes,{attempted:1,confirmedPrice:0,confirmedEmpty:0,unresolved:1,legacyUnclassified:0});
+  recovering=true;
+  const retried=await f.adapters.main.step({job:{...job,checkpoint:first.checkpoint},deadline:200000});
+  assert.equal(retried.status,'done');assert.equal(retried.checkpoint.coverageComplete,true);
+  assert.equal(retried.checkpoint.retryAttempts,1);assert.equal(retried.checkpoint.retryRound,1);
+  assert.deepEqual(retried.checkpoint.outcomes,{attempted:1,confirmedPrice:0,confirmedEmpty:1,unresolved:0,legacyUnclassified:0});
+});
+
+test('MAIN closes a bounded attempted pass honestly when one retry round remains unresolved',async()=>{
+  const f=fixture(mainPlan,()=>({kind:'refused',refusal:'server'}));
+  const first=await f.adapters.main.step({job,deadline:200000});
+  const retried=await f.adapters.main.step({job:{...job,checkpoint:first.checkpoint},deadline:200000});
+  assert.equal(retried.status,'done');assert.equal(retried.checkpoint.stage,'attempted_complete');
+  assert.equal(retried.checkpoint.coverageComplete,false);assert.equal(retried.checkpoint.retryRound,1);
+  assert.deepEqual(retried.checkpoint.outcomes,{attempted:1,confirmedPrice:0,confirmedEmpty:0,unresolved:1,legacyUnclassified:0});
+});
+
+test('an in-flight legacy MAIN checkpoint is preserved but cannot be relabeled as confirmed coverage',async()=>{
+  const f=fixture(mainPlan,()=>{throw new Error('completed legacy cursor must not call provider');});
+  const result=await f.adapters.main.step({job:{...job,checkpoint:{cursor:1,errors:2,wave:10}},deadline:200000});
+  assert.equal(result.status,'done');assert.equal(result.checkpoint.stage,'attempted_complete');
+  assert.equal(result.checkpoint.coverageComplete,false);
+  assert.deepEqual(result.checkpoint.outcomes,{attempted:1,confirmedPrice:0,confirmedEmpty:0,unresolved:0,legacyUnclassified:1});
 });
 test('restart between required probes leaves cursor unchanged and replays both variants before one commit',async()=>{
   const f=fixture(mainPlan,(n,url)=>{if(n===3)throw new CollectionYield('boundary');return okFare(url.includes('direct=true')?170:130,url.includes('direct=true')?0:1);});

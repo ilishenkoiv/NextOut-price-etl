@@ -52,7 +52,7 @@
 // tick() itself until true idle or its own runway is exhausted, so multiple bounded main ticks
 // DO land there (see collection-schedule.test.mjs) — this file models that path exactly, using the
 // same admission math, rather than approximating it.
-import { SLOTS, CYCLE_MS, PRIORITY_MAX_CYCLE_MS, MAIN_CYCLE_MS, LOWER_PHASE_RESERVE_MS, offCycleMainBudget } from './collection-schedule.mjs';
+import { SLOTS, CYCLE_MS, PRIORITY_MAX_CYCLE_MS, MAIN_CYCLE_MS, offCycleMainBudget } from './collection-schedule.mjs';
 import { originDueThisCycle } from './priority-market-schedule.mjs';
 import { ORIGINS_ALL } from '../src/data/origins.js';
 import { MAIN_REQUIRED_PROVIDER_CALLS, MAIN_UNIT_WORK_MS, MAIN_UNIT_ADMIT_MS, projectMainCellMs } from './collection-adapters.mjs';
@@ -146,11 +146,17 @@ function cycleMainCells(cycleStart, { pilotMarketSchedule, guaranteeDailyMain, o
   // trigger, which must still respect the real safety margin before the next due cycle.
   const dueSessionUsedMin = Math.min(sessionBudgetMinutes, nominalSlotMinutes('priority') + priorityMin - priorityOverrun + fastMin + dueSessionMainMinUsed + tailMin + maintMin);
   const cycleEnd = cycleStart + CYCLE_MS;
-  const offCycleStart = cycleStart + dueSessionUsedMin * MIN;
-  let offCycleTicks = 0;
-  if (offCycleMainMinutes > 0 && offCycleStart < cycleEnd) {
-    const stopAt = offCycleMainBudget(offCycleStart, { safetyMarginMs: OFF_CYCLE_SAFETY_MARGIN_MS, maxSessionMs: offCycleMainMinutes * MIN });
-    if (stopAt) offCycleTicks = Math.max(0, Math.floor((stopAt - offCycleStart - LOWER_PHASE_RESERVE_MS) / MAIN_UNIT_ADMIT_MS));
+  // Supabase dispatches at +5/+10/+15/+20/+25, not once at the due-session exit. A trigger starts
+  // only after the prior serialized runner has released the lease. The observed persisted frame is
+  // already in reserve, so each 2-minute off-cycle run admits exactly one 90s-bounded MAIN unit;
+  // subtracting LOWER_PHASE_RESERVE_MS here (the old model) incorrectly predicted zero.
+  let offCycleTicks = 0,runnerBusyUntil=cycleStart+dueSessionUsedMin*MIN;
+  for(const triggerMinute of [5,10,15,20,25]){
+    const trigger=cycleStart+triggerMinute*MIN;if(trigger<runnerBusyUntil||offCycleMainMinutes<=0)continue;
+    const stopAt=offCycleMainBudget(trigger,{safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS,maxSessionMs:offCycleMainMinutes*MIN});
+    if(!stopAt)continue;
+    const ticks=Math.max(0,Math.floor((stopAt-trigger)/MAIN_UNIT_ADMIT_MS));
+    offCycleTicks+=ticks;runnerBusyUntil=trigger+ticks*MAIN_UNIT_ADMIT_MS;
   }
   const totalTicks = dueSessionMainTicks + offCycleTicks;
   return { mainCells: totalTicks * cellsPerTick(msPerCellForTick), priorityMin, dueSessionMainTicks, offCycleTicks };

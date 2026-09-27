@@ -75,6 +75,24 @@ test('missing daily epoch fails closed without treating cache rows as selected',
   const adapters=createAdapters({db,store,provider:{request:async()=>{requests++;}},clock:()=>now});
   const result=await adapters.priority.step({job:{id:2,planDate:'2026-09-23',checkpoint:{cycle:2,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000});
   assert.equal(result.status,'done');assert.equal(result.checkpoint.weekend.blockedReason,'no_daily_window_candidate_epoch');assert.equal(requests,0);
+  assert.equal(result.checkpoint.weekend.currentDayComplete,false,'a missing epoch is never current-day completion');
+});
+
+test('an older window epoch may refresh but is explicitly stale and never counts as current-day completion',async()=>{
+  const now=Date.parse('2026-09-23T10:00:00Z'),snapshot='2026-09-22T03:30:00Z';
+  const old={observed_on:'2026-09-22',snapshot_at:snapshot,origin:'BER',market:'de',dest:'FCO',destination_id:'rome',flight_type:'any',
+    departure_at:'2026-10-10',return_at:'2026-10-17',position:1,window_kind:'weekend',exact_observed_at:'2026-09-22T09:00:00Z',refresh_status:'fresh'};
+  const db={from:table=>chain(table==='daily_window_candidate_epochs'?[{observed_on:'2026-09-22',snapshot_at:snapshot,contract_version:1,candidate_rows:1,exact_request_groups:1}]:[]),
+    rpc:()=>Promise.resolve({data:true,error:null}),storage:{from:()=>({})}};
+  const store={args:()=>({p_owner:'o',p_token:1}),lease:async()=>true,runId:'r',plan:async(key,build)=>key.includes('/windowrefresh-')?
+    {tickets:[old],groups:[[old]],setId:'daily-window:old',selectedAt:snapshot}:build()};
+  const provider={request:async()=>({kind:'ok',json:{success:true,data:[{departure_at:'2026-10-10T06:00:00Z',return_at:'2026-10-17T20:00:00Z',price:100,transfers:1}]}})};
+  const adapters=createAdapters({db,store,provider,clock:()=>now});
+  const result=await adapters.priority.step({job:{id:2,planDate:'2026-09-23',checkpoint:{cycle:2,dueAt:now,phase:'weekend',roulette:{done:true}}},deadline:now+200000});
+  assert.equal(result.status,'done');assert.equal(result.checkpoint.weekend.done,true);
+  assert.equal(result.checkpoint.weekend.sourceObservedOn,'2026-09-22');
+  assert.equal(result.checkpoint.weekend.currentDayComplete,false);
+  assert.equal(result.checkpoint.weekend.blockedReason,'stale_daily_window_candidate_epoch');
 });
 
 test('priority writes are fenced: lease loss prevents weekend fare commit',async()=>{

@@ -129,6 +129,34 @@ test('order within one call: roulette publishes before window is even attempted 
   assert.equal(state.dailySelection.windowRefresh.refreshed,5);
 });
 
+test('same-day recovery after a window publication failure resumes only window and preserves the completed roulette checkpoint',async()=>{
+  const instant=Date.parse('2026-09-24T05:05:00Z');
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
+  const saves=[];const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
+  let rouletteCalls=0,windowCalls=0;
+  await assert.rejects(()=>runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
+    publishRoulette:async()=>{rouletteCalls++;return{rebuilt:true,rank1Rows:44,poolRows:220};},
+    publishWindows:async()=>{windowCalls++;throw new Error('invalid daily window candidate row');}}),/invalid daily window candidate row/);
+  assert.equal(rouletteCalls,1);assert.equal(windowCalls,1);
+  assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,false);
+  assert.equal(state.jobs.priority.done,true,'priority is not reset against the old window epoch after a failed publication');
+  state.dailySelection.lastError={message:'invalid daily window candidate row',at:instant};await store.save(state);
+  assert.equal(dailySelectionRetryThrottled(state,instant+5*60_000),true,'same-day recovery obeys the 30-minute throttle');
+
+  const retryAt=instant+31*60_000;
+  const recovered=await runDueDailySelection({state,store,db:{},instant:retryAt,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
+    publishRoulette:async()=>{throw new Error('completed roulette must not run again');},
+    publishWindows:async()=>{windowCalls++;return{published:true,candidateRows:873,freshFraction:0.8};}});
+  if(state.dailySelection.lastError){delete state.dailySelection.lastError;await store.save(state);}
+  assert.equal(recovered.published,true);assert.equal(rouletteCalls,1);assert.equal(windowCalls,2);
+  assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
+  assert.equal(state.dailySelection.windowCandidateRows,873);assert.ok(state.dailySelection.completedAt);
+  assert.equal(state.dailySelection.lastError,undefined);
+  assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');
+  assert.ok(saves.some(saved=>saved.dailySelection?.rouletteDone===true&&saved.dailySelection?.windowDone!==true),
+    'partial success is durably checkpointed before window recovery');
+});
+
 test('legacy (pilotMarketSchedule unset) behaves exactly as the pilot path — both always publish immediately, no freshness gate either way',async()=>{
   const instant=Date.parse('2026-09-23T02:30:00Z'); // 03:30 Berlin, legacy threshold
   const state={version:1,jobs:{}};
