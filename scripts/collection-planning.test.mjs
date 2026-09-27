@@ -25,6 +25,18 @@ test('known empty watched route is never removed by weekly rotation',()=>{
   const prices=[{origin:'FRA',dest:'MAD',month:'2026-10',direct:null,any_stops:null}];
   for(let day=10;day<17;day++)assert.ok(mainPlan({date:`2026-09-${day}`,wave:10,prices,watches:[{origin:'FRA',dest:'MAD'}]}).routes.some(r=>r.key==='FRA|MAD'));
 });
+test('expired temporary dead route returns automatically on 29 September without resetting any pool',()=>{
+  const health=[{origin:'FRA',dest:'BCN',status:'dead',dead_policy:'temporary_immediate',temporary_dead_until:'2026-09-28T22:00:00Z'}];
+  assert.ok(mainPlan({date:'2026-09-29',wave:0,prices:[],watches:[],routeHealth:health}).routes.some(r=>r.key==='FRA|BCN'));
+});
+test('permanent dead watch and exotic routes keep their daily priority exception',()=>{
+  const health=[{origin:'FRA',dest:'MAD',status:'dead',dead_policy:'permanent_7d'},
+    {origin:'FRA',dest:'HKT',status:'dead',dead_policy:'permanent_7d'}];
+  for(const date of ['2026-09-29','2026-09-30']){
+    const plan=mainPlan({date,wave:10,prices:[],watches:[{origin:'FRA',dest:'MAD'}],routeHealth:health});
+    assert.ok(plan.routes.some(r=>r.key==='FRA|MAD'));assert.ok(plan.routes.some(r=>r.key==='FRA|HKT'));
+  }
+});
 test('fast plan has a hard bound and fairly interleaves origins',()=>{
   const rows=['FRA','MUC'].flatMap(origin=>Array.from({length:20},(_,i)=>({origin,dest:i%2?'MAD':'BCN',departure_at:`2027-01-${String(i+1).padStart(2,'0')}`,return_at:'2027-02-01',price:100+i,window_kind:'weekend'})));
   const result=fastPlan({rows,watches:[],today:'2026-09-16',wave:10});
