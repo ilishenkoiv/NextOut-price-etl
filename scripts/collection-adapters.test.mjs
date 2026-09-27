@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { createAdapters, MAIN_REQUIRED_PROVIDER_CALLS, projectMainCellMs } from './collection-adapters.mjs';
 import { CollectionYield } from './collection-provider.mjs';
 
-function fixture(plan,response,{tableRows={},clock=()=>100000}={}){
+function fixture(plan,response,{tableRows={},clock=()=>100000,rpc,lease=async()=>true,storageList}={}){
   const calls=[];
   const chain=data=>new Proxy({}, {get:(_,key)=>key==='then'?Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null})):()=>chain(data)});
-  const db={rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},
-    from:table=>chain(tableRows[table]??[]),storage:{from:()=>({upload:async()=>({data:{},error:null})})}};
-  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease:async()=>true,plan:async()=>plan,runId:'123'};
+  const db={rpc:(name,args)=>{calls.push({name,args});return rpc?rpc(name,args):Promise.resolve({data:true,error:null});},
+    from:table=>chain(tableRows[table]??[]),storage:{from:()=>({
+      upload:async()=>({data:{},error:null}),list:storageList??(async()=>({data:[],error:null})),remove:async()=>({data:[],error:null})})}};
+  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease,plan:async()=>plan,runId:'123'};
   let requests=0;
   const provider={request:async url=>{requests++;return response(requests,url);}};
   return{adapters:createAdapters({db,store,provider,clock,wave:10}),calls,get requests(){return requests;}};
@@ -242,4 +243,88 @@ test('weekend phase: no epoch rows at all is reported as blocked, not an empty-l
   assert.equal(result.status,'done');
   assert.equal(result.checkpoint.weekend.blockedReason,'no_daily_window_candidate_epoch');
   assert.equal(result.checkpoint.weekend.done,true);
+});
+
+const maintenanceNow=Date.parse('2026-09-27T01:05:00Z'); // 03:05 Europe/Berlin
+const maintenanceJob=checkpoint=>({id:1,planDate:'2026-09-27',startedAt:maintenanceNow,activeMs:0,checkpoint});
+async function reachStorageMetrics(adapter,checkpoint=null,now=maintenanceNow){
+  let cp=checkpoint;
+  for(let i=0;i<3;i++){
+    const result=await adapter.step({job:maintenanceJob(cp),deadline:now+120000});
+    assert.equal(result.status,'progress');cp=result.checkpoint;
+  }
+  return cp;
+}
+
+test('maintenance records a failed storage-metrics attempt once, emits FAILED, and continues the remaining queue',async()=>{
+  let metricsCalls=0;const events=[];const originalLog=console.log;
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    rpc:async name=>{if(name==='collect_storage_metrics'){metricsCalls++;return{data:null,error:{message:'TimeoutError: aborted',code:'unknown'},status:0};}return{data:true,error:null};}});
+  try{
+    console.log=line=>events.push(JSON.parse(line));
+    const before=await reachStorageMetrics(f.adapters.maintenance);
+    const failed=await f.adapters.maintenance.step({job:maintenanceJob(before),deadline:maintenanceNow+120000});
+    assert.equal(failed.status,'progress');assert.equal(metricsCalls,1);
+    assert.equal(failed.checkpoint.checked.collect_storage_metrics,undefined,'failure is not marked successful');
+    assert.equal(failed.checkpoint.attempted.collect_storage_metrics,'2026-09-27');
+    assert.deepEqual(failed.checkpoint.failed.collect_storage_metrics,{day:'2026-09-27',code:'unknown'});
+    assert.equal(failed.checkpoint.summary.at(-1).status,'FAILED');
+    assert.deepEqual(events.at(-1),{event:'maintenance_result',name:'collect_storage_metrics',status:'FAILED',code:'unknown',rows:0,ms:0,day:'2026-09-27'});
+    const continued=await f.adapters.maintenance.step({job:maintenanceJob(failed.checkpoint),deadline:maintenanceNow+120000});
+    assert.equal(continued.checkpoint.summary.at(-1).name,'plan_bucket_expire');
+    assert.equal(metricsCalls,1,'same-day continuation does not repeat the ambiguous RPC');
+  }finally{console.log=originalLog;}
+});
+
+test('a same-day restart skips failed storage metrics, while the next Berlin day permits one new attempt',async()=>{
+  const failedCheckpoint={day:'2026-09-27',checked:{app_errors:'2026-09-27',flight_price_feedback:'2026-09-27',destination_requests:'2026-09-27'},
+    attempted:{collect_storage_metrics:'2026-09-27'},failed:{collect_storage_metrics:{day:'2026-09-27',code:'unknown'}},
+    summary:[{name:'collect_storage_metrics',status:'FAILED',code:'unknown',rows:0,ms:8000}],blockDone:false};
+  let sameDayCalls=0;
+  const sameDay=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    rpc:async()=>{sameDayCalls++;return{data:true,error:null};}});
+  const resumed=await sameDay.adapters.maintenance.step({job:maintenanceJob(failedCheckpoint),deadline:maintenanceNow+120000});
+  assert.equal(sameDayCalls,0);assert.equal(resumed.checkpoint.summary.at(-1).name,'plan_bucket_expire');
+
+  const nextDay=Date.parse('2026-09-28T01:05:00Z');let nextDayCalls=0;
+  const next=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>nextDay,
+    rpc:async name=>{if(name==='collect_storage_metrics')nextDayCalls++;return{data:true,error:null};}});
+  const before=await reachStorageMetrics(next.adapters.maintenance,failedCheckpoint,nextDay);
+  const attempted=await next.adapters.maintenance.step({job:{...maintenanceJob(before),startedAt:nextDay},deadline:nextDay+120000});
+  assert.equal(nextDayCalls,1);assert.equal(attempted.checkpoint.checked.collect_storage_metrics,'2026-09-28');
+  assert.equal(attempted.checkpoint.summary.at(-1).status,'SUCCESS');
+});
+
+test('normal storage metrics success is checked successful and has no failed checkpoint',async()=>{
+  let metricsCalls=0;
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    rpc:async name=>{if(name==='collect_storage_metrics')metricsCalls++;return{data:true,error:null};}});
+  const before=await reachStorageMetrics(f.adapters.maintenance);
+  const result=await f.adapters.maintenance.step({job:maintenanceJob(before),deadline:maintenanceNow+120000});
+  assert.equal(metricsCalls,1);assert.equal(result.checkpoint.checked.collect_storage_metrics,'2026-09-27');
+  assert.equal(result.checkpoint.attempted.collect_storage_metrics,'2026-09-27');
+  assert.equal(result.checkpoint.failed.collect_storage_metrics,undefined);
+  assert.equal(result.checkpoint.summary.at(-1).status,'SUCCESS');
+});
+
+test('storage metrics yield, cancellation, lease loss, and unrelated DB errors retain their semantics',async()=>{
+  const ready={day:'2026-09-27',checked:{app_errors:'2026-09-27',flight_price_feedback:'2026-09-27',destination_requests:'2026-09-27'},
+    attempted:{},failed:{},summary:[],blockDone:false};
+  const yielding=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    rpc:async()=>{throw new CollectionYield('boundary');}});
+  const yielded=await yielding.adapters.maintenance.step({job:maintenanceJob(ready),deadline:maintenanceNow+120000});
+  assert.equal(yielded.status,'yield');assert.equal(yielded.checkpoint.attempted.collect_storage_metrics,undefined);
+
+  const cancelling=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    rpc:async()=>{throw new Error('cancelled');}});
+  await assert.rejects(()=>cancelling.adapters.maintenance.step({job:maintenanceJob(ready),deadline:maintenanceNow+120000}),/cancelled/);
+
+  const lostLease=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,lease:async()=>false});
+  await assert.rejects(()=>lostLease.adapters.maintenance.step({job:maintenanceJob(ready),deadline:maintenanceNow+120000}),/lease lost/);
+
+  const afterMetrics={...ready,checked:{...ready.checked,collect_storage_metrics:'2026-09-27'},attempted:{collect_storage_metrics:'2026-09-27'}};
+  const unrelated=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>maintenanceNow,
+    storageList:async()=>({data:null,error:{message:'bucket unavailable',code:'500'},status:500})});
+  await assert.rejects(()=>unrelated.adapters.maintenance.step({job:maintenanceJob(afterMetrics),deadline:maintenanceNow+120000}),
+    error=>error.dbOp==='plan_bucket_list');
 });
