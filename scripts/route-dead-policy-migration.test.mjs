@@ -31,6 +31,10 @@ test('rollback reactivates temporary-only rows, restores the 30-day function and
 
 test('operator readback exposes definitions, classification counts and transition violations without writes',()=>{
   assert.match(readback,/pg_get_functiondef\('public\.collection_record_route_observation/);
+  assert.match(readback,/has_function_privilege\('service_role',p\.oid,'EXECUTE'\)/);
+  assert.match(readback,/aclexplode\(coalesce\(p\.proacl,acldefault\('f',p\.proowner\)\)\)/);
+  assert.match(readback,/has_function_privilege\('anon',p\.oid,'EXECUTE'\)/);
+  assert.match(readback,/has_function_privilege\('authenticated',p\.oid,'EXECUTE'\)/);
   assert.match(readback,/'expired_temporary_rows'/);
   assert.match(readback,/'permanent_before_7d'/);
   assert.match(readback,/'protected_permanent_rows'/);
@@ -42,7 +46,7 @@ test('migration and rollback both execute idempotently against the existing rout
   try{
     await db.exec(`
       create role service_role;create role anon;create role authenticated;
-      create table public.collection_scheduler_state(singleton boolean primary key,owner uuid,fence bigint,lease_until timestamptz);
+      create table public.collection_scheduler_state(singleton boolean primary key,owner uuid,fence bigint,lease_until timestamptz,checkpoint jsonb);
       create table public.route_price_health(
         origin text not null,dest text not null,status text not null default 'active',first_observed_at timestamptz not null default clock_timestamp(),
         protected_until timestamptz,first_confirmed_no_price_at timestamptz,last_confirmed_no_price_at timestamptz,last_price_at timestamptz,
@@ -53,6 +57,15 @@ test('migration and rollback both execute idempotently against the existing rout
     const added=await db.query(`select column_name from information_schema.columns where table_schema='public'
       and table_name='route_price_health' and column_name in ('dead_policy','temporary_dead_until') order by column_name`);
     assert.deepEqual(added.rows.map(r=>r.column_name),['dead_policy','temporary_dead_until']);
+    const verified=await db.query(readback);
+    const policy=JSON.parse(verified.rows[0].route_dead_policy_readback);
+    assert.equal(policy.execute_privileges.length,2);
+    for(const privileges of policy.execute_privileges){
+      assert.equal(privileges.service_role,true);
+      assert.equal(privileges.public,false);
+      assert.equal(privileges.anon,false);
+      assert.equal(privileges.authenticated,false);
+    }
     await db.exec(rollback);await db.exec(rollback);
     const removed=await db.query(`select count(*)::integer n from information_schema.columns where table_schema='public'
       and table_name='route_price_health' and column_name in ('dead_policy','temporary_dead_until')`);

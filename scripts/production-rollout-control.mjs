@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
+import { routeIsEffectivelyDead, TEMPORARY_DEAD_POLICY } from './route-price-health.mjs';
 
 const action=process.env.ROLLOUT_ACTION;
 const url=(process.env.SUPABASE_URL||'').replace(/\/$/,'');
@@ -58,7 +59,10 @@ probe.liveMetrics={recentSince:recentIso,recentPrices:recentPrices.length,recent
   recentWindows:recentWindows.length,consumerWindowRows:consumer.length,
   consumerWindowGroups:new Set(consumer.map(r=>[r.origin,r.dest,r.departure_at,r.return_at].join('|'))).size,
   consumerOldestAgeMs:ages.length?Math.max(...ages):null,consumerNewestAgeMs:ages.length?Math.min(...ages):null,
-  routeHealthRows:health.length,routeHealthDead:health.filter(r=>r.status==='dead').length,routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
+  routeHealthRows:health.length,routeHealthStoredDead:health.filter(r=>r.status==='dead').length,
+  routeHealthEffectiveDead:health.filter(r=>routeIsEffectivelyDead(r,now)).length,
+  routeHealthExpiredTemporary:health.filter(r=>r.status==='dead'&&r.dead_policy===TEMPORARY_DEAD_POLICY&&!routeIsEffectivelyDead(r,now)).length,
+  routeHealthWithPrice:health.filter(r=>r.last_price_at).length,
   poolRows:pool.length,poolSnapshots:Object.keys(poolGroups).length,latestPoolSnapshot,
   latestPoolRows:latestPool.length,poolFingerprint:fingerprint(pool),latestPoolFingerprint:fingerprint(latestPool),
   latestPoolDuplicateCities:duplicateCities,replacementAuditRows:replacements.length,

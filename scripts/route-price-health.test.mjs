@@ -64,6 +64,15 @@ test('temporary immediate rule overrides expansion protection, then expiry resto
   assert.equal(s.status,'dead');assert.equal(s.deadPolicy,PERMANENT_DEAD_POLICY);
 });
 
+test('an existing unprotected route gains the same expansion protection as the SQL transition',()=>{
+  const start=TEMPORARY_DEAD_CUTOFF+DAY;
+  let s=emptyPassAt(null,start,1);
+  assert.equal(s.protectedUntil,null);
+  s=emptyPassAt(s,start+7*DAY,2,{expansion:true});
+  assert.equal(s.protectedUntil,start+30*DAY);
+  assert.equal(s.status,'active','seven-day eligibility cannot bypass newly applied expansion protection');
+});
+
 test('expired temporary rows are operationally live and durable permanent dead rows are sampled about 1/7',()=>{
   const temporary={status:'dead',dead_policy:TEMPORARY_DEAD_POLICY,temporary_dead_until:'2026-09-28T22:00:00Z'};
   assert.equal(routeIsEffectivelyDead(temporary,TEMPORARY_DEAD_CUTOFF-1),true);

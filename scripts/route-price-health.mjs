@@ -34,6 +34,7 @@ export function recordRouteAttempt(state, attempt) {
   else if(JSON.stringify(next.observationHorizon)!==JSON.stringify(horizon))throw new Error('Horizon changed within pass');
   if(!next.observedMonths.includes(attempt.month))next.observedMonths.push(attempt.month);
   const hasPrice=attempt.outcome==='price';next.passHasPrice ||= hasPrice;
+  if(attempt.isExpansion&&next.protectedUntil==null)next.protectedUntil=next.firstObservedAt+30*DAY;
   if(hasPrice){next.status='active';next.deadPolicy=null;next.temporaryDeadUntil=null;
     next.firstConfirmedNoPriceAt=null;next.lastPriceAt=at;return next;}
   if(next.observedMonths.length===6){
