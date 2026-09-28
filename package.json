@@ -1,7 +1,7 @@
 {
-  "name": "nextout-price-etl",
+  "name": "proprietary-software",
   "version": "1.0.0",
-  "description": "Automated flight-price collection pipeline for the NextOut application.",
+  "description": "Proprietary software.",
   "type": "module",
   "engines": {
     "node": ">=22"
