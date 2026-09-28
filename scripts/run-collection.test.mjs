@@ -222,6 +222,9 @@ test('off-cycle MAIN advance never offers a priority handler and never calls run
 
 test('regular progress logs expose only the checkpointed safe roulette technical diagnostics and later per-key outcomes',()=>{
   const projection=source.slice(source.indexOf("...(k==='priority'?{phase:j.checkpoint?.phase"),source.indexOf("window:{cursor:j.checkpoint?.weekend?.cursor"));
+  const priorityProjection=source.slice(source.indexOf("...(k==='priority'?{phase:j.checkpoint?.phase"),source.indexOf("}}:{})}]))}"));
+  assert.match(priorityProjection,/roulette:\{cursor:[^}]*total:[^}]*admittedAt:[^}]*snapshotAt:/);
+  assert.match(priorityProjection,/window:\{cursor:[^}]*total:[^}]*admittedAt:[^}]*snapshotAt:[^}]*setId:/);
   assert.match(projection,/technicalDeferred:j\.checkpoint\?\.roulette\?\.technicalDeferred\?\?\[\]/);
   assert.match(projection,/technicalOutcomes:j\.checkpoint\?\.roulette\?\.technicalOutcomes\?\?\[\]/);
   assert.doesNotMatch(projection,/TP_TOKEN|Authorization|headers|response\.json|providerUrl/);

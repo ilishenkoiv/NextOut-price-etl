@@ -14,10 +14,11 @@ const { main: publishDailyRoulette, PILOT_SELECTION_THRESHOLD_MINUTES } = await 
 const { main: publishDailyWindows } = await import('./snapshot-daily-window-candidates.mjs');
 
 const settle = (result) => ({ then: (onFulfilled, onRejected) => Promise.resolve(result).then(onFulfilled, onRejected) });
-const freshOffer = { origin: 'BER', market: 'de', dest: 'BCN', flight_type: 'any', price: 120,
-  departure_at: '2027-01-10', return_at: '2027-01-17', transfers: 1, updated_at: '2026-01-15T05:00:00.000Z', price_source: null };
+const freshOffers = ['AMS','ATH','BCN','FCO','IST','LIS','PMI','PRG','VIE','ZRH'].map((dest,index)=>({
+  origin:'BER',market:'de',dest,flight_type:'any',price:120+index,departure_at:'2027-01-10',return_at:'2027-01-17',
+  transfers:1,updated_at:'2026-01-15T05:00:00.000Z',price_source:null}));
 
-function stubDb({ rows = [freshOffer], publish = true } = {}) {
+function stubDb({ rows = freshOffers, publish = true } = {}) {
   const chain = {
     select() { return chain; }, gte() { return chain; }, gt() { return chain; }, lte() { return chain; },
     order() { return chain; }, in() { return chain; },
@@ -35,7 +36,7 @@ test('roulette selection (snapshot-daily-origin-cheapest.mjs): pilot threshold a
   const notYet = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T04:59:00.000Z', pilotMarketSchedule: true }); // 05:59 Berlin (CET)
   assert.equal(notYet.rebuilt, false);
   assert.equal(notYet.reason, 'not_due');
-  const due = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T05:00:00.000Z', pilotMarketSchedule: true }); // 06:00 Berlin
+  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T05:00:00.000Z',pilotMarketSchedule:true,expectedOrigins:['BER'] }); // 06:00 Berlin
   assert.equal(due.rebuilt, true);
 });
 
@@ -50,7 +51,7 @@ test('window/carousel selection (snapshot-daily-window-candidates.mjs): same pil
 
 test('without pilotMarketSchedule, both scripts keep the untouched legacy 03:30 default', async () => {
   const db = stubDb();
-  const due = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T02:30:00.000Z' }); // 03:30 Berlin, legacy-due
+  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T02:30:00.000Z',expectedOrigins:['BER'] }); // 03:30 Berlin, legacy-due
   assert.equal(due.rebuilt, true);
   const notDue = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T02:29:00.000Z' }); // 03:29 Berlin, legacy not-yet-due
   assert.equal(notDue.reason, 'not_due');

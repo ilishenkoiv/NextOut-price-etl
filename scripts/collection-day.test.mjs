@@ -24,12 +24,16 @@ async function simulate(mainMinutes){
 test('24-hour scheduling simulation survives six runner handovers without parallel work',async()=>{
   const result=await simulate(331.6);
   assert.equal(result.overlaps,0);assert.equal(result.restarts,6);
-  assert.equal(result.state.completedMain,1); // one main pass/day (MAIN_CYCLE_MS = 24h)
+  assert.ok(result.state.completedMain>1,'completed MAIN passes restart continuously instead of waiting for a new UTC bucket');
+  assert.equal(new Set(result.state.mainCompletions.map(pass=>pass.id)).size,result.state.mainCompletions.length,
+    'every completed pass has a unique successor identity');
   assert.equal(result.state.missedFast,0);
 });
-test('an overloaded day keeps the unfinished cursor instead of claiming two complete passes',async()=>{
+test('continuous restart still preserves the newest unfinished pass across runner handovers',async()=>{
   const result=await simulate(600);
-  assert.ok(result.state.completedMain<2);
+  assert.ok(result.state.completedMain>=1);
   assert.equal(result.overlaps,0);
+  assert.equal(result.state.jobs.main.done,false);
   assert.ok(result.state.jobs.main.checkpoint.spent>0);
+  assert.ok(result.state.jobs.main.checkpoint.spent<600*60000);
 });

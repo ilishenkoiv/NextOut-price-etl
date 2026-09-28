@@ -165,7 +165,7 @@ test('pilot market schedule (off by default): a night-hours instant skips priori
     const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
     const nightUtc=Date.parse('2026-01-15T01:00:00Z'); // 02:00 Europe/Berlin — night, mainOnly
     const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc});
-    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:nightUtc,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
     assert.equal(f.requests,0,'no provider call for an origin whose market-local time is inside the night gap');
     assert.equal(result.checkpoint.roulette.total,0);
@@ -178,7 +178,7 @@ test('pilot market schedule (off by default): a DACH peak-hours instant still re
     const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
     const peakUtc=Date.parse('2026-01-15T19:00:00Z'); // 20:00 Europe/Berlin — DACH peak (19:00-23:00)
     const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc});
-    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:peakUtc,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
     assert.equal(f.requests,1,'the one selected ticket is still refreshed at peak local time');
     assert.equal(result.checkpoint.roulette.total,1);
@@ -193,7 +193,7 @@ test('pilot market schedule (window/carousel path): a night-hours instant skips 
     const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
     const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc,
       tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
-    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:nightUtc,roulette:{done:true}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
     assert.equal(f.requests,0,'no provider call for a window group whose origin is inside the night gap');
     assert.equal(result.checkpoint.weekend.total,0);
@@ -209,7 +209,7 @@ test('pilot market schedule (window/carousel path): a DACH peak-hours instant st
     const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
     const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc,
       tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
-    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:peakUtc,roulette:{done:true}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
     assert.equal(f.requests,1,'the one selected window group is still refreshed at peak local time');
     assert.equal(result.checkpoint.weekend.total,1);
@@ -254,16 +254,16 @@ test('weekend phase: an unchanged latest epoch (retry/resume) continues the curs
   assert.equal(result.checkpoint.weekend.done,true);
 });
 
-test('weekend phase: a new epoch publication (or Berlin-day rollover, which always emits one) invalidates in-flight progress',async()=>{
+test('weekend phase: a new epoch waits while the admitted old-epoch pass completes',async()=>{
   const newEpoch={observed_on:'2026-01-16',snapshot_at:'2026-01-16T00:00:00Z',contract_version:1,candidate_rows:2,exact_request_groups:2};
   const f=fixture(twoGroupPlan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>someUtc,
     tableRows:{daily_window_candidate_epochs:[newEpoch]}});
   const staleCheckpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true},
     weekend:{day:'2026-01-15',dayId:1,cursor:1,done:false,errors:3,passStartedAt:0,snapshotAt:'2026-01-15T00:00:00Z'}};
   const result=await f.adapters.priority.step({job:{...job,checkpoint:staleCheckpoint},deadline:someUtc+200000});
-  assert.equal(result.checkpoint.weekend.snapshotAt,newEpoch.snapshot_at,'adopts the new latest epoch');
-  assert.equal(result.checkpoint.weekend.cursor,1,'restarts at group 0 and advances to 1, discarding the stale cursor=1 from the old epoch');
-  assert.equal(result.checkpoint.weekend.errors,0,'stale error count from the superseded epoch is not carried forward');
+  assert.equal(result.checkpoint.weekend.snapshotAt,'2026-01-15T00:00:00Z','keeps the admitted epoch until cursor reaches total');
+  assert.equal(result.checkpoint.weekend.cursor,2,'continues the pending group instead of restarting or skipping it');
+  assert.equal(result.checkpoint.weekend.errors,3,'in-flight diagnostics remain attached to the admitted pass');
 });
 
 test('weekend phase: no epoch rows at all is reported as blocked, not an empty-latest-row crash',async()=>{

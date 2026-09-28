@@ -50,44 +50,6 @@ export function windowConsumerSetId(rows,day){return`window-consumer:${day}:`+cr
   [t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|')).join('\n')).digest('hex').slice(0,20);}
 export function groupWindowConsumerTickets(rows){const groups=new Map();for(const row of rows){const key=[row.origin,row.dest,row.departure_at,row.return_at].join('|');
   if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}return[...groups.values()].map(group=>group.sort((a,b)=>a.flight_type.localeCompare(b.flight_type)));}
-export function buildRouletteReplacementCandidates(offers,pool,allowedDests,today){const allowed=new Set(allowedDests),used=new Set(pool.map(t=>`${t.origin}|${t.dest}`)),best=new Map();
-  for(const row of offers){if(!allowed.has(row.dest)||used.has(`${row.origin}|${row.dest}`)||row.departure_at<today||!row.return_at||row.return_at<=row.departure_at||!(Number(row.price)>0))continue;
-    const key=`${row.origin}|${row.flight_type}|${row.dest}`,old=best.get(key);if(!old||Number(row.price)<Number(old.price)||Number(row.price)===Number(old.price)&&String(row.updated_at).localeCompare(String(old.updated_at))>0)best.set(key,row);}
-  const grouped={};for(const row of best.values())(grouped[`${row.origin}|${row.flight_type}`]??=[]).push(row);for(const rows of Object.values(grouped))rows.sort((a,b)=>Number(a.price)-Number(b.price)
-    ||String(b.updated_at).localeCompare(String(a.updated_at))||Number(a.transfers??0)-Number(b.transfers??0)||String(a.departure_at).localeCompare(String(b.departure_at))||String(a.dest).localeCompare(String(b.dest)));
-  return grouped;}
-// `plan.replacements` is cached and reused for every 30-minute cycle until the daily snapshot
-// changes (see the coordinator's `store.plan(...roulette-${snapshotId}...)` call), but the live
-// `daily_origin_cheapest_pool` keeps changing under it as OTHER ranks are successfully replaced
-// mid-day. A cached candidate that was free when the plan was built can already be taken by the
-// time this target's turn comes up. Re-checks the exact same identity/membership invariants
-// collection_commit_roulette's replacement guard enforces (destination not already in this
-// origin/snapshot's live pool, not the ticket's own destination, in-horizon dates, matching
-// flight type/transfers) against a FRESH read, so a now-stale candidate is caught and skipped
-// (advance to the next candidate, exactly like a provider no_result) before spending a TP request
-// or a doomed RPC round-trip on it — never by assuming it is invalid merely because it is old.
-export function rouletteCandidateStillEligible(candidate,target,livePoolDests,today){
-  return Boolean(candidate)&&candidate.dest!==target.dest&&candidate.flight_type===target.flight_type
-    &&!livePoolDests.has(`${candidate.origin}|${candidate.dest}`)
-    &&typeof candidate.departure_at==='string'&&candidate.departure_at>=today
-    &&typeof candidate.return_at==='string'&&candidate.return_at>candidate.departure_at
-    &&(candidate.flight_type!=='direct'||Number(candidate.transfers)===0);
-}
-// The one Postgres exception collection_commit_roulette raises for a candidate our own
-// pre-commit checks could not have ruled out in advance. Matched on the exact op AND exact
-// message — never a bare P0001, which several distinct, still-fatal exceptions in the same
-// function also use (invalid roulette ticket, invalid confirmed fare, lease lost, target changed
-// before replacement/sync). This single message covers many distinct validation predicates in
-// the function (destination already in the live pool, price/date/transfer integrity, the
-// observation-freshness window, allowed-destination membership, ...), so from the client alone a
-// match here is NOT proof that this specific candidate is genuinely unavailable — it may equally
-// reflect a technical/data problem with our own submitted observation. Treat every match as an
-// uncertain, technical rejection (see the deferTechnical call at its one call site), never as a
-// confirmed "no alternative" verdict.
-export function isRouletteReplacementRejection(error){
-  return error?.dbOp==='collection_commit_roulette'&&error?.dbMessage==='invalid or stale roulette replacement';
-}
-
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
   const exactKey=t=>[t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|');
@@ -417,14 +379,19 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // separately blocked product/app contract; the scheduler never invents a top-N cap.
   const priority={maxUnitMs:PRIORITY_UNIT_MAX_MS,async step({job,deadline}){
     const previous=structuredClone(job.checkpoint??{});const now=clock();const today=berlinDay(now);
+    const previousDueAt=Number.isFinite(previous.dueAt)?previous.dueAt:Number.isFinite(job.startedAt)?job.startedAt:now;
     const previousRoulette=previous.roulette??null;
     const pendingRoulette=previousRoulette&&!previousRoulette.done?previousRoulette:null;
     const cp=previous.cycle===job.id?previous:{...previous,cycle:job.id,dueAt:job.id*30*60*1000,
       phase:'audit',auditDone:false,auditProcessed:0,
-      roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id}:{cycle:job.id,cursor:0,errors:0,done:false,
-        ...(previousRoulette?.snapshotAt?{snapshotAt:previousRoulette.snapshotAt}:{}),
+      roulette:pendingRoulette?{...pendingRoulette,resumedInCycle:job.id,
+        admittedAt:Number.isFinite(pendingRoulette.admittedAt)?pendingRoulette.admittedAt:
+          Number.isFinite(pendingRoulette.dueAt)?pendingRoulette.dueAt:previousDueAt}:{cycle:job.id,cursor:0,errors:0,done:false,
+        admittedAt:job.id*30*60*1000,
         technicalDeferred:structuredClone(previousRoulette?.technicalDeferred??[]),
         technicalOutcomes:structuredClone(previousRoulette?.technicalOutcomes??[])}};
+    if(cp.roulette&&!cp.roulette.done&&!Number.isFinite(cp.roulette.admittedAt))
+      cp.roulette.admittedAt=Number.isFinite(cp.roulette.dueAt)?cp.roulette.dueAt:previousDueAt;
     deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
     try {
       if(cp.phase==='audit'){
@@ -442,37 +409,32 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_origin_cheapest_pool_latest_snapshot'});
         recordRead('daily_origin_cheapest_pool',latest);
         const latestSnapshot=latest[0]?.snapshot_at??null;
-        if(r.snapshotAt!==latestSnapshot){
-          const invalidated=(r.technicalDeferred??[]).map(item=>({key:item.key,outcome:'context_changed',cycle:cp.cycle,
-            ...(item.candidateKey?{candidateKey:item.candidateKey}:{})}));
-          r.technicalOutcomes=[...(r.technicalOutcomes??[]),...invalidated].slice(-220);
-          r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;r.technicalDeferred=[];
-          delete r.pendingReplacement;delete r.usedReplacementDests;delete r.replaced;delete r.exhausted;}
-        const snapshotId=String(Math.max(0,Date.parse(latestSnapshot??'')||0));
+        // Once admitted, a sub-pass owns one immutable snapshot and cadence instant until its
+        // cursor genuinely reaches total. A later scheduler cycle may observe a newer snapshot,
+        // but it must finish this admitted set before a future pass can adopt that snapshot.
+        if(!Object.hasOwn(r,'snapshotAt')){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;r.technicalDeferred=[];}
+        const admittedSnapshot=r.snapshotAt;
+        const snapshotId=String(Math.max(0,Date.parse(admittedSnapshot??'')||0));
         // Keyed only by snapshot (not r.cycle): the plan is a daily artifact, built once per
         // snapshot and reused for every 30-minute cycle until the snapshot changes (see the
         // snapshotAt reset above). Previously keying on r.cycle rebuilt this every cycle and
-        // re-read the full offers table each time.
+        // re-read the pool each time. Membership is immutable; refresh never needs an alternative-
+        // city offers query.
         const plan=await store.plan(`coordinator/roulette-${snapshotId}-0.json`,async()=>{
-          if(!latestSnapshot)return{tickets:[],snapshotAt:null,allowedDests:[],replacements:{}};
+          if(!admittedSnapshot)return{tickets:[],snapshotAt:null};
           const tickets=await load('daily_origin_cheapest_pool','observed_on,snapshot_at,origin,dest,flight_type,departure_at,return_at,rank,price,transfers,market,source_updated_at,price_source',
-            ['origin','flight_type','rank'],q=>q.eq('snapshot_at',latestSnapshot),deadline);
+            ['origin','flight_type','rank'],q=>q.eq('snapshot_at',admittedSnapshot),deadline);
           if(tickets.length>220)throw new Error(`Roulette pool exceeds 22 origins × 10 tickets (${tickets.length}>220)`);
           const eligible=tickets.filter(t=>t.departure_at>=today&&t.return_at>t.departure_at);
-          const allowedDests=catalogue(Number(process.env.SNAPSHOT_EXPANSION_WAVE??0)).map(item=>item.iata);
-          const origins=[...new Set(eligible.map(t=>t.origin))];
-          const offers=origins.length?await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
-            ['origin','dest','month','flight_type','departure_at','return_at'],q=>q.in('origin',origins).in('dest',allowedDests)
-              .gte('departure_at',today).gte('updated_at',new Date(clock()-36*60*60*1000).toISOString()).gt('price',0),deadline):[];
-          return{tickets:eligible,snapshotAt:latestSnapshot,allowedDests,replacements:buildRouletteReplacementCandidates(offers,eligible,allowedDests,today)};
+          return{tickets:eligible,snapshotAt:admittedSnapshot};
         });
-        // PILOT (off by default): the full daily pool/plan/replacement pool are cached and left
+        // PILOT (off by default): the full daily pool/plan is cached and left
         // exactly as-is (membership/rank/dest never depend on time of day); only which of THIS
         // cycle's tickets get a price re-confirmation is narrowed by market-local time of day.
         // Filtered here (not inside store.plan's cached builder) so the cache stays the full,
         // stable daily set and this filter is always re-evaluated fresh every cycle.
-        const effectiveTickets=pilotMarketSchedule?plan.tickets.filter(t=>originDueThisCycle(clock(),t.origin)):plan.tickets;
-        const ticketPayload=ticket=>({...ticket,month:ticket.departure_at.slice(0,7),allowed_dests:plan.allowedDests,run_id:store.runId});
+        const effectiveTickets=pilotMarketSchedule?plan.tickets.filter(t=>originDueThisCycle(r.admittedAt,t.origin)):plan.tickets;
+        const ticketPayload=ticket=>({...ticket,month:ticket.departure_at.slice(0,7),run_id:store.runId});
         const safeToken=value=>typeof value==='string'&&/^[A-Za-z0-9_.:-]{1,80}$/.test(value)?value:undefined;
         const safeDiagnostic=(response,outcome,error)=>({
           ...(safeToken(response?.kind)?{providerKind:safeToken(response.kind)}:{}),
@@ -480,127 +442,23 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           ...(safeToken(response?.refusal)?{refusal:safeToken(response.refusal)}:{}),
           ...(safeToken(outcome?.detail)?{classifierDetail:safeToken(outcome.detail)}:{}),
           ...(safeToken(error?.dbCode)?{storageCode:safeToken(error.dbCode)}:{}),
-          ...(isRouletteReplacementRejection(error)?{storageDetail:'invalid_or_stale_replacement'}:{}),
         });
         const ticketIdentity=ticket=>({origin:ticket.origin,dest:ticket.dest,flight_type:ticket.flight_type,
           departure_at:ticket.departure_at,return_at:ticket.return_at,rank:ticket.rank,snapshot_at:ticket.snapshot_at});
-        const recordTechnicalOutcome=(ticket,outcome,{candidate=null}={})=>{const key=exactKey(ticket);
+        const recordTechnicalOutcome=(ticket,outcome)=>{const key=exactKey(ticket);
           const deferred=(r.technicalDeferred??[]).find(item=>item.key===key);if(!deferred)return;
           r.technicalDeferred=r.technicalDeferred.filter(item=>item.key!==key);
-          const candidateKey=candidate?exactKey(candidate):deferred.candidateKey;
-          const result={key,outcome,...(candidateKey?{candidateKey}:{}),cycle:cp.cycle};
+          const result={key,outcome,cycle:cp.cycle};
           r.technicalOutcomes=[...(r.technicalOutcomes??[]).filter(item=>item.key!==key),result].slice(-220);
         };
-        const deferTechnical=(ticket,stage,{candidate=null,response=null,outcome=null,error=null}={})=>{const key=exactKey(ticket);
-          const old=(r.technicalDeferred??[]).find(item=>item.key===key),candidateCursor=r.pendingReplacement?.candidateCursor;
-          const item={key,stage,outcome:'technical_failure',cycle:cp.cycle,firstCycle:old?.firstCycle??old?.cycle??cp.cycle,
-            attempts:(old?.attempts??0)+1,ticket:ticketIdentity(ticket),...safeDiagnostic(response,outcome,error),
-            ...(candidate?{candidateKey:exactKey(candidate)}:{}),
-            ...(stage==='replacement'&&Number.isInteger(candidateCursor)?{candidateCursor}:{})};
+        const deferTechnical=(ticket,{response=null,outcome=null,error=null}={})=>{const key=exactKey(ticket);
+          const old=(r.technicalDeferred??[]).find(item=>item.key===key);
+          const item={key,stage:'ticket',outcome:'technical_failure',cycle:cp.cycle,firstCycle:old?.firstCycle??old?.cycle??cp.cycle,
+            attempts:(old?.attempts??0)+1,ticket:ticketIdentity(ticket),...safeDiagnostic(response,outcome,error)};
           r.errors++;r.technicalDeferred=[...(r.technicalDeferred??[]).filter(entry=>entry.key!==key),item];
-          r.cursor++;delete r.pendingReplacement;};
-        const currentTicket=effectiveTickets[r.cursor];
-        const retained=currentTicket?(r.technicalDeferred??[]).find(item=>item.key===exactKey(currentTicket)&&item.stage==='replacement'):null;
-        if(!r.pendingReplacement&&retained?.candidateKey&&retained.ticket?.snapshot_at===plan.snapshotAt
-            &&retained.ticket.rank===currentTicket.rank){
-          const candidates=plan.replacements[`${currentTicket.origin}|${currentTicket.flight_type}`]??[];
-          const candidateCursor=candidates.findIndex(candidate=>exactKey(candidate)===retained.candidateKey);
-          if(candidateCursor>=0)r.pendingReplacement={ticket:currentTicket,candidateCursor,candidateKey:retained.candidateKey};
-        }
-        if(r.pendingReplacement){
-          const target=r.pendingReplacement.ticket,candidates=plan.replacements[`${target.origin}|${target.flight_type}`]??[];
-          // Reconcile before ever picking a candidate: a resumed/replayed pending target may
-          // already have been resolved by a prior attempt that crashed after
-          // collection_commit_roulette's RPC succeeded but before this checkpoint/revival was
-          // saved. That RPC's own event-key guard silently returns true for ANY replacement
-          // payload once this exact old ticket's slot is resolved — an RPC "true" on a replay can
-          // never prove the candidate WE are about to submit is the one that was actually
-          // applied. Look up the authoritative audit row for this exact old-ticket identity
-          // (matched on the recorded old_ticket fields, never a client-reconstructed event key —
-          // snapshot_at is a timestamptz and Postgres's own text formatting of it is not something
-          // to reproduce client-side) before choosing another candidate.
-          const audit=await load('roulette_pool_replacements','old_ticket,new_ticket,outcome',[],
-            q=>q.eq('snapshot_at',target.snapshot_at).eq('origin',target.origin).eq('rank',target.rank),deadline);
-          const resolved=audit.find(row=>row.old_ticket?.flight_type===target.flight_type&&row.old_ticket?.dest===target.dest
-            &&row.old_ticket?.departure_at===target.departure_at&&row.old_ticket?.return_at===target.return_at);
-          if(resolved){
-            if(resolved.outcome==='replaced'&&resolved.new_ticket){
-              const applied=resolved.new_ticket,usedKey=`${applied.origin}|${applied.dest}`;
-              if(!(r.usedReplacementDests??[]).includes(usedKey)){
-                // Authoritative identity straight from the audit row; the observation time comes
-                // from the offers row that same commit wrote — never a freshly invented
-                // timestamp for a candidate we did not just confirm ourselves.
-                const [confirmed]=await load('offers','updated_at',[],q=>q.eq('origin',applied.origin).eq('dest',applied.dest)
-                  .eq('flight_type',applied.flight_type).eq('departure_at',applied.departure_at).eq('return_at',applied.return_at),deadline);
-                if(!confirmed?.updated_at)throw new Error('Applied roulette replacement is missing its recorded offer');
-                const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:applied.origin,p_dest:applied.dest,
-                  p_observed_at:confirmed.updated_at}),deadline,{retry:true,op:'collection_revive_route'});
-                if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
-                r.usedReplacementDests=[...(r.usedReplacementDests??[]),usedKey];
-              }
-              recordTechnicalOutcome(target,'replaced',{candidate:applied});
-              r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
-            }else{
-              recordTechnicalOutcome(target,'exhausted');
-              r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
-            }
-            r.total=effectiveTickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
-            return{status:'progress',checkpoint:cp};
-          }
-          // Fresh, cheap (per-origin, <=10 rows), read-committed truth of what this snapshot's
-          // pool currently holds for this origin — the cached `candidates` list can be hours
-          // stale against it (see rouletteCandidateStillEligible above).
-          const livePool=await load('daily_origin_cheapest_pool','origin,dest',['dest'],
-            q=>q.eq('snapshot_at',plan.snapshotAt).eq('origin',target.origin),deadline);
-          const livePoolDests=new Set([...(r.usedReplacementDests??[]),...livePool.map(row=>`${row.origin}|${row.dest}`)]);
-          let candidate=candidates[r.pendingReplacement.candidateCursor];
-          while(candidate&&!rouletteCandidateStillEligible(candidate,target,livePoolDests,today))candidate=candidates[++r.pendingReplacement.candidateCursor];
-          if(!candidate){
-            await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement:null}},deadline);
-            recordTechnicalOutcome(target,'exhausted');
-            r.cursor++;r.exhausted=(r.exhausted??0)+1;delete r.pendingReplacement;
-          }else{
-            const params=new URLSearchParams({origin:candidate.origin,destination:candidate.dest,departure_at:candidate.departure_at,
-              return_at:candidate.return_at,direct:String(candidate.flight_type==='direct'),market:marketForOrigin(candidate.origin),currency:'eur',one_way:'false',limit:'500'});
-            const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
-            const outcome=response.kind==='ok'?classifyResponse(response.json,{origin:candidate.origin,dest:candidate.dest,depart:candidate.departure_at,
-              ret:candidate.return_at,mode:candidate.flight_type}):{status:'error',detail:'provider_error'};
-            if(outcome.status==='error')deferTechnical(target,'replacement',{candidate,response,outcome});
-            if(outcome.status==='no_result'){r.pendingReplacement.candidateCursor++;return{status:'progress',checkpoint:cp};}
-            if(outcome.status==='found'){
-              const source=response.json.data.find(row=>classifyResponse({success:true,data:[row]},{origin:candidate.origin,dest:candidate.dest,
-                depart:candidate.departure_at,ret:candidate.return_at,mode:candidate.flight_type}).price===outcome.price);
-              const replacement=withPriceProvenance([{...candidate,...outcome,price:outcome.price,updated_at:new Date(clock()).toISOString(),
-                market:marketForOrigin(candidate.origin),transfers:Number.isInteger(source?.transfers)?source.transfers:candidate.transfers,
-                airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-              try{
-                await commit('collection_commit_roulette',{p_ticket:ticketPayload(target),p_result:{status:'no_result',replacement}},deadline);
-              }catch(error){
-                // Never fatal to the run. But this rejection message covers many distinct
-                // validation predicates (see isRouletteReplacementRejection above) — it is NOT
-                // proof that no alternative exists, only that THIS commit attempt failed for some
-                // uncertain reason. Do not fall through to a false replacement:null/exhausted
-                // conclusion, and do not assume it is safe to keep walking the same cached
-                // candidate list. Defer the whole target as a technical failure (bounded,
-                // non-fatal, retried from a fresh live-pool read next cycle) — the same treatment
-                // an ordinary provider error already gets just above. Any other exception (lease
-                // lost, invalid ticket/fare, target changed under an unrelated fenced attempt,
-                // ...) stays fatal.
-                if(!isRouletteReplacementRejection(error))throw error;
-                deferTechnical(target,'replacement',{candidate,response,outcome,error});
-                return{status:'progress',checkpoint:cp};
-              }
-              const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:candidate.origin,p_dest:candidate.dest,
-                p_observed_at:replacement.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Replacement route revival was not acknowledged');
-              recordTechnicalOutcome(target,'replaced',{candidate});
-              r.usedReplacementDests=[...(r.usedReplacementDests??[]),`${candidate.origin}|${candidate.dest}`];r.cursor++;r.replaced=(r.replaced??0)+1;delete r.pendingReplacement;
-            }
-          }
-          r.total=effectiveTickets.length;r.done=r.cursor>=r.total;cp.phase='weekend';
-          return{status:'progress',checkpoint:cp};
-        }
+          r.cursor++;};
         const ticket=effectiveTickets[r.cursor];
-        if(ticket&&!r.pendingReplacement){
+        if(ticket){
           const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
             direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
           const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
@@ -609,8 +467,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
           const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
             transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          if(result.status==='error')deferTechnical(ticket,'ticket',{response,outcome:result});
-          if(result.status==='no_result'){r.pendingReplacement={ticket,candidateCursor:0};return{status:'progress',checkpoint:cp};}
+          if(result.status==='error')deferTechnical(ticket,{response,outcome:result});
+          if(result.status==='no_result'){
+            await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:result},deadline);
+            recordTechnicalOutcome(ticket,'retained_no_result');r.cursor++;
+          }
           if(result.status==='found'){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
             const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
             p_observed_at:patch.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
@@ -622,7 +483,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       }
       if(cp.phase==='weekend'){
         let w=cp.weekend;
-        if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,passStartedAt:clock()};}
+        if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,
+          passStartedAt:clock(),admittedAt:Number.isFinite(cp.dueAt)?cp.dueAt:now};}
+        if(!Number.isFinite(w.admittedAt))w.admittedAt=Number.isFinite(w.dueAt)?w.dueAt:previousDueAt;
         // Latest-row-only: snapshot_at is UNIQUE on this table (see
         // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
         // same row ascending-order .at(-1) used to, without paging the whole epoch history
@@ -633,9 +496,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         recordRead('daily_window_candidate_epochs',epochs);
         if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.currentDayComplete=false;w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
           return{status:'done',checkpoint:cp};}
-        const epoch=epochs[0],epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
-        const currentDayEpoch=epoch.observed_on===today;
-        if(w.snapshotAt!==epoch.snapshot_at)w={day:today,dayId:w.dayId,cursor:0,done:false,errors:0,passStartedAt:clock(),snapshotAt:epoch.snapshot_at,
+        const latestEpoch=epochs[0];
+        const epoch=w.snapshotAt?{...latestEpoch,snapshot_at:w.snapshotAt,observed_on:w.sourceObservedOn??w.day}:latestEpoch;
+        const epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
+        const currentDayEpoch=epoch.observed_on===w.day;
+        if(!w.snapshotAt)w={...w,cursor:0,snapshotAt:epoch.snapshot_at,
           sourceObservedOn:epoch.observed_on,currentDayComplete:currentDayEpoch,
           ...(currentDayEpoch?{}:{blockedReason:'stale_daily_window_candidate_epoch'})};
         else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
@@ -652,7 +517,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         // the full daily set; only which groups get touched THIS cycle is narrowed by each
         // group's origin's market-local time of day. Every group from one groupWindowConsumerTickets
         // bucket shares one origin (grouped by [origin,dest,departure_at,return_at]).
-        const effectiveGroups=pilotMarketSchedule?plan.groups.filter(g=>originDueThisCycle(clock(),g[0].origin)):plan.groups;
+        const effectiveGroups=pilotMarketSchedule?plan.groups.filter(g=>originDueThisCycle(w.admittedAt,g[0].origin)):plan.groups;
         w.setId=plan.setId;w.total=effectiveGroups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
         const group=effectiveGroups[w.cursor];
         if(group){
