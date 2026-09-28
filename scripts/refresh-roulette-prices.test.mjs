@@ -13,8 +13,10 @@ test('priority-0 roulette recheck is resumable and yields before changing the ne
   assert.match(source, /REFRESH_WORKFLOW_NAME = process\.env\.REFRESH_WORKFLOW_NAME \|\| ROULETTE_REFRESH_WORKFLOW/);
 });
 
-test('price-only refresh does not write the roulette snapshot tables', () => {
-  assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)\.(?:insert|upsert|update|delete)/);
+test('price-only refresh synchronizes exact pool fields and never deletes factual rows', () => {
+  assert.match(source, /daily_origin_cheapest_pool'\)\.update\(poolPatch\)/);
+  assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)\.(?:insert|upsert|delete)/);
   assert.doesNotMatch(source, /daily_origin_cheapest'\)\.(?:insert|upsert|update|delete)/);
   assert.match(source, /from\('offers'\)\.update/);
+  assert.doesNotMatch(source, /from\('offers'\)\.delete/);
 });

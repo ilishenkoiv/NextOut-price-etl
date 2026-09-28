@@ -64,6 +64,34 @@ test('unfinished main retains its date and cursor across midnight and a new runn
   assert.deepEqual(next.checkpoint, { month: 3, route: 18 });
 });
 
+test('completed main immediately creates one unique successor inside the same UTC bucket', () => {
+  const state = freshScheduleState();
+  const completed = prepareJob(state, 'main', Date.parse('2026-09-16T01:00:00Z'));
+  completed.checkpoint = { cursor: 10, total: 10, wave: 43 };
+  completed.done = true;
+  completed.completedAt = Date.parse('2026-09-16T02:00:00Z');
+
+  const successor = prepareJob(state, 'main', Date.parse('2026-09-16T02:01:00Z'));
+  assert.equal(successor.id, completed.id + 1);
+  assert.equal(successor.done, false);
+  assert.equal(successor.checkpoint, null, 'the successor must rebuild its immutable plan from current inputs');
+  assert.equal(successor.startedAt, Date.parse('2026-09-16T02:01:00Z'));
+
+  const repeated = prepareJob(state, 'main', Date.parse('2026-09-16T02:02:00Z'));
+  assert.equal(repeated, successor, 'repeated ticks reuse the unfinished successor instead of duplicating it');
+  assert.equal(repeated.id, successor.id);
+});
+
+test('completed main uses the next UTC bucket when it is newer than the prior identity', () => {
+  const state = freshScheduleState();
+  const completed = prepareJob(state, 'main', Date.parse('2026-09-16T01:00:00Z'));
+  completed.done = true;
+  const nextDay = Date.parse('2026-09-18T01:00:00Z');
+  const successor = prepareJob(state, 'main', nextDay);
+  assert.equal(successor.id, Math.floor(nextDay / MAIN_CYCLE_MS));
+  assert.equal(successor.checkpoint, null);
+});
+
 test('plan month follows Berlin while cycle IDs remain monotonic through DST',()=>{
   const state=freshScheduleState();
   assert.equal(prepareJob(state,'main',Date.parse('2026-09-30T22:30:00Z')).planDate,'2026-10-01');
@@ -130,6 +158,28 @@ test('late GitHub start immediately services the due fast cycle', async () => {
   assert.equal((await engine.tick()).task,'main');
 });
 
+test('remaining MAIN-slot budget advances a same-bucket successor in the same scheduler session', async () => {
+  let mainSteps = 0;
+  const engine = new SequentialSchedule({ clock: () => 4*60000, lease: async () => true,
+    save: async () => {}, handlers: {
+      main: { maxUnitMs: 100, step: async ({ job }) => {
+        mainSteps += 1;
+        return mainSteps === 1
+          ? { status: 'done', checkpoint: { cursor: 1, total: 1, wave: 43, coverageComplete: true } }
+          : { status: 'progress', checkpoint: { cursor: 1, total: 2, wave: 44 } };
+      } },
+    } });
+
+  const completed = await engine.tick();
+  const completedId = engine.state.jobs.main.id;
+  assert.deepEqual({ task: completed.task, status: completed.status }, { task: 'main', status: 'done' });
+  const advanced = await engine.tick();
+  assert.deepEqual({ task: advanced.task, status: advanced.status }, { task: 'main', status: 'progress' });
+  assert.equal(engine.state.jobs.main.id, completedId + 1);
+  assert.equal(engine.state.jobs.main.checkpoint.cursor, 1);
+  assert.equal(engine.state.completedMain, 1, 'only the completed pass is counted');
+});
+
 test('a due priority cycle preempts a long MAIN unit, then MAIN resumes after the priority checkpoint completes',async()=>{
   const ran=[];const state=freshScheduleState();state.frame={cycle:0,phase:2,spentMs:0};
   const engine=new SequentialSchedule({state,clock:()=>4*60000,lease:async()=>true,save:async()=>{},handlers:{
@@ -157,9 +207,12 @@ test('priority cap with less than one max unit remaining cannot deadlock lower p
   assert.equal((await engine.tick()).task,'main');assert.deepEqual(ran,['main']);
 });
 
-test('completed main is counted once; fast completion does not complete main', async () => {
+test('one completed main is counted once while its successor only progresses', async () => {
+  let calls = 0;
   const engine = new SequentialSchedule({ clock: () => 16 * 60000, lease: async () => true,
-    save: async () => {}, handlers: { main: { maxUnitMs: 100, step: async () => ({ status: 'done' }) } } });
+    save: async () => {}, handlers: { main: { maxUnitMs: 100, step: async () => ++calls === 1
+      ? { status: 'done' }
+      : { status: 'progress', checkpoint: { cursor: 1, total: 2 } } } } });
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);
@@ -281,9 +334,12 @@ test('fast is never starved: its own slot still runs fast even while main is at 
 });
 
 test('completed main is still counted once with the guarantee on (snapshot/counting unchanged)', async () => {
+  let calls = 0;
   const engine = new SequentialSchedule({ clock: () => 16 * MINMS, lease: async () => true, save: async () => {},
-    guaranteeDailyMain: true, handlers: { main: { maxUnitMs: 100, step: async () => ({ status: 'done', checkpoint: {
-      cursor: 5,total: 5,wave:43,coverageComplete:true,outcomes:{attempted:5,confirmedPrice:3,confirmedEmpty:2,unresolved:0,legacyUnclassified:0} } }) } } });
+    guaranteeDailyMain: true, handlers: { main: { maxUnitMs: 100, step: async () => ++calls === 1
+      ? { status: 'done', checkpoint: {
+        cursor: 5,total: 5,wave:43,coverageComplete:true,outcomes:{attempted:5,confirmedPrice:3,confirmedEmpty:2,unresolved:0,legacyUnclassified:0} } }
+      : { status: 'progress', checkpoint: { cursor: 1, total: 5, wave: 44 } } } } });
   await engine.tick();
   await engine.tick();
   assert.equal(engine.state.completedMain, 1);

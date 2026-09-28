@@ -2,9 +2,8 @@ import { withSupabaseRetry, retryMetadataFetch } from './supabase-retry.mjs';
 // Revalidate only the exact tickets present in the latest roulette snapshot.
 //
 // This is deliberately separate from the main month sweep. It makes at most one partner request
-// per current roulette ticket, updates a confirmed fare in-place, and deletes that exact cached
-// offer only when a successful upstream response confirms it is no longer available. Network,
-// HTTP and malformed-body failures never destroy the last known offer.
+// per current roulette ticket and updates a confirmed fare in-place. Every non-found outcome
+// retains the last known offer and pool price; refresh never changes membership or deletes facts.
 
 import { withPriceProvenance } from './price-provenance.mjs';
 import { githubIsIdle } from './check-flight-price-feedback.mjs';
@@ -122,6 +121,13 @@ function matchOffer(query, ticket) {
   return matched;
 }
 
+function matchPool(query,ticket){
+  let matched=query.eq('snapshot_at',ticket.snapshot_at).eq('origin',ticket.origin)
+    .eq('flight_type',ticket.flight_type).eq('rank',ticket.rank).eq('dest',ticket.dest)
+    .eq('departure_at',ticket.departure_at);
+  return ticket.return_at?matched.eq('return_at',ticket.return_at):matched.is('return_at',null);
+}
+
 async function latestPool(supabase) {
   const { data: latest, error: latestError } = await withSupabaseRetry(() => supabase
     .from('daily_origin_cheapest_pool')
@@ -136,7 +142,7 @@ async function latestPool(supabase) {
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await withSupabaseRetry(() => supabase
       .from('daily_origin_cheapest_pool')
-      .select('origin,dest,flight_type,departure_at,return_at,price,snapshot_at')
+      .select('origin,dest,flight_type,departure_at,return_at,price,snapshot_at,rank')
       .eq('snapshot_at', latest.snapshot_at)
       .order('origin').order('rank')
       .range(from, from + PAGE - 1), {label:'roulette pool page'});
@@ -206,11 +212,13 @@ async function main() {
       const [patch] = withPriceProvenance([{ price: result.fare.price, transfers: result.fare.transfers, airline: result.fare.airline, updated_at: updatedAt, flight_type: ticket.flight_type, market: marketForOrigin(ticket.origin) }], 'offers');
       const { error } = await withSupabaseRetry(() => matchOffer(supabase.from('offers').update(patch), ticket), {label:'roulette offer update'});
       if (error) throw new Error(`offer update failed for ${ticketKey(ticket)}: ${error.message}`);
+      const poolPatch={price:patch.price,transfers:patch.transfers,source_updated_at:patch.updated_at,price_source:patch.price_source};
+      const {error:poolError}=await withSupabaseRetry(()=>matchPool(supabase.from('daily_origin_cheapest_pool').update(poolPatch),ticket),
+        {label:'roulette pool price update'});
+      if(poolError)throw new Error(`pool price update failed for ${ticketKey(ticket)}: ${poolError.message}`);
       counts.found += 1;
       if (Number(ticket.price) !== result.fare.price) counts.changed += 1;
     } else if (result.status === 'unavailable') {
-      const { error } = await withSupabaseRetry(() => matchOffer(supabase.from('offers').delete(), ticket), {label:'roulette offer delete'});
-      if (error) throw new Error(`offer delete failed for ${ticketKey(ticket)}: ${error.message}`);
       counts.unavailable += 1;
     } else {
       counts.error += 1;

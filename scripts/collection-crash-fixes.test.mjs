@@ -15,10 +15,11 @@ const { runDueDailySelection } = await import('./run-collection.mjs');
 // snapshot-daily-origin-cheapest.mjs's main() calls on `supabase.from('offers')...`.
 const settle = (result) => ({ then: (onFulfilled, onRejected) => Promise.resolve(result).then(onFulfilled, onRejected) });
 
-const freshOffer = { origin: 'BER', market: 'de', dest: 'BCN', flight_type: 'any', price: 120,
-  departure_at: '2027-01-10', return_at: '2027-01-17', transfers: 1, updated_at: '2026-09-25T05:00:00.000Z', price_source: null };
+const freshOffers = ['AMS','ATH','BCN','FCO','IST','LIS','PMI','PRG','VIE','ZRH'].map((dest,index)=>({
+  origin:'BER',market:'de',dest,flight_type:'any',price:120+index,departure_at:'2027-01-10',return_at:'2027-01-17',
+  transfers:1,updated_at:'2026-09-25T05:00:00.000Z',price_source:null}));
 
-function stubDb({ offers = [freshOffer], publish = true } = {}) {
+function stubDb({ offers = freshOffers, publish = true } = {}) {
   const chain = {
     select() { return chain; }, gte() { return chain; }, gt() { return chain; }, order() { return chain; },
     range: () => settle({ data: offers, error: null }),
@@ -31,14 +32,14 @@ function stubDb({ offers = [freshOffer], publish = true } = {}) {
 // normalizeInstant/freshOriginFraction) against the current always-publish behavior.
 test('main({snapshotAt: ISO string, pilotMarketSchedule: true}) with a stub DB does not crash', async () => {
   const db = stubDb();
-  const result = await publishDailyRoulette({ db, snapshotAt: '2026-09-25T07:00:00.000Z', pilotMarketSchedule: true });
+  const result = await publishDailyRoulette({ db, snapshotAt: '2026-09-25T07:00:00.000Z', pilotMarketSchedule:true,expectedOrigins:['BER'] });
   assert.equal(result.rebuilt, true);
   assert.ok(typeof result.freshFraction === 'number', 'freshness is computed and returned, never gates the publish');
 });
 
 test('main() also accepts a numeric snapshotAt (unchanged behavior) and treats an unparsable instant as a clear error, not a crash', async () => {
   const db = stubDb();
-  const result = await publishDailyRoulette({ db, snapshotAt: Date.parse('2026-09-25T07:00:00.000Z'), pilotMarketSchedule: true });
+  const result = await publishDailyRoulette({ db, snapshotAt: Date.parse('2026-09-25T07:00:00.000Z'), pilotMarketSchedule:true,expectedOrigins:['BER'] });
   assert.equal(result.rebuilt, true);
   await assert.rejects(() => publishDailyRoulette({ db, snapshotAt: 'not-a-date' }), /Invalid snapshot instant/);
 });
@@ -50,7 +51,7 @@ test('runDueDailySelection with the real publishRoulette and a string-time snaps
   const db = stubDb();
   const result = await runDueDailySelection({
     state, store, db, wave: 0, instant, pilotMarketSchedule: true,
-    publishRoulette: (args) => publishDailyRoulette({ ...args, db }),
+    publishRoulette: (args) => publishDailyRoulette({ ...args, db,expectedOrigins:['BER'] }),
     publishWindows: async () => ({ published: true }),
   });
   assert.equal(result.published, true);

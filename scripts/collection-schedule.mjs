@@ -124,8 +124,18 @@ export function prepareJob(state, task, timestamp) {
     state.missedPriority += Math.max(0,requestedId-current.id-(current.done?1:0));
   // An unfinished main/tail/maintenance pass survives midnight, missed slots and
   // runner replacement. Never advance its plan date just because time advanced.
-  if (current && (current.id === requestedId || (!current.done && task !== 'fast' && task !== 'priority'))) return current;
-  const next = newJob(task, requestedId, timestamp);
+  if (current && !current.done && task !== 'fast' && task !== 'priority') return current;
+  // MAIN is continuous rather than bucket-capped: once a pass completes, its successor must get
+  // a fresh durable identity immediately, even when both passes start inside the same UTC 24-hour
+  // bucket. Keeping the id numeric and monotonic preserves the bigint route-observation contract;
+  // the null checkpoint and distinct durable-plan key make every successor rebuild from current
+  // dead/evidence/sample/revival/watch/expansion inputs. Once created, the unfinished guard above
+  // makes repeated ticks reuse that successor instead of creating duplicates.
+  const nextId = task === 'main' && current?.done
+    ? Math.max(requestedId, Number(current.id) + 1)
+    : requestedId;
+  if (current && current.id === nextId) return current;
+  const next = newJob(task, nextId, timestamp);
   // The daily weekend-refresh cursor lives across 30-minute priority cycles. Each cycle gets a
   // fresh due/deadline identity while retaining the stable daily-set checkpoint.
   if (task === 'priority' && current?.checkpoint) next.checkpoint = structuredClone(current.checkpoint);
