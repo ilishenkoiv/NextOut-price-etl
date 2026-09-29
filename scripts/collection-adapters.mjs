@@ -17,6 +17,7 @@ import { retentionCutoff, shouldDeleteSnapshot, positiveDays, SNAPSHOT_RETENTION
 import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
+import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -290,7 +291,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         outcome:outcome.status==='no_result'?'empty':'http_error',detail:outcome.detail,checked_at:now };
     }
     if(ticket.snapshot_at&&ticket.position&&ticket.destination_id){const candidateResult=fare?{status:'found',price:fare.price,
-      transfers:fare.transfers,airline:fare.airline,updated_at:fare.updated_at,checked_at:fare.updated_at,price_source:fare.price_source}
+      transfers:fare.transfers,airline:fare.airline,updated_at:fare.updated_at,checked_at:fare.updated_at,
+      price_source:preserveCarouselSixMonthMinimum(fare.price_source,ticket.price_source)}
       :{status:outcome.status,detail:outcome.detail};
       await commit('collection_commit_window_candidate',{p_ticket:ticket,p_result:candidateResult},deadline);
     }else await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
@@ -506,7 +508,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
           if(currentDayEpoch)delete w.blockedReason;else w.blockedReason='stale_daily_window_candidate_epoch';}
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
-          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status',
+          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status,price_source',
             ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
           const selected=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
             updated_at:t.exact_observed_at}));

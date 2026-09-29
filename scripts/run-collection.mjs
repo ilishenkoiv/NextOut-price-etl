@@ -11,6 +11,9 @@ import { publishPilotState } from './pilot-price-metadata.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
+import { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
+
+export { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
 
 // Headroom an off-cycle (priority-not-due) trigger must always leave before the next real due
 // (priority) cycle. Generous relative to observed GH Actions/DB overhead (a due session's own
@@ -27,9 +30,9 @@ export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
 // Post-selection point-refresh budget: how long, at most, the same session spends confirming the
 // day's freshly-selected tickets via the provider (select -> point-refresh -> publish) before
 // moving on. Capped independently of the session length so a huge pool never starves MAIN/FAST.
-export const DAILY_SELECTION_REFRESH_MAX_MS = 10 * 60_000;
-// Always leave at least this much of the session for MAIN/priority/etc after selection+refresh.
-export const DAILY_SELECTION_REFRESH_RESERVE_MS = 5 * 60_000;
+// Always leave at least DAILY_SELECTION_REFRESH_RESERVE_MS of the session for MAIN/priority/etc
+// after selection+refresh. Both unchanged values live in daily-selection-budget.mjs so the manual
+// recovery publisher uses the same refresh cap.
 
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;

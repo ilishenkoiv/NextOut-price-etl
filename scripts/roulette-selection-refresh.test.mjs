@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 
 process.env.SUPABASE_SERVICE_KEY??='test-service-key';
-const {main:publishSnapshot,assertCompleteDailyRoulettePool}=await import('./snapshot-daily-origin-cheapest.mjs');
+const {main:publishSnapshot,manualRecoveryMain,assertCompleteDailyRoulettePool}=await import('./snapshot-daily-origin-cheapest.mjs');
 const {createAdapters}=await import('./collection-adapters.mjs');
 const {capRefreshTickets,MAX_REFRESH_TICKETS}=await import('./refresh-roulette-prices.mjs');
 
@@ -28,6 +28,24 @@ test('daily owner publishes ten fixed ranked cities and force never asks SQL to 
 test('daily owner reports the immutable same-day SQL no-op',async()=>{
   const db=selectionDb({published:false});const result=await publishSnapshot({db,snapshotAt:'2027-01-05T22:00:00Z',force:true,expectedOrigins:['BER']});
   assert.deepEqual(result,{rebuilt:false,observedOn:'2027-01-05',snapshotAt:null,reason:'already_published'});
+});
+
+test('manual origin recovery requires TP_TOKEN before provider construction or any publication RPC',async()=>{
+  const db=selectionDb();let constructed=false;
+  await assert.rejects(()=>manualRecoveryMain({env:{},db,snapshotAt:'2027-01-05T12:00:00Z',force:true,expectedOrigins:new Set(['BER']),
+    providerFactory:()=>{constructed=true;throw new Error('must not construct');}}),/requires TP_TOKEN/);
+  assert.equal(constructed,false);assert.equal(db.writes.length,0);
+  const workflow=readFileSync(new URL('../.github/workflows/nightly-cheapest-selection.yml',import.meta.url),'utf8');
+  assert.match(workflow,/Select the daily cheapest pool[\s\S]*TP_TOKEN: \$\{\{ secrets\.TP_TOKEN \}\}[\s\S]*snapshot-daily-origin-cheapest\.mjs/,
+    'the earlier origin publication step must receive TP_TOKEN, not only the later window step');
+});
+
+test('actual manual origin path attempts selected tickets and fails closed before publication when the sweep is incomplete',async()=>{
+  const db=selectionDb();let now=1000,requests=0;
+  await assert.rejects(()=>manualRecoveryMain({env:{TP_TOKEN:'test-token'},db,snapshotAt:'2027-01-05T12:00:00Z',force:true,
+    expectedOrigins:new Set(['BER']),clock:()=>now,providerFactory:()=>({request:async()=>{requests++;now=700000;return{kind:'refused',refusal:'server'};}})}),
+    /refused incomplete point refresh \(1\/10\)/);
+  assert.equal(requests,1);assert.equal(db.writes.length,0,'incomplete selected-ticket attempts must not reach publish_daily_cheapest_selection');
 });
 
 test('JavaScript publication guard rejects fewer than ten, duplicate cities, rank gaps and non-positive prices',()=>{

@@ -62,14 +62,19 @@ export function computeAllWindows(holidays, regions, today, { horizonMonths = 6,
       holidays.filter((h) => h.country === country && (h.level === 'country' || h.subdivision_code === region)).map((h) => h.date),
     )].sort();
     for (const b of buildBlocks(dates)) {
-      const starts = SHORT_SCHEMES[dow(b.first)];
-      const rets = SHORT_SCHEMES[dow(b.last)];
+      // A public-holiday block may end on Saturday/Sunday (Christmas 2026 is Fri+Sat).
+      // Weekend endpoints have no independent short scheme, so anchor that edge to the preceding
+      // Friday instead of silently deleting the whole Christmas window.
+      const startAnchor = SHORT_SCHEMES[dow(b.first)].length ? b.first : addDays(b.first, dow(b.first) === 6 ? -1 : -2);
+      const endAnchor = SHORT_SCHEMES[dow(b.last)].length ? b.last : addDays(b.last, dow(b.last) === 6 ? -1 : -2);
+      const starts = SHORT_SCHEMES[dow(startAnchor)];
+      const rets = SHORT_SCHEMES[dow(endAnchor)];
       if (!starts.length || !rets.length) continue;
       const n = Math.max(starts.length, rets.length);
       let best = null;
       for (let i = 0; i < n; i += 1) {
-        const dep = addDays(b.first, starts[i % starts.length][0]);
-        const ret = addDays(b.last, rets[i % rets.length][1]);
+        const dep = addDays(startAnchor, starts[i % starts.length][0]);
+        const ret = addDays(endAnchor, rets[i % rets.length][1]);
         if (!best || dep < best.dep) best = { dep, ret };
       }
       if (best) add({ start: best.dep, end: best.ret, nights: nightsBetween(best.dep, best.ret), kind: 'holiday' });
