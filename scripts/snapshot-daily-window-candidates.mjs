@@ -8,6 +8,10 @@ import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { recordRead } from './collection-egress.mjs';
 import { pointRefreshTickets, ticketKey } from './daily-selection-refresh.mjs';
+import { horizon } from './collection-planning.mjs';
+import { attachCarouselSixMonthMinimum, preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
+import { CollectionProvider } from './collection-provider.mjs';
+import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 
 const PAGE=1000,CONTRACT_VERSION=1;
 const addDays=(iso,n)=>{const d=new Date(iso+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
@@ -21,23 +25,29 @@ export function buildWindowRegionMap(holidays,regions,today){const result=new Ma
   return result;
 }
 
-export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],regions=[],wave=0}={}){
+export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],regions=[],originRegions=[],wave=0}={}){
   const min=addDays(today,10),max=addMonths(today,4),allowedDests=publishedSnapshotDestinations(wave),allowedOrigins=publishedSnapshotOrigins();
   const factual=computeAllWindows(holidays,regions,today,{horizonMonths:4});const factualByKey=new Map(factual.map(w=>[windowKey(w.start,w.end),w]));
-  const regionMap=buildWindowRegionMap(holidays,regions,today),freshCutoff=Date.parse(snapshotAt)-36*60*60*1000;
+  const weekends=new Set(computeAllWindows([],[],today,{horizonMonths:4}).map(w=>windowKey(w.start,w.end)));
+  const regionMap=buildWindowRegionMap(holidays,regions,today);
+  const regionForOrigin=new Map(originRegions.map(row=>[row.airport,row.calendar_subdivision_code]));
   const exact=new Map();
-  for(const row of rows){const w=factualByKey.get(windowKey(row.departure_at,row.return_at)),updated=Date.parse(row.updated_at);
+  for(const row of rows){const key=windowKey(row.departure_at,row.return_at),w=factualByKey.get(key),updated=Date.parse(row.updated_at);
     if(!w||!allowedOrigins.has(row.origin)||!allowedDests.has(row.dest)||!destinationIdForIata(row.dest)||row.departure_at<min||row.departure_at>max
-      ||row.return_at<=row.departure_at||!['direct','any'].includes(row.flight_type)||!(Number(row.price)>0)||!Number.isFinite(updated)||updated<freshCutoff)continue;
-    const key=routeKey(row),entry=exact.get(key)??{direct:null,any:null,window:w};const old=entry[row.flight_type];
+      ||row.return_at<=row.departure_at||!['direct','any'].includes(row.flight_type)||!(Number(row.price)>0)||!Number.isFinite(updated))continue;
+    const holidayRegions=[...(regionMap.get(key)??[])].sort(),originRegion=regionForOrigin.get(row.origin);
+    const window=originRegion&&holidayRegions.includes(originRegion)?{...w,kind:'holiday',regionCodes:[originRegion]}:
+      weekends.has(key)?{...w,kind:'weekend',regionCodes:[]}:null;
+    if(!window)continue;
+    const route=routeKey(row),entry=exact.get(route)??{direct:null,any:null,window};const old=entry[row.flight_type];
     if(!old||Number(row.price)<Number(old.price)||Number(row.price)===Number(old.price)&&String(row.updated_at).localeCompare(String(old.updated_at))>0)entry[row.flight_type]=row;
-    exact.set(key,entry);
+    exact.set(route,entry);
   }
   const candidates=[];
   for(const entry of exact.values()){const rowsByMode=[entry.direct&&{mode:'direct',row:entry.direct},(entry.direct||entry.any)&&{mode:'any',row:
       [entry.direct,entry.any].filter(Boolean).sort((a,b)=>Number(a.price)-Number(b.price)||String(b.updated_at).localeCompare(String(a.updated_at)))[0]}].filter(Boolean);
     for(const {mode,row} of rowsByMode)candidates.push({contract_version:CONTRACT_VERSION,observed_on:today,snapshot_at:snapshotAt,
-      origin:row.origin,market:marketForOrigin(row.origin),flight_type:mode,region_codes:entry.window.kind==='holiday'?[...(regionMap.get(windowKey(row.departure_at,row.return_at))??[])].sort():[],
+      origin:row.origin,market:marketForOrigin(row.origin),flight_type:mode,region_codes:entry.window.regionCodes,
       window_kind:entry.window.kind,departure_at:row.departure_at,return_at:row.return_at,dest:row.dest,destination_id:destinationIdForIata(row.dest),
       exact_price:Number(row.price),currency:'EUR',transfers:Number.isInteger(row.transfers)?row.transfers:null,airline:row.airline??null,
       exact_observed_at:row.updated_at,refresh_status:'fresh',refresh_checked_at:row.updated_at,last_error_kind:null,price_source:row.price_source??null});}
@@ -52,7 +62,7 @@ async function loadAll(db,table,columns,order,filter){const out=[];for(let from=
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
-  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now}={}){
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now}={}){
   const today=berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — see the
   // matching comment in snapshot-daily-origin-cheapest.mjs's main().
@@ -60,20 +70,23 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
-  // Same date window (min..max) and freshness cutoff (36h) that selectDailyWindowCandidates
-  // enforces below, pushed into the query so the DB does the row elimination instead of
-  // shipping the full window_prices table over the wire on every run.
-  const windowMin=addDays(today,10),windowMax=addMonths(today,4),freshCutoffIso=new Date(instant-36*60*60*1000).toISOString();
+  // Date bounds stay server-side. Observation age is diagnostic only: a last-known positive exact
+  // window remains eligible and is point-refreshed after selection.
+  const windowMin=addDays(today,10),windowMax=addMonths(today,4);
   const [rows,holidays,originRegions]=await Promise.all([
     loadAll(client,'window_prices','origin,dest,flight_type,departure_at,return_at,price,transfers,airline,updated_at,price_source',['origin','dest','flight_type','departure_at','return_at'],
-      q=>q.gte('departure_at',windowMin).lte('departure_at',windowMax).gte('updated_at',freshCutoffIso)),
+      q=>q.gte('departure_at',windowMin).lte('departure_at',windowMax)),
     loadAll(client,'public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date']),
     loadAll(client,'origin_regions','airport,calendar_subdivision_code',['airport'])]);
   // Selection never waits for freshness — this is observability only (see the
   // daily_selection_published event below), same as the roulette pool.
   const freshFraction=freshOriginFraction(rows,instant,publishedSnapshotOrigins());
   const regions=[...new Set(originRegions.map(r=>r.calendar_subdivision_code).filter(Boolean))].sort();const snapshotAt=new Date(instant).toISOString();
-  const candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,wave});if(!candidates.length)throw new Error('Daily window candidate selection is empty');
+  let candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,originRegions,wave});if(!candidates.length)throw new Error('Daily window candidate selection is empty');
+  const months=horizon(today),origins=[...new Set(candidates.map(row=>row.origin))],dests=[...new Set(candidates.map(row=>row.dest))];
+  const monthlyRows=await loadAll(client,'prices','origin,dest,month,direct,any_stops,updated_at,price_source',['origin','dest','month'],
+    q=>q.in('month',months).in('origin',origins).in('dest',dests));
+  candidates=attachCarouselSixMonthMinimum(candidates,monthlyRows,months);
   // Point-refresh: confirm the SELECTED carousel candidates' exact prices before publishing
   // (order: select -> point-refresh -> publish). Sequential, normal pace, never re-reads
   // window_prices. An unconfirmed 'no_result' marks the row unavailable without touching
@@ -87,11 +100,15 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
     for(let i=0;i<candidates.length;i++){
       const key=ticketKey(candidates[i]),c=confirmed.get(key);
       if(c)candidates[i]={...candidates[i],exact_price:c.price,transfers:c.transfers,airline:c.airline,
-        exact_observed_at:c.updated_at,refresh_status:'fresh',refresh_checked_at:c.updated_at,last_error_kind:null,price_source:c.price_source??candidates[i].price_source};
+        exact_observed_at:c.updated_at,refresh_status:'fresh',refresh_checked_at:c.updated_at,last_error_kind:null,
+        price_source:preserveCarouselSixMonthMinimum(c.price_source,candidates[i].price_source)};
       else if(missed.has(key))candidates[i]={...candidates[i],refresh_status:'unavailable',refresh_checked_at:new Date(clock()).toISOString()};
       else if(errored.has(key))candidates[i]={...candidates[i],refresh_status:'failed',refresh_checked_at:new Date(clock()).toISOString(),
         last_error_kind:'point_refresh_error'};
     }
+  }
+  if(requireCompleteRefresh&&(!provider||refresh.attempted!==refresh.total)){
+    throw new Error(`Manual daily window recovery refused incomplete point refresh (${refresh.attempted}/${refresh.total})`);
   }
   const{data,error}=await client.rpc('publish_daily_window_candidates',{p_observed_on:today,p_snapshot_at:snapshotAt,p_candidates:candidates});if(error)throw error;
   const requestGroups=new Set(candidates.map(routeKey)).size;console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published:data===true,observedOn:today,snapshotAt,
@@ -99,4 +116,13 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   return{published:data===true,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh};
 }
 
-if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main();
+export async function manualRecoveryMain({env=process.env,publish=main,providerFactory=options=>new CollectionProvider(options),clock=Date.now}={}){
+  const token=typeof env.TP_TOKEN==='string'?env.TP_TOKEN.trim():'';
+  if(!token)throw new Error('Manual daily window recovery requires TP_TOKEN; refusing unrefreshed publication');
+  const provider=providerFactory({token,lease:async()=>true,clock});
+  return publish({provider,clock,refreshDeadline:clock()+DAILY_SELECTION_REFRESH_MAX_MS,requireCompleteRefresh:true});
+}
+
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
+  manualRecoveryMain().catch(error=>{console.error(error.message);process.exitCode=1;});
+}

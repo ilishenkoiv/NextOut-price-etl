@@ -38,6 +38,7 @@ jobs:
       - name: Select the shared daily weekend candidates (contract v1)
         env:
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/snapshot-daily-window-candidates.mjs
