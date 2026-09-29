@@ -238,7 +238,27 @@ test('MUC keeps November, DE-BY Christmas/New Year and January candidates withou
 });
 
 test('diversity uses a different priced city first and records a last-resort repeat instead of dropping a window',()=>{
-  const ordered=[{dest:'BCN',exact_price:90},{dest:'FCO',exact_price:100}];
+  const ordered=[{dest:'BCN',exact_price:90},{dest:'FCO',exact_price:100},{dest:'ATH',exact_price:0,
+    price_source:{carousel_six_month_min:{price:50}}}];
   assert.deepEqual(chooseCarouselCityForWindow(ordered,new Set(['BCN'])),{candidate:ordered[1],repeat:false,reason:'different_city'});
   assert.deepEqual(chooseCarouselCityForWindow(ordered,new Set(['BCN','FCO'])),{candidate:ordered[0],repeat:true,reason:'last_resort_no_different_eligible_city'});
+});
+
+test('production publication orders each real window through different-city-first and keeps last-resort repeats',async()=>{
+  const first={departure_at:'2026-10-02',return_at:'2026-10-04'},second={departure_at:'2026-10-09',return_at:'2026-10-11'},
+    third={departure_at:'2026-10-16',return_at:'2026-10-18'};
+  const rows=[row('BCN','any',80,first),row('FCO','any',90,first),row('BCN','any',70,second),row('FCO','any',100,second),
+    row('BCN','any',60,third),row('ATH','any',0,{...third,price_source:{carousel_six_month_min:{price:10}}})];
+  const handle=windowDb(rows);await main({db:handle.db,instant:Date.parse('2026-09-22T04:00:00Z'),force:true});
+  const published=handle.published.p_candidates;
+  const positions=dates=>published.filter(candidate=>candidate.departure_at===dates.departure_at)
+    .sort((a,b)=>a.position-b.position).map(candidate=>candidate.dest);
+  assert.deepEqual(positions(first),['BCN','FCO']);
+  assert.deepEqual(positions(second),['FCO','BCN'],'the real publication caller must invoke different-city-first');
+  assert.deepEqual(positions(third),['BCN'],'no different exact-price-qualified city: keep the last-resort repeat');
+  assert.equal(published.some(candidate=>candidate.dest==='ATH'),false,'six-month minimum alone cannot qualify a ticket');
+  assert.equal(published.length,5,'diversity ordering must not remove fixed positive-price membership');
+  const productionSource=readFileSync(new URL('./snapshot-daily-window-candidates.mjs',import.meta.url),'utf8');
+  assert.match(productionSource,/chooseCarouselCityForWindow\(group,usedCities\)/,
+    'the production publication path must call the approved shared selector, not duplicate or bypass it');
 });

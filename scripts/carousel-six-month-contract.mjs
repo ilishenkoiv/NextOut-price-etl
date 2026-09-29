@@ -34,9 +34,10 @@ export function preserveCarouselSixMonthMinimum(nextExactSource,previousSource){
   return minimum?{...(nextExactSource??{}),carousel_six_month_min:minimum}:nextExactSource??null;
 }
 
-// The app supplies candidates already ordered by the price-gated Dream -> Return -> other rule.
-// This shared contract only applies diversity: another city first, then one explicitly recorded
-// repeat when no different eligible priced city exists. It never drops the window.
+// Callers supply candidates in their approved order (Dream -> Would-return -> other where those
+// personal tiers exist, deterministic exact-ticket price order in the shared publication). This
+// contract only applies diversity: another exact-price-qualified city first, then the first item
+// in that same order as an explicit last-resort repeat. A six-month minimum never qualifies a row.
 export function chooseCarouselCityForWindow(orderedEligible,usedCities){
   const priced=orderedEligible.filter(row=>Number(row.exact_price)>0);if(!priced.length)return null;
   const different=priced.find(row=>!usedCities.has(row.dest));

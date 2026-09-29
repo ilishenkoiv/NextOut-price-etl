@@ -1,5 +1,6 @@
 // Once-per-Berlin-day publication of the complete shared exact-price carousel candidate union.
-// No provider requests: reads existing factual calendars/window_prices and atomically publishes v1.
+// Reads factual calendars/window_prices, point-refreshes selected tickets when supplied a provider,
+// then atomically publishes v1.
 import { pathToFileURL } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import { computeAllWindows } from './collection-windows.mjs';
@@ -9,7 +10,7 @@ import { marketForOrigin } from '../src/data/origin-markets.js';
 import { recordRead } from './collection-egress.mjs';
 import { pointRefreshTickets, ticketKey } from './daily-selection-refresh.mjs';
 import { horizon } from './collection-planning.mjs';
-import { attachCarouselSixMonthMinimum, preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
+import { attachCarouselSixMonthMinimum, chooseCarouselCityForWindow, preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
 import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 
@@ -52,8 +53,16 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
       exact_price:Number(row.price),currency:'EUR',transfers:Number.isInteger(row.transfers)?row.transfers:null,airline:row.airline??null,
       exact_observed_at:row.updated_at,refresh_status:'fresh',refresh_checked_at:row.updated_at,last_error_kind:null,price_source:row.price_source??null});}
   const groups=new Map();for(const row of candidates){const key=[row.origin,row.flight_type,row.departure_at,row.return_at].join('|');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
-  const output=[];for(const group of groups.values()){group.sort((a,b)=>a.exact_price-b.exact_price||String(b.exact_observed_at).localeCompare(String(a.exact_observed_at))
-    ||Number(a.transfers??99)-Number(b.transfers??99)||a.destination_id.localeCompare(b.destination_id));group.forEach((row,index)=>output.push({...row,position:index+1}));}
+  const orderedGroups=[...groups.values()].sort((a,b)=>a[0].origin.localeCompare(b[0].origin)||a[0].flight_type.localeCompare(b[0].flight_type)
+    ||a[0].departure_at.localeCompare(b[0].departure_at)||a[0].return_at.localeCompare(b[0].return_at));
+  const usedBySeries=new Map(),output=[];
+  for(const group of orderedGroups){group.sort((a,b)=>a.exact_price-b.exact_price||String(b.exact_observed_at).localeCompare(String(a.exact_observed_at))
+    ||Number(a.transfers??99)-Number(b.transfers??99)||a.destination_id.localeCompare(b.destination_id));
+    const seriesKey=[group[0].origin,group[0].flight_type].join('|'),usedCities=usedBySeries.get(seriesKey)??new Set();
+    const selection=chooseCarouselCityForWindow(group,usedCities);if(!selection)continue;
+    usedCities.add(selection.candidate.dest);usedBySeries.set(seriesKey,usedCities);
+    const ordered=[selection.candidate,...group.filter(row=>row!==selection.candidate)];
+    ordered.forEach((row,index)=>output.push({...row,position:index+1}));}
   return output.sort((a,b)=>a.origin.localeCompare(b.origin)||a.flight_type.localeCompare(b.flight_type)||a.departure_at.localeCompare(b.departure_at)
     ||a.return_at.localeCompare(b.return_at)||a.position-b.position);
 }

@@ -7,6 +7,8 @@ import { ORIGINS_ALL } from '../src/data/origins.js';
 import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { recordRead } from './collection-egress.mjs';
 import { pointRefreshTickets, ticketKey } from './daily-selection-refresh.mjs';
+import { CollectionProvider } from './collection-provider.mjs';
+import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 
 export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
@@ -157,7 +159,7 @@ export function pilotSourcesReady(rows, instant, expectedOrigins,
 
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
   force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now,
-  expectedOrigins=publishedSnapshotOrigins() } = {}) {
+  expectedOrigins=publishedSnapshotOrigins(),requireCompleteRefresh=false } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
   const instant=normalizeInstant(requestedSnapshotAt??clock());const observedOn = berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — the legacy
@@ -252,6 +254,9 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     for (let i = 0; i < pool.length; i++) pool[i] = apply(pool[i]);
     for (let i = 0; i < chosen.length; i++) chosen[i] = apply(chosen[i]);
   }
+  if(requireCompleteRefresh&&(!provider||refresh.attempted!==refresh.total)){
+    throw new Error(`Manual daily roulette recovery refused incomplete point refresh (${refresh.attempted}/${refresh.total})`);
+  }
 
   const {data:didPublish,error:publishError}=await supabase.rpc('publish_daily_cheapest_selection',{
     p_observed_on:observedOn,p_snapshot_at:snapshotAt,p_rank1:chosen,p_pool:pool,p_force:false});
@@ -263,6 +268,13 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh, rank1Rows: chosen.length, poolRows: pool.length };
 }
 
+export async function manualRecoveryMain({env=process.env,providerFactory=options=>new CollectionProvider(options),clock=Date.now,...options}={}){
+  const token=typeof env.TP_TOKEN==='string'?env.TP_TOKEN.trim():'';
+  if(!token)throw new Error('Manual daily roulette recovery requires TP_TOKEN; refusing unrefreshed publication');
+  const provider=providerFactory({token,lease:async()=>true,clock});
+  return main({...options,provider,clock,refreshDeadline:clock()+DAILY_SELECTION_REFRESH_MAX_MS,requireCompleteRefresh:true});
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => { console.error(error.message || error); process.exit(1); });
+  manualRecoveryMain().catch((error) => { console.error(error.message || error); process.exit(1); });
 }
