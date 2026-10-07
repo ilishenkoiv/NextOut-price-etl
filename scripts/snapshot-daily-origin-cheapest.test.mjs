@@ -32,8 +32,8 @@ test('stores up to ten cheapest unique destinations per origin across any and di
   assert.equal(pool[0].flight_type, 'direct');
 });
 
-test('production selection derives the approved canonical 22 origins from the shared catalogue',()=>{
-  assert.equal(publishedSnapshotOrigins().size,22);
+test('production selection derives the approved 18 active departures from the shared catalogue',()=>{
+  assert.equal(publishedSnapshotOrigins().size,18);
 });
 
 test('MUC Rome date flood occupies one rank and cannot crowd out other cities', () => {

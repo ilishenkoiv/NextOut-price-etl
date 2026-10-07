@@ -1,11 +1,11 @@
 import { DESTINATIONS } from '../src/data/destinations.js';
-import { ORIGINS_ALL } from '../src/data/origins.js';
+import { ORIGINS_ALL, isSuspendedOrigin } from '../src/data/origins.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { routeIsEffectivelyDead } from './route-price-health.mjs';
 import { isPriorityRoute, priorityWatchRouteKeys, PRIORITY_EXOTIC_DESTINATIONS } from './quote-integrity.mjs';
 import { planWindowDestinations } from './window-destination-plan.mjs';
 
-export const WINDOW_ORIGINS = ['BER','FRA','VIE','DUS','HAM','GVA','HHN','MUC','CGN','STR','ZRH','BTS','EIN','BSL','NRN','NUE','LEJ','FMM','DRS','SZG'];
+export const WINDOW_ORIGINS = ['BER','FRA','VIE','DUS','HAM','GVA','HHN','MUC','CGN','STR','ZRH','BTS','EIN','BSL','NRN','NUE','LEJ','FMM','DRS','SZG'].filter(origin => !isSuspendedOrigin(origin));
 export const catalogue = wave => [...DESTINATIONS, ...expansionTargets(wave)];
 function watchKeys(rows,wave){
   return [...new Set([...priorityWatchRouteKeys(rows),...rows.filter(r=>r.watch_scope==='country').flatMap(r=>

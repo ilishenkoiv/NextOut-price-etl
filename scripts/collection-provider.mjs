@@ -1,3 +1,4 @@
+import { isSuspendedOrigin } from '../src/data/origins.js';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 export class CollectionYield extends Error {}
 export class CollectionProvider {
@@ -8,6 +9,8 @@ export class CollectionProvider {
   async request(input, deadline = Infinity) {
     const url = new URL(input);
     if (url.origin !== 'https://api.travelpayouts.com') throw new Error('Unexpected provider origin');
+    // Defence in depth for an old durable plan or feedback ticket. Never fabricate empty data.
+    if (isSuspendedOrigin(url.searchParams.get('origin'))) return { kind: 'suspended' };
     url.searchParams.delete('token'); // use a header, never a credential-bearing loggable URL
     const method = url.pathname;
     const base = method.includes('month-matrix') ? 250 : 125;

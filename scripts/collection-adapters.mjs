@@ -2,6 +2,7 @@ import { probeType, fetchCalendarMonth, selectCombo } from './fetch-prices.mjs';
 import { monthlyQuoteProvenance } from './quote-integrity.mjs';
 import { withPriceProvenance } from './price-provenance.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
+import { isSuspendedOrigin } from '../src/data/origins.js';
 import { mainPlan, tailPlan, fastPlan, nextMonth, horizon, resolveTrancheDests, catalogue } from './collection-planning.mjs';
 import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
@@ -127,7 +128,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const row=rows?.[0];
     if(!row)return{claimed:false};
     const ticket=ticketFromFeedback(row.feedback,today);let outcome={status:'not_requested',detail:'missing_exact_context'};
-    if(ticket){
+    if(ticket && isSuspendedOrigin(ticket.origin)) outcome={status:'error',detail:'departure_suspended'};
+    else if(ticket){
       const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.depart,return_at:ticket.ret,
         direct:String(ticket.mode==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
       const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
@@ -186,6 +188,28 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const cellId=retrying?cp.retryQueue[cp.retryCursor]:(plan.cellOrder ? plan.cellOrder[cp.cursor] : cp.cursor);
           const route = plan.routes[cellId % plan.routes.length];
           const month = plan.months[Math.floor(cellId / plan.routes.length)];
+          if (isSuspendedOrigin(route.origin)) {
+            if (!await store.lease()) throw new Error('Suspended cell advancement forbidden: lease lost');
+            // Advance in the ORIGINAL order, keeping total/object/date/start/wave unchanged.
+            // Suspension is neither a provider attempt nor confirmed-empty/route-dead evidence.
+            if (retrying) {
+              cp.retryNext.push(cellId); cp.retryCursor++;
+              cp.retrySuspendedCells=[...new Set([...(cp.retrySuspendedCells??[]),cellId])];
+              if(cp.retryCursor>=cp.retryQueue.length){
+                cp.retryRound=(cp.retryRound??0)+1;cp.unresolvedCells=[...cp.retryNext];
+                delete cp.retryQueue;delete cp.retryCursor;delete cp.retryNext;
+                break;
+              }
+            } else {
+              cp={...cp,cursor:cp.cursor+1,outcomes:{...cp.outcomes,suspended:(cp.outcomes.suspended??0)+1},
+                suspendedCells:[...(cp.suspendedCells??[]),cellId]};
+              if(cp.cursor===total&&cp.unresolvedCells.length&&(cp.retryRound??0)<MAIN_MAX_RETRY_ROUNDS){
+                cp.retryQueue=[...cp.unresolvedCells];cp.retryCursor=0;cp.retryNext=[];
+                return{status:'yield',checkpoint:cp};
+              }
+            }
+            continue;
+          }
           const request = url => provider.request(url, unitEnd - 9000);
           // Owner invariant: BOTH variants are mandatory for every cell. `any` is the provider's
           // actual direct=false result and may legitimately be cheaper than (or include) direct.
@@ -266,7 +290,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           await query(()=>db.storage.from('price-snapshots').upload(path,body,{contentType:'application/gzip',upsert:true}),unitEnd,{retry:true,op:'price_snapshot_upload'});
           // The pass is complete once its private CSV is preserved. Daily selection remains the
           // coordinator pre-phase and is never coupled to MAIN completion.
-          const coverageComplete=(cp.outcomes.legacyUnclassified??0)===0&&(cp.outcomes.unresolved??0)===0
+          const coverageComplete=(cp.outcomes.suspended??0)===0&&(cp.outcomes.legacyUnclassified??0)===0&&(cp.outcomes.unresolved??0)===0
             &&(cp.outcomes.confirmedPrice??0)+(cp.outcomes.confirmedEmpty??0)===total;
           return {status:'done',checkpoint:{...cp,stage:coverageComplete?'complete':'attempted_complete',coverageComplete,snapshotPath:path}};
         }
@@ -355,6 +379,10 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
               window_kind:window.kind,flight_type:cp.cursor%2===0?'direct':'any'};
           }
           // Priority owns 30-minute freshness for every existing consumer row. FAST and TAIL keep
+          if(isSuspendedOrigin(ticket.origin)){
+            if(!await store.lease())throw new Error('Suspended window advancement forbidden: lease lost');
+            cp={...cp,cursor:cp.cursor+1,total,suspended:(cp.suspended??0)+1};continue;
+          }
           // discovery/watch duties but do not issue a duplicate TP request for an exact key that
           // priority (or another exact writer) already refreshed inside the cadence window.
           if(await windowWasRefreshedRecently(ticket,unitEnd)){
@@ -460,7 +488,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           r.errors++;r.technicalDeferred=[...(r.technicalDeferred??[]).filter(entry=>entry.key!==key),item];
           r.cursor++;};
         const ticket=effectiveTickets[r.cursor];
-        if(ticket){
+        if(ticket && isSuspendedOrigin(ticket.origin)){
+          r.suspended=(r.suspended??0)+1;r.cursor++;
+        } else if(ticket){
           const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,return_at:ticket.return_at,
             direct:String(ticket.flight_type==='direct'),market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
           const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
@@ -523,7 +553,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         w.setId=plan.setId;w.total=effectiveGroups.length;w.totalRows=plan.tickets.length;w.sourceSelectedAt=plan.selectedAt;
         const group=effectiveGroups[w.cursor];
         if(group){
-          if(group[0].departure_at<today){w.cursor++;w.expired=(w.expired??0)+group.length;}
+          if(isSuspendedOrigin(group[0].origin)){w.cursor++;w.suspended=(w.suspended??0)+group.length;}
+          else if(group[0].departure_at<today){w.cursor++;w.expired=(w.expired??0)+group.length;}
           else{const age=Math.max(...group.map(ticket=>Math.max(0,clock()-Date.parse(ticket.updated_at))).filter(Number.isFinite));
             const ok=await exactGroup(group,deadline);w.cursor++;w.errors+=ok?0:1;
             w.oldestAgeMs=Math.max(w.oldestAgeMs??0,Number.isFinite(age)?age:0);w.lastRefreshedAt=clock();}
