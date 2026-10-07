@@ -1,9 +1,12 @@
 import { isSuspendedOrigin } from '../src/data/origins.js';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-export class CollectionYield extends Error {}
+export class CollectionYield extends Error {
+  constructor(message, reason = 'unavailable') { super(message); this.reason = reason; }
+}
 export class CollectionProvider {
   constructor({ token, lease, clock = Date.now, sleep = delay, fetchImpl = fetch }) {
     this.token = token; this.lease = lease; this.clock = clock; this.sleep = sleep; this.fetchImpl = fetchImpl;
+    this.blockedByMethod = new Map();
     this.nextByMethod = new Map(); this.interval = new Map(); this.recent = []; this.requests = 0;
   }
   async request(input, deadline = Infinity) {
@@ -16,10 +19,10 @@ export class CollectionProvider {
     const base = method.includes('month-matrix') ? 250 : 125;
     for (let attempt = 0; attempt < 3; attempt++) {
       const wait = Math.max(0, (this.nextByMethod.get(method) ?? 0) - this.clock());
-      if (this.clock() + wait + 10_000 >= deadline) throw new CollectionYield('Provider unit would cross boundary');
+      if (this.clock() + wait + 10_000 >= deadline) throw new CollectionYield('Provider unit would cross boundary', wait > 0 && this.blockedByMethod.get(method) ? 'backoff' : 'boundary');
       if (wait) await this.sleep(wait);
       if (!await this.lease()) throw new Error('Provider request forbidden: lease lost');
-      if (this.clock()+10000>=deadline) throw new CollectionYield('Lease check consumed provider time budget');
+      if (this.clock()+10000>=deadline) throw new CollectionYield('Lease check consumed provider time budget', 'boundary');
       const requestStarted=this.clock();this.requests++;
       let response;
       try {
@@ -37,6 +40,7 @@ export class CollectionProvider {
         quotaWait = Math.min(65000, Math.max(1000, resetMs || 60000));
       }
       this.nextByMethod.set(method, Math.max(requestStarted + spacing,this.clock()+quotaWait));
+      this.blockedByMethod.set(method, quotaWait > 0);
       const refused = !response || response.status === 429 || response.status >= 500;
       this.recent.push(refused); if (this.recent.length > 200) this.recent.shift();
       if (this.recent.length === 200 && this.recent.filter(Boolean).length > 100) throw new Error('Provider circuit breaker');
@@ -51,6 +55,7 @@ export class CollectionProvider {
       const retryMs = retryAfter == null ? 0 : Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - this.clock();
       const backoff = Math.max([2000, 6000][attempt], Number.isFinite(retryMs) ? Math.min(65000, retryMs) : 0);
       this.nextByMethod.set(method, Math.max(this.nextByMethod.get(method), this.clock() + backoff));
+      this.blockedByMethod.set(method, true);
     }
   }
 }

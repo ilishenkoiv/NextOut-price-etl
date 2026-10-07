@@ -7,6 +7,7 @@ import { mainPlan, tailPlan, fastPlan, nextMonth, horizon, resolveTrancheDests, 
 import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
+import { mainBoundaryStatus } from './main-continuation.mjs';
 import { withSupabaseRetry } from './supabase-retry.mjs';
 import { logDbError, dbErrorCode } from './db-error.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
@@ -74,7 +75,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // every call site below passes one so a failure is traceable to what it was doing, not just
   // reduced to an opaque error code.
   async function query(build, deadline = Infinity, { retry = false, op = 'db_operation' } = {}) {
-    if (clock() + 9000 >= deadline) throw new CollectionYield('Database unit would cross boundary');
+    if (clock() + 9000 >= deadline) throw new CollectionYield('Database unit would cross boundary', 'boundary');
     let attempts = 0;
     const attempt = async () => {
       attempts++;
@@ -150,6 +151,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     async step({ job, deadline }) {
       const unitEnd = Math.min(deadline, clock() + MAIN_UNIT_WORK_MS);
       let cp = job.checkpoint ?? { cursor: 0, errors: 0, wave };
+      const before = { cursor: cp.cursor, retryAttempts: cp.retryAttempts, errors: cp.errors };
+      let requiredProbeFailed = false;
       const pinnedWave=cp.wave??wave;
       cp={...cp,wave:pinnedWave};
       try {
@@ -211,11 +214,19 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             continue;
           }
           const request = url => provider.request(url, unitEnd - 9000);
+          // Latch each required window's technical failure before another probe can yield.
+          // Partial-cell durable accounting remains deferred until the complete cell is committed.
+          const requiredRequest = async url => {
+            const response = await request(url);
+            if(response.kind!=='ok'||!response.json?.success||!Array.isArray(response.json.data))
+              requiredProbeFailed = true;
+            return response;
+          };
           // Owner invariant: BOTH variants are mandatory for every cell. `any` is the provider's
           // actual direct=false result and may legitimately be cheaper than (or include) direct.
           // A boundary/restart between probes leaves cp.cursor unchanged, so both replay safely.
-          const directResult = await probeType(route.origin,route.dest,month,nextMonth(month),true,request);
-          const anyResult = await probeType(route.origin,route.dest,month,nextMonth(month),false,request);
+          const directResult = await probeType(route.origin,route.dest,month,nextMonth(month),true,requiredRequest);
+          const anyResult = await probeType(route.origin,route.dest,month,nextMonth(month),false,requiredRequest);
           let calendarResult = null;
           // Calendar is positive-only supplemental evidence after TWO confirmed-empty required
           // probes. It never masks a failed required probe and never supplies no-price evidence.
@@ -294,9 +305,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             &&(cp.outcomes.confirmedPrice??0)+(cp.outcomes.confirmedEmpty??0)===total;
           return {status:'done',checkpoint:{...cp,stage:coverageComplete?'complete':'attempted_complete',coverageComplete,snapshotPath:path}};
         }
-        return { status:'progress',checkpoint:cp };
+        return { status:mainBoundaryStatus(before,cp,'boundary',requiredProbeFailed),checkpoint:cp };
       } catch (error) {
-        if (error instanceof CollectionYield) return { status:'yield',checkpoint:cp };
+        if (error instanceof CollectionYield) return { status:mainBoundaryStatus(before,cp,error.reason,requiredProbeFailed),checkpoint:cp };
         throw error;
       }
     },
