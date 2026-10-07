@@ -9,7 +9,8 @@ export class CollectionProvider {
     this.blockedByMethod = new Map();
     this.nextByMethod = new Map(); this.interval = new Map(); this.recent = []; this.requests = 0;
   }
-  async request(input, deadline = Infinity) {
+  async request(input, deadline = Infinity, observe = null) {
+    const report=(status,reason)=>{try{observe?.(status,reason);}catch{/* Logging cannot affect requests. */}};
     const url = new URL(input);
     if (url.origin !== 'https://api.travelpayouts.com') throw new Error('Unexpected provider origin');
     // Defence in depth for an old durable plan or feedback ticket. Never fabricate empty data.
@@ -43,11 +44,12 @@ export class CollectionProvider {
       this.blockedByMethod.set(method, quotaWait > 0);
       const refused = !response || response.status === 429 || response.status >= 500;
       this.recent.push(refused); if (this.recent.length > 200) this.recent.shift();
+      report(response?.status??null,!response?'NETWORK_FAILURE':response.status===429?'RATE_LIMIT':response.status>=500?'HTTP_SERVER_ERROR':response.status>=400?'HTTP_CLIENT_ERROR':null);
       if (this.recent.length === 200 && this.recent.filter(Boolean).length > 100) throw new Error('Provider circuit breaker');
       if (!refused) {
         if (!response.ok) return { kind: 'error', status: response.status };
         try { return { kind: 'ok', json: await response.json() }; }
-        catch { return { kind: 'error', status: response.status }; }
+        catch { report(response.status,'INVALID_JSON');return { kind: 'error', status: response.status }; }
       }
       if (attempt === 2) return { kind: 'refused', refusal: !response ? 'network' : response.status === 429 ? 'tooMany' : 'server' };
       const retryAfter = response?.headers.get('Retry-After');

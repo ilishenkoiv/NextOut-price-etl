@@ -154,7 +154,7 @@ export async function main(env=process.env){
   });
   const store=new CollectionStore(db,randomUUID(),env.GITHUB_RUN_ID);
   activeStore=store;
-  let claimed=false,engine=null,stopping=false;const stop=()=>{stopping=true;};
+  let claimed=false,engine=null,stopping=false,diagnosticProvider=null;const stop=()=>{stopping=true;};
   try{
     const previous=await store.inspect();
     // Same normal-intersection case as above (an old runner from the previous cycle has not yet
@@ -182,6 +182,7 @@ export async function main(env=process.env){
       // heartbeat's own write load; the regular due session below covers the rest of the day.
       await publishPilotState(db,env);
       const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+      diagnosticProvider=provider;
       const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
       const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
       // Off-cycle exists to advance MAIN (never priority). Offering fast/maintenance here as well
@@ -210,6 +211,7 @@ export async function main(env=process.env){
     // post-selection point-refresh below and the regular engine loop further down.
     const sessionEnd=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+    diagnosticProvider=provider;
     // A daily-selection error must never take down the whole session: priority and MAIN below
     // still need to run regardless of this call's outcome. The failure is checkpointed with its
     // message and timestamp, and dailySelectionRetryThrottled keeps a persistently failing
@@ -269,6 +271,7 @@ export async function main(env=process.env){
       Object.entries(engine.state.jobs).map(([task,j])=>`- ${task}: ${j.done?'pass finished':'checkpoint saved'}; ${j.checkpoint?.cursor??0}/${j.checkpoint?.total??'?'} units; ${j.checkpoint?.errors??0} inconclusive responses.\n`).join('')+
       "\nA successful session is not a claim that the day's main pass or all fast refreshes met their deadlines. Check pass timestamps and error counts.\n");
   }finally{
+    diagnosticProvider?.mainProbeDiagnostics?.flush();
     process.off('SIGTERM',stop);process.off('SIGINT',stop);
     console.log(JSON.stringify(egressSummary()));
     if(claimed)await store.release();
