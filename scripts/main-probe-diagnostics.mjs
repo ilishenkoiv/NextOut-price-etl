@@ -1,5 +1,8 @@
-const CELLS=new Set([1370,1992,4740,5362,8110,8732]);
-export const isTargetMainCell=(jobId,cellId)=>jobId===20732&&CELLS.has(cellId);
+// Context comes from the admitted immutable plan, not provider data. Cover the two
+// routes throughout this job's existing cells; never broaden to other jobs/routes.
+export const isTargetMainCell=(jobId,cellId,origin,dest)=>jobId===20732
+  &&Number.isSafeInteger(cellId)&&cellId>=0&&cellId<20220
+  &&(origin==='HHN'&&dest==='FRA'||origin==='NRN'&&dest==='DUS');
 const REASONS=new Set(['HTTP_CLIENT_ERROR','HTTP_SERVER_ERROR','RATE_LIMIT','NETWORK_FAILURE','INVALID_JSON',
   'SUCCESS_NOT_TRUE','DATA_NOT_ARRAY','PROVIDER_REFUSED','UNKNOWN_PROVIDER_FAILURE']);
 export function requiredProbeFailureReason(response){
@@ -23,7 +26,7 @@ export function createMainProbeDiagnostics({source,runId,emit=record=>console.lo
   const output=value=>{try{emit(value);}catch{/* Diagnostics never alter provider/checkpoint execution. */}};
   return{
     record(context,reason,httpStatus){
-      if(!isTargetMainCell(context?.jobId,context?.cellId)||!REASONS.has(reason)
+      if(!isTargetMainCell(context?.jobId,context?.cellId,context?.origin,context?.dest)||!REASONS.has(reason)
         ||!['direct','any'].includes(context.variant)||!/^[A-Z]{3}$/.test(context.origin??'')||!/^[A-Z]{3}$/.test(context.dest??'')
         ||!/^\d{4}-(0[1-9]|1[0-2])$/.test(context.departureMonth??'')||!/^\d{4}-(0[1-9]|1[0-2])$/.test(context.returnMonth??''))return;
       const key=[context.cellId,context.variant,context.departureMonth,context.returnMonth].join('|');

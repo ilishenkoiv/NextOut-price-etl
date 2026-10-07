@@ -236,7 +236,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           // Owner invariant: BOTH variants are mandatory for every cell. `any` is the provider's
           // actual direct=false result and may legitimately be cheaper than (or include) direct.
           // A boundary/restart between probes leaves cp.cursor unchanged, so both replay safely.
-          requiredRequest.sanitizedFailureDiagnostics=isTargetMainCell(job.id,cellId);
+          requiredRequest.sanitizedFailureDiagnostics=isTargetMainCell(job.id,cellId,route.origin,route.dest);
           const directResult = await probeType(route.origin,route.dest,month,nextMonth(month),true,requiredRequest);
           const anyResult = await probeType(route.origin,route.dest,month,nextMonth(month),false,requiredRequest);
           let calendarResult = null;
