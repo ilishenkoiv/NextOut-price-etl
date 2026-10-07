@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMainProbeDiagnostics, requiredProbeFailureReason } from './main-probe-diagnostics.mjs';
+import { createMainProbeDiagnostics, requiredProbeFailureReason, isTargetMainCell } from './main-probe-diagnostics.mjs';
 import { CollectionProvider, CollectionYield } from './collection-provider.mjs';
 import { createAdapters } from './collection-adapters.mjs';
 const source='a'.repeat(40);
@@ -10,13 +10,26 @@ test('whitelist attribution discards arbitrary input and deduplicates cell/varia
   const records=[];const d=createMainProbeDiagnostics({source,runId:'123',emit:r=>records.push(r)});
   d.record({...context,url:'https://secret',headers:{token:'secret'},error:'secret',body:'secret'},'HTTP_CLIENT_ERROR',400);
   d.record(context,'INVALID_JSON',200);d.record({...context,variant:'any'},'DATA_NOT_ARRAY',200);
-  d.record({...context,jobId:20733},'HTTP_CLIENT_ERROR',400);d.record({...context,cellId:2},'HTTP_CLIENT_ERROR',400);
+  d.record({...context,jobId:20733},'HTTP_CLIENT_ERROR',400);d.record({...context,dest:'DUS'},'HTTP_CLIENT_ERROR',400);
   d.record({...context,origin:'https://secret'},'HTTP_CLIENT_ERROR',400);d.record({...context,returnMonth:'secret'},'HTTP_CLIENT_ERROR',400);
   d.record({...context,returnMonth:'2026-12'},'secret arbitrary error',400);d.flush();
   assert.equal(records.length,2);assert.equal(records[0].source,source);assert.equal(records[0].runId,'123');
   assert.equal(records[0].jobId,20732);assert.equal(records[0].cellId,1370);assert.equal(records[0].httpStatus,400);
   assert.deepEqual(Object.keys(records[0]),['event','source','runId','jobId','cellId','origin','dest','departureMonth','returnMonth','variant','httpStatus','reason']);
   assert.ok(!JSON.stringify(records).includes('secret'));
+});
+
+test('route filter covers all twelve existing month cells and excludes other jobs/routes/invalid IDs',()=>{
+  const records=[];const d=createMainProbeDiagnostics({source,runId:'123',emit:r=>records.push(r)});
+  const months=['2026-11','2026-12','2027-01','2027-02','2027-03','2027-04'];
+  for(let mi=0;mi<months.length;mi++)for(const [ri,origin,dest] of [[1370,'HHN','FRA'],[1992,'NRN','DUS']]){
+    const cellId=ri+mi*3370;
+    assert.equal(isTargetMainCell(20732,cellId,origin,dest),true);
+    d.record({...context,cellId,origin,dest,departureMonth:months[mi],returnMonth:months[mi]},'HTTP_CLIENT_ERROR',400);
+  }
+  assert.equal(records.length,12);assert.ok(records.some(r=>r.cellId===11480));assert.ok(records.some(r=>r.cellId===12102));assert.ok(records.some(r=>r.cellId===14850));
+  for(const [job,id,origin,dest] of [[20733,11480,'HHN','FRA'],[20732,11480,'FRA','HHN'],[20732,11480,'HHN','DUS'],[20732,11480,'NRN','FRA'],[20732,-1,'HHN','FRA'],[20732,20220,'HHN','FRA'],[20732,1.5,'HHN','FRA']])
+    assert.equal(isTargetMainCell(job,id,origin,dest),false);
 });
 test('24 records maximum and one final suppression summary; duplicate failures do not inflate suppression',()=>{
   const records=[];const d=createMainProbeDiagnostics({source,runId:'123',emit:r=>records.push(r)});
