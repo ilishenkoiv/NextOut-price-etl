@@ -1,7 +1,8 @@
 // Context comes from the admitted immutable plan, not provider data. Cover the two
 // routes throughout this job's existing cells; never broaden to other jobs/routes.
-export const isTargetMainCell=(jobId,cellId,origin,dest)=>jobId===20732
-  &&Number.isSafeInteger(cellId)&&cellId>=0&&cellId<20220
+const TARGET_JOB=20733,TARGET_TOTAL=16362;
+export const isTargetMainCell=(jobId,cellId,origin,dest)=>jobId===TARGET_JOB
+  &&Number.isSafeInteger(cellId)&&cellId>=0&&cellId<TARGET_TOTAL
   &&(origin==='HHN'&&dest==='FRA'||origin==='NRN'&&dest==='DUS');
 const REASONS=new Set(['HTTP_CLIENT_ERROR','HTTP_SERVER_ERROR','RATE_LIMIT','NETWORK_FAILURE','INVALID_JSON',
   'SUCCESS_NOT_TRUE','DATA_NOT_ARRAY','PROVIDER_REFUSED','UNKNOWN_PROVIDER_FAILURE']);
@@ -33,10 +34,10 @@ export function createMainProbeDiagnostics({source,runId,emit=record=>console.lo
       if(seen.has(key))return;seen.add(key);
       if(emitted>=cap){suppressed++;return;}
       emitted++;
-      output({event:'main_required_probe_failure',source:sourceSha,runId:run,jobId:20732,cellId:context.cellId,
+      output({event:'main_required_probe_failure',source:sourceSha,runId:run,jobId:TARGET_JOB,cellId:context.cellId,
         origin:context.origin,dest:context.dest,departureMonth:context.departureMonth,returnMonth:context.returnMonth,variant:context.variant,
         httpStatus:Number.isInteger(httpStatus)&&httpStatus>=100&&httpStatus<=599?httpStatus:null,reason});
     },
-    flush(){if(flushed)return;flushed=true;if(suppressed)output({event:'main_required_probe_suppression',source:sourceSha,runId:run,jobId:20732,emitted,suppressed,limit:cap});},
+    flush(){if(flushed)return;flushed=true;if(suppressed)output({event:'main_required_probe_suppression',source:sourceSha,runId:run,jobId:TARGET_JOB,emitted,suppressed,limit:cap});},
   };
 }
