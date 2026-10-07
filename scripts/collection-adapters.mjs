@@ -8,6 +8,7 @@ import { computeAllWindows } from './collection-windows.mjs';
 import { buildBreakWindows } from './break-windows.mjs';
 import { CollectionYield } from './collection-provider.mjs';
 import { mainBoundaryStatus } from './main-continuation.mjs';
+import { createMainProbeDiagnostics, requiredProbeFailureReason, isTargetMainCell } from './main-probe-diagnostics.mjs';
 import { withSupabaseRetry } from './supabase-retry.mjs';
 import { logDbError, dbErrorCode } from './db-error.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
@@ -55,6 +56,8 @@ export function groupWindowConsumerTickets(rows){const groups=new Map();for(cons
   if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}return[...groups.values()].map(group=>group.sort((a,b)=>a.flight_type.localeCompare(b.flight_type)));}
 export function createAdapters({ db, store, provider, wave = 0, clock = Date.now, setDbDeadline = () => {}, getState = () => null,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), random = Math.random }) {
+  // All adapters sharing this provider share one diagnostic budget for the whole session.
+  provider.mainProbeDiagnostics??=createMainProbeDiagnostics({source:process.env.GITHUB_SHA,runId:store.runId});
   const exactKey=t=>[t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|');
   // PILOT, off by default: uniform 30-minute price refresh for every already-selected ticket
   // (legacy) unless explicitly opted into the market/time-of-day cadence.
@@ -217,7 +220,15 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           // Latch each required window's technical failure before another probe can yield.
           // Partial-cell durable accounting remains deferred until the complete cell is committed.
           const requiredRequest = async url => {
-            const response = await request(url);
+            const params=new URL(url).searchParams;
+            const diagnosticContext={jobId:job.id,cellId,origin:route.origin,dest:route.dest,departureMonth:month,
+              returnMonth:params.get('return_at'),variant:params.get('direct')==='true'?'direct':'any'};
+            let httpStatus=null;
+            const response = await provider.request(url,unitEnd-9000,(status,reason)=>{
+              httpStatus=status;if(reason)provider.mainProbeDiagnostics.record(diagnosticContext,reason,status);
+            });
+            const reason=requiredProbeFailureReason(response);
+            if(reason)provider.mainProbeDiagnostics.record(diagnosticContext,reason,httpStatus??response?.status);
             if(response.kind!=='ok'||!response.json?.success||!Array.isArray(response.json.data))
               requiredProbeFailed = true;
             return response;
@@ -225,6 +236,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           // Owner invariant: BOTH variants are mandatory for every cell. `any` is the provider's
           // actual direct=false result and may legitimately be cheaper than (or include) direct.
           // A boundary/restart between probes leaves cp.cursor unchanged, so both replay safely.
+          requiredRequest.sanitizedFailureDiagnostics=isTargetMainCell(job.id,cellId);
           const directResult = await probeType(route.origin,route.dest,month,nextMonth(month),true,requiredRequest);
           const anyResult = await probeType(route.origin,route.dest,month,nextMonth(month),false,requiredRequest);
           let calendarResult = null;

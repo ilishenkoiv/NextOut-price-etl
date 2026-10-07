@@ -689,7 +689,8 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
     const shape = Array.isArray(r.data) ? 'array' : `${typeof r.data}${r.data === undefined ? ' (absent)' : ''}`;
     // Capped like every other upstream string we print — it is somebody else's field.
     const why = typeof r.error === 'string' ? ` error="${previewBody(r.error)}"` : '';
-    console.warn(`    unusable 200 ${origin}→${dest} ${ym} (${direct ? 'direct' : 'any'}): success=${r.success}, data=${shape}${why}`);
+    // Targeted MAIN debt probes use the session-capped sanitized diagnostic channel instead.
+    if(!request.sanitizedFailureDiagnostics)console.warn(`    unusable 200 ${origin}→${dest} ${ym} (${direct ? 'direct' : 'any'}): success=${r.success}, data=${shape}${why}`);
     return { ok: false, min: null, offers: [], reason: 'body' };
   }
 
