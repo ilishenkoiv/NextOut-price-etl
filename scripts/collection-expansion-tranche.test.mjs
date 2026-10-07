@@ -32,7 +32,7 @@ const cellDest = (plan, id) => plan.routes[id % plan.routes.length].dest;
 test('1+2+16: the full wave-43 plan front-loads incomplete expansion cells regardless of alphabetical position', () => {
   const plan = mainPlan({ date: DATE, wave: WAVE, prices: [], watches: [] });
   const R = plan.routes.length, M = plan.months.length;
-  assert.equal(R, 3992);                                   // real wave-43 route set (base 139 + 43 expansion)
+  assert.equal(R, 3266);                                   // wave-43 destinations from 18 active departures
   assert.equal(plan.cellOrder.length, R * M);              // a permutation of EVERY cell — nothing dropped
   assert.equal(new Set(plan.cellOrder).size, R * M);       // …and it is a true permutation (no dupes/holes)
 

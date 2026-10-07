@@ -12,6 +12,7 @@
 import { classifyResponse } from './check-flight-price-feedback.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { withPriceProvenance } from './price-provenance.mjs';
+import { isSuspendedOrigin } from '../src/data/origins.js';
 
 export function ticketKey(t) { return [t.origin, t.dest, t.flight_type, t.departure_at, t.return_at].join('|'); }
 
@@ -28,7 +29,9 @@ function requestUrl(ticket) {
 export async function pointRefreshTickets(tickets, { provider, clock = Date.now, deadline = Infinity, sourceTable = 'offers' } = {}) {
   const confirmed = new Map(), missed = new Set(), errored = new Set();
   let attempted = 0;
+  const suspended = new Set();
   for (const ticket of tickets) {
+    if(isSuspendedOrigin(ticket.origin)){suspended.add(ticketKey(ticket));continue;}
     if (clock() + 9000 >= deadline) break;
     attempted++;
     const response = await provider.request(requestUrl(ticket), deadline - 9000);
@@ -50,5 +53,5 @@ export async function pointRefreshTickets(tickets, { provider, clock = Date.now,
     } else if (outcome.status === 'no_result') missed.add(key);
     else errored.add(key);
   }
-  return { confirmed, missed, errored, attempted, refreshed: confirmed.size, misses: missed.size, errors: errored.size, total: tickets.length };
+  return { confirmed, missed, errored, suspended: suspended.size, attempted, refreshed: confirmed.size, misses: missed.size, errors: errored.size, total: tickets.length };
 }

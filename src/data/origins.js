@@ -14,4 +14,9 @@ export const HUB_AIRPORTS = ['FRA', 'MUC', 'BER', 'DUS', 'HAM', 'STR', 'CGN', 'V
 // DRS (Dresden) and LEJ (Leipzig/Halle) are secondary Saxon airports served by Eurowings and
 // Ryanair rather than network carriers — same profile as NUE/FMM, so they group here.
 export const LOWCOST_AIRPORTS = ['NUE', 'FMM', 'HHN', 'NRN', 'BTS', 'EIN', 'DRS', 'LEJ'];
-export const ORIGINS_ALL = [...HUB_AIRPORTS, ...LOWCOST_AIRPORTS];
+// Temporary departure-only suspension. Keep the catalogue and destination data intact.
+// Re-enable only by a separately reviewed owner decision; never rewrite admitted plans.
+export const SUSPENDED_DEPARTURES = Object.freeze(['AMS', 'LHR', 'EIN', 'BTS']);
+export const isSuspendedOrigin = origin => SUSPENDED_DEPARTURES.includes(origin);
+export const ORIGINS_CATALOGUE = [...HUB_AIRPORTS, ...LOWCOST_AIRPORTS];
+export const ORIGINS_ALL = ORIGINS_CATALOGUE.filter(origin => !isSuspendedOrigin(origin));

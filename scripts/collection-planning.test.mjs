@@ -5,11 +5,11 @@ import { expansionTargets } from '../src/data/expansion-targets.js';
 import { computeAllWindows } from './collection-windows.mjs';
 import { publishedSnapshotDestinations } from './snapshot-daily-origin-cheapest.mjs';
 
-test('all 43 targets add 946 real route pairs without duplicate GVA/ZRH collection',()=>{
+test('all 43 targets add 774 active-departure route pairs without duplicate GVA/ZRH collection',()=>{
   const base=mainPlan({date:'2026-09-16',wave:0,prices:[],watches:[]});
   const full=mainPlan({date:'2026-09-16',wave:43,prices:[],watches:[]});
-  assert.equal(full.routes.length-base.routes.length,946);assert.equal(full.routes.length,3992);
-  assert.equal(catalogue(43).length,182);assert.equal(new Set(full.routes.map(r=>r.key)).size,3992);
+  assert.equal(full.routes.length-base.routes.length,774);assert.equal(full.routes.length,3266);
+  assert.equal(catalogue(43).length,182);assert.equal(new Set(full.routes.map(r=>r.key)).size,3266);
   assert.ok(full.routes.every(r=>r.origin!==r.dest));
   assert.ok(expansionTargets(43).every(r=>Number.isFinite(r.lat)&&Number.isFinite(r.lng)));
 });
