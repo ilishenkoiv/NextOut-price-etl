@@ -1,3 +1,4 @@
+import { safeProviderError } from './http400-diagnostics.mjs';
 // Context comes from the admitted immutable plan, not provider data. Cover the two
 // routes throughout this job's existing cells; never broaden to other jobs/routes.
 const TARGET_JOB=20733,TARGET_TOTAL=16362;
@@ -23,9 +24,23 @@ export function createMainProbeDiagnostics({source,runId,emit=record=>console.lo
   const sourceSha=/^[a-f0-9]{40}$/.test(source??'')?source:null;
   const run=/^\d{1,24}$/.test(String(runId??''))?String(runId):null;
   const cap=Math.max(0,Math.min(24,Number.isSafeInteger(limit)?limit:24));
-  const seen=new Set();let emitted=0,suppressed=0,flushed=false;
+  const seen=new Set(),providerSeen=new Set();let emitted=0,suppressed=0,flushed=false,providerEmitted=0;
   const output=value=>{try{emit(value);}catch{/* Diagnostics never alter provider/checkpoint execution. */}};
   return{
+    recordProviderError(context,diagnostic){
+      if(!Number.isSafeInteger(context?.jobId)||context.jobId<0||!Number.isSafeInteger(context.cellId)||context.cellId<0
+        ||!(context.origin==='HHN'&&context.dest==='FRA'||context.origin==='NRN'&&context.dest==='DUS')
+        ||!['direct','any'].includes(context.variant)||!/^\d{4}-(0[1-9]|1[0-2])$/.test(context.departureMonth??'')
+        ||!/^\d{4}-(0[1-9]|1[0-2])$/.test(context.returnMonth??''))return;
+      const safe=safeProviderError({code:diagnostic?.providerCode,message:diagnostic?.providerMessage});
+      if(!safe)return;
+      const key=[context.jobId,context.cellId,context.variant,context.departureMonth,context.returnMonth].join('|');
+      if(providerSeen.has(key)||providerEmitted>=cap)return;
+      providerSeen.add(key);providerEmitted++;
+      output({event:'main_http400_provider_error',source:sourceSha,runId:run,jobId:context.jobId,cellId:context.cellId,
+        origin:context.origin,dest:context.dest,departureMonth:context.departureMonth,returnMonth:context.returnMonth,
+        variant:context.variant,httpStatus:400,reason:'HTTP_CLIENT_ERROR',...safe});
+    },
     record(context,reason,httpStatus){
       if(!isTargetMainCell(context?.jobId,context?.cellId,context?.origin,context?.dest)||!REASONS.has(reason)
         ||!['direct','any'].includes(context.variant)||!/^[A-Z]{3}$/.test(context.origin??'')||!/^[A-Z]{3}$/.test(context.dest??'')
