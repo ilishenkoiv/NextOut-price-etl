@@ -1,3 +1,4 @@
+import { readHttp400Error } from './http400-diagnostics.mjs';
 import { isSuspendedOrigin } from '../src/data/origins.js';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 export class CollectionYield extends Error {
@@ -10,7 +11,7 @@ export class CollectionProvider {
     this.nextByMethod = new Map(); this.interval = new Map(); this.recent = []; this.requests = 0;
   }
   async request(input, deadline = Infinity, observe = null) {
-    const report=(status,reason)=>{try{observe?.(status,reason);}catch{/* Logging cannot affect requests. */}};
+    const report=(status,reason,diagnostic)=>{try{observe?.(status,reason,diagnostic);}catch{/* Logging cannot affect requests. */}};
     const url = new URL(input);
     if (url.origin !== 'https://api.travelpayouts.com') throw new Error('Unexpected provider origin');
     // Defence in depth for an old durable plan or feedback ticket. Never fabricate empty data.
@@ -44,7 +45,11 @@ export class CollectionProvider {
       this.blockedByMethod.set(method, quotaWait > 0);
       const refused = !response || response.status === 429 || response.status >= 500;
       this.recent.push(refused); if (this.recent.length > 200) this.recent.shift();
-      report(response?.status??null,!response?'NETWORK_FAILURE':response.status===429?'RATE_LIMIT':response.status>=500?'HTTP_SERVER_ERROR':response.status>=400?'HTTP_CLIENT_ERROR':null);
+      let diagnostic=null;
+      if(response?.status===400 && observe && ((url.searchParams.get('origin')==='HHN'&&url.searchParams.get('destination')==='FRA')
+        ||(url.searchParams.get('origin')==='NRN'&&url.searchParams.get('destination')==='DUS')))
+        diagnostic=await readHttp400Error(response,{deadline:Math.min(deadline,requestStarted+8000),clock:this.clock,secret:this.token});
+      report(response?.status??null,!response?'NETWORK_FAILURE':response.status===429?'RATE_LIMIT':response.status>=500?'HTTP_SERVER_ERROR':response.status>=400?'HTTP_CLIENT_ERROR':null,diagnostic);
       if (this.recent.length === 200 && this.recent.filter(Boolean).length > 100) throw new Error('Provider circuit breaker');
       if (!refused) {
         if (!response.ok) return { kind: 'error', status: response.status };

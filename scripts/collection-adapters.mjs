@@ -224,8 +224,9 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             const diagnosticContext={jobId:job.id,cellId,origin:route.origin,dest:route.dest,departureMonth:month,
               returnMonth:params.get('return_at'),variant:params.get('direct')==='true'?'direct':'any'};
             let httpStatus=null;
-            const response = await provider.request(url,unitEnd-9000,(status,reason)=>{
+            const response = await provider.request(url,unitEnd-9000,(status,reason,diagnostic)=>{
               httpStatus=status;if(reason)provider.mainProbeDiagnostics.record(diagnosticContext,reason,status);
+              if(status===400)provider.mainProbeDiagnostics.recordProviderError?.(diagnosticContext,diagnostic);
             });
             const reason=requiredProbeFailureReason(response);
             if(reason)provider.mainProbeDiagnostics.record(diagnosticContext,reason,httpStatus??response?.status);
