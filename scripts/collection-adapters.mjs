@@ -460,13 +460,15 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       }
       if(cp.phase==='roulette'){
         const r=cp.roulette;
-        const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_origin_cheapest_pool_latest_snapshot'});
-        recordRead('daily_origin_cheapest_pool',latest);
-        const latestSnapshot=latest[0]?.snapshot_at??null;
         // Once admitted, a sub-pass owns one immutable snapshot and cadence instant until its
         // cursor genuinely reaches total. A later scheduler cycle may observe a newer snapshot,
         // but it must finish this admitted set before a future pass can adopt that snapshot.
-        if(!Object.hasOwn(r,'snapshotAt')){r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;r.technicalDeferred=[];}
+        if(!Object.hasOwn(r,'snapshotAt')){
+          const latest=await query(()=>db.from('daily_origin_cheapest_pool').select('snapshot_at').order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_origin_cheapest_pool_latest_snapshot'});
+          recordRead('daily_origin_cheapest_pool',latest);
+          const latestSnapshot=latest[0]?.snapshot_at??null;
+          r.snapshotAt=latestSnapshot;r.cursor=0;r.errors=0;r.done=false;r.technicalDeferred=[];
+        }
         const admittedSnapshot=r.snapshotAt;
         const snapshotId=String(Math.max(0,Date.parse(admittedSnapshot??'')||0));
         // Keyed only by snapshot (not r.cycle): the plan is a daily artifact, built once per
