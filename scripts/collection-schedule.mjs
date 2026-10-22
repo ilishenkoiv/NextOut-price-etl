@@ -261,6 +261,11 @@ export class SequentialSchedule {
             after.mainCompletions=[...(after.mainCompletions??[]),{id:job.id,startedAt:job.startedAt,completedAt:this.clock(),
               errors:after.jobs[task].checkpoint?.errors??0,wave:after.jobs[task].checkpoint?.wave??0,
               activeMs:after.jobs[task].activeMs,coverageComplete:after.jobs[task].checkpoint?.coverageComplete===true,
+              // Keep original cell ids (not traversal positions) with the exact durable-plan key.
+              // Missing legacy evidence stays unknown; never manufacture an empty unresolved set.
+              planDate:job.planDate??null,total:after.jobs[task].checkpoint?.total??null,
+              planKey:after.jobs[task].checkpoint?.wave==null?null:`coordinator/main-${job.id}-${after.jobs[task].checkpoint.wave}.json`,
+              unresolvedCells:Array.isArray(after.jobs[task].checkpoint?.unresolvedCells)?[...after.jobs[task].checkpoint.unresolvedCells]:null,
               outcomes:after.jobs[task].checkpoint?.outcomes??null,retryAttempts:after.jobs[task].checkpoint?.retryAttempts??0}].slice(-16);
           }
         }
