@@ -330,7 +330,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const now = new Date(clock()).toISOString(); const market = marketForOrigin(ticket.origin);
     let fare = null; let miss = null;
     if (outcome.status==='found') {
-      const source = response.json.data.find(r=>r.departure_at?.slice(0,10)===ticket.departure_at && r.return_at?.slice(0,10)===ticket.return_at && Math.round(r.price)===outcome.price && (ticket.flight_type!=='direct'||r.transfers===0));
+      const source = response.json.data.find(row=>classifyResponse({success:true,data:[row]},
+        {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===outcome.price);
       fare=withPriceProvenance([{ ...ticket,market,price:outcome.price,
         transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null,updated_at:now }],'window_prices')[0];
     } else {

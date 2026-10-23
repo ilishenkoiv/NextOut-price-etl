@@ -705,6 +705,8 @@ async function fetchFlightMonth(origin, dest, ym, direct, retYm, request) {
     const price = typeof x.price === 'number' ? Math.round(x.price) : NaN;
     if (!departure_at || !(price > 0)) continue; // validation (1e): needs a dep date & price>0
     if (departure_at.slice(0, 7) !== ym) continue; // §dedup: keep the cell strictly = departure month
+    // Invalid direct responses are not empty evidence for an extra calendar request.
+    if (direct && x.return_transfers !== undefined && x.return_transfers !== 0) return { ok: false, min: null, offers: [], reason: 'body' };
     const return_at = toDateOnly(x.return_at); // null for one-way
     offers.push({
       origin,

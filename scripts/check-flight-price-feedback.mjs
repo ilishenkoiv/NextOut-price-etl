@@ -50,6 +50,8 @@ export function classifyResponse(body, ticket) {
       return { status: 'error', detail: 'invalid_price' };
     if (ticket.mode === 'direct' && !Number.isInteger(row.transfers)) return { status: 'error', detail: 'unknown_stop_count' };
     if (ticket.mode === 'direct' && row.transfers !== 0) continue;
+    // A supplied return stop count must be numeric zero; absent remains compatible.
+    if (ticket.mode === 'direct' && row.return_transfers !== undefined && row.return_transfers !== 0) continue;
     best = best == null ? row.price : Math.min(best, row.price);
   }
   return best == null ? { status: 'no_result', detail: 'no_exact_offer_in_provider_cache' }
