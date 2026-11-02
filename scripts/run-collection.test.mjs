@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { noOtherActiveRuns, scheduledCollectionDue, runDueDailySelection, collectionTriggerSource, isAutomatedTrigger,
-  main, dailySelectionRetryThrottled, DAILY_SELECTION_RETRY_MS,
+  main, dailySelectionRetryThrottled, runAllOriginPriorityFill, allOriginPriorityReleased, DAILY_SELECTION_RETRY_MS,
   DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './run-collection.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
 import { berlinObservedOn } from './snapshot-daily-origin-cheapest.mjs';
@@ -12,7 +12,7 @@ const source = readFileSync(new URL('./run-collection.mjs', import.meta.url), 'u
 test('daily selection is a checkpointed coordinator pre-phase, never an end-of-session republish', () => {
   assert.match(source, /^\s*import[^\n]*snapshot-daily-origin-cheapest/m);
   assert.match(source, /^\s*import[^\n]*snapshot-daily-window-candidates/m);
-  assert.match(source, /runDueDailySelection\(\{state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline\}\)/);
+  assert.match(source, /allOriginPriorityAdapter:allAdapters\.allOriginPriority/);
   assert.doesNotMatch(source, /export\s+(?:async\s+)?function\s+(?:publishEndOfSessionPool|shouldPublishEndOfSession)/, 'end-of-session republish is gone');
   assert.doesNotMatch(source, /daily_origin_cheapest_pool'\)/, 'the coordinator does not query/write the pool tables directly');
 });
@@ -45,6 +45,60 @@ test('due daily selection is serialized by the lease and fenced after each check
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');assert.ok(saved.length>=4);
   await runDueDailySelection({state,store,db:{},instant,wave:43,
     publishRoulette:async()=>{throw new Error('already checkpointed');},publishWindows:async()=>{throw new Error('already checkpointed');}});
+});
+
+test('all-origin reserve checkpoints the current origin and its local cursors at the bounded deadline',async()=>{
+  const state={version:1,jobs:{}};const saves=[];let calls=0,now=0;
+  const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
+  const adapter={step:async()=>{calls++;now=160000;return{status:'yield',checkpoint:{originIndex:1,currentOrigin:'MUC',completedOrigins:['FRA'],
+    origin:{phase:'carousel',roulette:{cursor:4,total:4},carousel:{cursor:2,total:9}},complete:false}};}};
+  const result=await runAllOriginPriorityFill({state,store,adapter,instant:Date.parse('2026-09-23T07:00:00Z'),clock:()=>now,deadline:200000});
+  assert.equal(calls,1);assert.equal(result.currentOrigin,'MUC');assert.deepEqual(result.completedOrigins,['FRA']);
+  assert.equal(result.origin.carousel.cursor,2);assert.equal(result.complete,false);assert.equal(result.deadlineReached,true);
+  assert.ok(saves.some(s=>s.dailySelection.allOriginPriority.currentOrigin==='MUC'),'current origin is durable beside local roulette/carousel cursors');
+});
+
+test('an incomplete reserve error durably blocks broad provider work until its explicit deadline release',async()=>{
+  const instant=Date.parse('2026-11-02T07:00:00Z'),state={version:1,jobs:{}},saves=[];
+  const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
+  const adapter={step:async()=>{throw new Error('reserve provider failure');}};
+  await assert.rejects(()=>runAllOriginPriorityFill({state,store,adapter,instant,clock:()=>100,deadline:200_000}),/reserve provider failure/);
+  const checkpoint=state.dailySelection.allOriginPriority;
+  assert.equal(checkpoint.complete,undefined);assert.equal(checkpoint.deadlineReached,false);
+  assert.equal(checkpoint.lastError.message,'reserve provider failure');
+  assert.ok(saves.some(saved=>saved.dailySelection.allOriginPriority.lastError?.message==='reserve provider failure'));
+  let broadProviderCalls=0;
+  if(allOriginPriorityReleased(state,instant))broadProviderCalls++;
+  assert.equal(broadProviderCalls,0,'no MAIN/FAST/TAIL provider handler may start before release');
+  checkpoint.deadlineReached=true;
+  assert.equal(allOriginPriorityReleased(state,instant),true,'a persisted same-day deadline release permits the normal broad path');
+  assert.equal(allOriginPriorityReleased(state,instant+86_400_000),false,'a release never crosses the Berlin day boundary');
+});
+
+test('all-origin reserve uses canonical order, one provider lane, and the existing factual commit paths',()=>{
+  const adapters=readFileSync(new URL('./collection-adapters.mjs',import.meta.url),'utf8');
+  assert.match(adapters,/ORIGINS_ALL\[cp\.originIndex\]/);
+  assert.match(adapters,/reserveOrigin:currentOrigin/);
+  assert.match(adapters,/routes:plan\.routes\.filter\(route=>route\.origin===job\.reserveOrigin\)/);
+  assert.match(adapters,/ORIGINS_ALL\.flatMap\(origin=>catalogue\(pinnedWave\)/);
+  assert.doesNotMatch(adapters,/mucPriority|muc-priority|origin==='MUC'/);
+  assert.match(adapters,/collection_commit_main/);assert.match(adapters,/collection_commit_window/);
+  assert.match(source,/all_origin_priority_deadline/);
+  assert.match(source,/if\(result\.status==='yield'&&clock\(\)\+ALL_ORIGIN_PRIORITY_MIN_UNIT_MS>=deadline\)break/);
+});
+
+test('a resumed reserve publishes newly complete MUC while FRA remains incomplete, even after an earlier same-day publication',async()=>{
+  const instant=Date.parse('2026-11-02T07:00:00Z'),state={version:1,jobs:{},dailySelection:{day:'2026-11-02',windowDone:true,rouletteDone:true,
+    allOriginPriority:{day:'2026-11-02',originIndex:1,currentOrigin:'MUC',completedOrigins:['FRA'],origin:{phase:'roulette'},complete:false}}};const calls=[];
+  const store={lease:async()=>true,save:async()=>{}};
+  const reserve={step:async()=>({status:'yield',checkpoint:{originIndex:2,currentOrigin:'FRA',completedOrigins:['FRA','MUC'],
+    origin:{phase:'roulette',roulette:{cursor:2,total:4},carousel:null},complete:false}})};
+  await runDueDailySelection({state,store,db:{},instant,refreshDeadline:Date.now()+46_000,allOriginPriorityAdapter:reserve,
+    publishWindows:async()=>{calls.push('window');return{published:true};},
+    publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true,publishedOrigins:['MUC'],incompleteOrigins:[{origin:'FRA'}]};}});
+  assert.deepEqual(calls,['window','roulette']);
+  assert.ok(state.dailySelection.allOriginPriority.completedOrigins.includes('MUC'));
+  assert.equal(state.dailySelection.allOriginPriority.currentOrigin,'FRA');
 });
 
 test('the provider and its point-refresh deadline are threaded into both publish paths, and a daily_selection_published line is logged with counts',async()=>{
@@ -213,7 +267,7 @@ test('pilot state is published under the same claimed lease for both the regular
   assert.doesNotMatch(notDueExit, /publishPilotState/, 'the cheap 5-minute not_due heartbeat must not gain a new write');
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
   assert.match(offCycleBlock, /await publishPilotState\(db,env\)/, 'off-cycle attempts publish too, not just regular due sessions');
-  const dueSelectionCallIndex = source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline})');
+  const dueSelectionCallIndex = source.indexOf('await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline,');
   const regularPublishIndex = source.lastIndexOf('await publishPilotState(db,env)', dueSelectionCallIndex);
   const betweenPublishAndSelection = source.slice(regularPublishIndex, dueSelectionCallIndex);
   assert.ok(regularPublishIndex > -1, 'the regular due session publishes pilot state before running daily selection');
@@ -234,9 +288,17 @@ test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN
 
 test('off-cycle MAIN advance never offers a priority handler and never calls runDueDailySelection', () => {
   const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.match(offCycleBlock, /await runAllOriginPriorityFill\(\{state,store,adapter:allAdapters\.allOriginPriority,deadline:stopAt\}\)/);
+  assert.match(offCycleBlock, /if\(!allOriginPriorityReleased\(state\)\)\{\s*console\.log\(JSON\.stringify\(\{event:'all_origin_priority_blocks_broad'/);
   assert.match(offCycleBlock, /const offCycleHandlers=\{main:allAdapters\.main,tail:allAdapters\.tail\}/);
   assert.match(offCycleBlock, /handlers:offCycleHandlers/);
   assert.doesNotMatch(offCycleBlock, /runDueDailySelection/);
+});
+
+test('the regular scheduler cannot construct broad handlers without the persisted reserve release',()=>{
+  const regularBlock=source.slice(source.indexOf("if(dailySelectionRetryThrottled"),source.indexOf("process.once('SIGTERM'"));
+  assert.match(regularBlock,/if\(!allOriginPriorityReleased\(state\)\)\{\s*console\.log\(JSON\.stringify\(\{event:'all_origin_priority_blocks_broad'/);
+  assert.match(regularBlock,/return;\s*\}\s*const end=sessionEnd;[\s\S]*handlers:allAdapters/);
 });
 
 test('regular progress logs expose only the checkpointed safe roulette technical diagnostics and later per-key outcomes',()=>{

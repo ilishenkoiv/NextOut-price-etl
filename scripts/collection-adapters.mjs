@@ -11,6 +11,7 @@ import { logDbError, dbErrorCode } from './db-error.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { ORIGINS_ALL } from '../src/data/origins.js';
 import { originDueThisCycle, selectedPriceRefreshDue } from './priority-market-schedule.mjs';
 import { maintenanceDue, maintenanceMustStop, isQuarterlyMaintenanceDay } from './maintenance-window.mjs';
 import { retentionCutoff, shouldDeleteSnapshot, positiveDays, SNAPSHOT_RETENTION_DAYS, PROGRESS_RETENTION_DAYS } from './price-storage-retention.mjs';
@@ -172,7 +173,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           for(const id of old.cellIds)retainMainCell(cp,oldPlan,id,old,old.wave);
           cp.legacyUnresolved=cp.legacyUnresolved.slice(1);
         }
-        const plan = await durablePlan('main',{...job,checkpoint:cp},async () => {
+        // The reserve phase reuses MAIN's mandatory direct/any, positive-only path.  Its
+        // durable plan is the full canonical plan; the caller's current origin is filtered only
+        // after loading it, so one storage artifact cannot accidentally pin a first origin.
+        const planTask=job.reserveOrigin?'reserve':'main';
+        let plan = await durablePlan(planTask,{...job,checkpoint:cp},async () => {
           const months = horizon(job.planDate);
           const prices = await load('prices','origin,dest,month,direct,any_stops',PRICE_ORDER,q=>q.in('month',months),unitEnd);
           const routeHealth = await load('route_price_health','origin,dest,status,dead_policy,temporary_dead_until',['origin','dest'],undefined,unitEnd);
@@ -182,9 +187,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           const codes = new Set(regions.map(r=>r.calendar_subdivision_code));
           const days = new Set(holidays.filter(h=>codes.has(h.subdivision_code) || (h.level==='country' && [...codes].some(c=>c.startsWith(h.country+'-')))).map(h=>h.date));
           const trancheDests = resolveTrancheDests(process.env.EXPANSION_TRANCHE_DESTS);
-          return { ...mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows,routeHealth,trancheDests}),
+          const built=mainPlan({date:job.planDate,wave:pinnedWave,prices,watches:watchRows,routeHealth,trancheDests});
+          return { ...built,
             breakKeys:[...buildBreakWindows(days,months[0]+'-01',nextMonth(months.at(-1))+'-01').keySet] };
         },unitEnd);
+        if(job.reserveOrigin)plan={...plan,routes:plan.routes.filter(route=>route.origin===job.reserveOrigin),cellOrder:null};
         // cellOrder (when present) front-loads the bounded expansion tranche, then keeps every
         // remaining cell in the original month-major order. It is a permutation of the same cell ids,
         // so `total` and cursor/resume semantics are identical to the legacy identity ordering.
@@ -401,15 +408,21 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       const unitEnd=Math.min(deadline,clock()+30000); let cp=job.checkpoint??{cursor:0,errors:0,wave};
       const pinnedWave=cp.wave??wave;cp={...cp,wave:pinnedWave};
       try {
-        const plan=await durablePlan(task,{...job,checkpoint:cp},async()=>{
+        const planTask=job.reserveOrigin?'reservewindow':task;
+        let plan=await durablePlan(planTask,{...job,checkpoint:cp},async()=>{
           const history=await load('window_prices','origin,dest,flight_type,departure_at,return_at,price,window_kind',WINDOW_ORDER,q=>q.gte('departure_at',job.planDate),unitEnd);
           const watchRows=await watches(unitEnd);
           if(task==='fast')return fastPlan({rows:history,watches:watchRows,today:job.planDate,wave:pinnedWave});
           const holidays=await load('public_holidays','country,subdivision_code,level,date',['country','subdivision_code','date'],undefined,unitEnd);
           const regions=await load('origin_regions','airport,calendar_subdivision_code',['airport'],undefined,unitEnd);
           const windows=computeAllWindows(holidays,[...new Set(regions.map(r=>r.calendar_subdivision_code).filter(Boolean))],job.planDate);
-          return tailPlan({date:job.planDate,wave:pinnedWave,windows,history,watches:watchRows});
+          const built=tailPlan({date:job.planDate,wave:pinnedWave,windows,history,watches:watchRows});
+          // Reserve acquisition covers every canonical origin and every real catalogue route;
+          // normal TAIL keeps its rolling destination subset unchanged.
+          return job.reserveOrigin?{...built,routes:ORIGINS_ALL.flatMap(origin=>catalogue(pinnedWave)
+            .filter(d=>d.iata!==origin).map(d=>({origin,dest:d.iata})))}:built;
         },unitEnd);
+        if(job.reserveOrigin)plan={...plan,routes:plan.routes.filter(route=>route.origin===job.reserveOrigin)};
         const total=task==='fast'?plan.tickets.length:plan.routes.length*plan.windows.length*2;
         while(cp.cursor<total&&clock()+19000<unitEnd){
           let ticket;
@@ -736,5 +749,33 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       return{status:'done',checkpoint:cp};
     }catch(error){if(error instanceof CollectionYield)return{status:'yield',checkpoint:cp};throw error;}
   }};
-  return{priority,main,fast:windowAdapter('fast'),tail:windowAdapter('tail'),maintenance};
+  const tail=windowAdapter('tail');
+  // One bounded sequential reserve lane: finish an origin's roulette and real carousel windows
+  // before moving to the next canonical origin.  This is intentionally not a queue or a second
+  // provider; both delegates share the existing provider, lease and commit semantics.
+  const allOriginPriority={maxUnitMs:MAIN_UNIT_ADMIT_MS,async step({job,deadline}){
+    const cp=structuredClone(job.checkpoint??{originIndex:0,currentOrigin:null,completedOrigins:[],origin:null,steps:0});
+    cp.completedOrigins=Array.isArray(cp.completedOrigins)?cp.completedOrigins:[];
+    if(cp.originIndex>=ORIGINS_ALL.length)return{status:'done',checkpoint:{...cp,currentOrigin:null,origin:null,complete:true}};
+    const currentOrigin=ORIGINS_ALL[cp.originIndex];
+    if(cp.currentOrigin!==currentOrigin){cp.currentOrigin=currentOrigin;cp.origin={phase:'roulette',roulette:null,carousel:null};}
+    const local=cp.origin??{phase:'roulette',roulette:null,carousel:null};
+    const rouletteDone=local.roulette?.cursor===local.roulette?.total;
+    const carouselDone=local.carousel?.cursor===local.carousel?.total;
+    const runRoulette=!rouletteDone;
+    const result=runRoulette
+      ?await main.step({job:{...job,reserveOrigin:currentOrigin,checkpoint:local.roulette},deadline})
+      :!carouselDone?await tail.step({job:{...job,reserveOrigin:currentOrigin,checkpoint:local.carousel},deadline})
+      :{status:'done',checkpoint:null};
+    if(runRoulette)local.roulette=result.checkpoint;
+    else if(!carouselDone)local.carousel=result.checkpoint;
+    local.phase=(local.roulette?.cursor===local.roulette?.total)?'carousel':'roulette';
+    cp.origin=local;cp.steps=(cp.steps??0)+1;
+    if(local.roulette?.cursor===local.roulette?.total&&local.carousel?.cursor===local.carousel?.total){
+      cp.completedOrigins=[...new Set([...cp.completedOrigins,currentOrigin])];cp.originIndex++;cp.currentOrigin=ORIGINS_ALL[cp.originIndex]??null;cp.origin=null;
+    }
+    cp.complete=cp.originIndex>=ORIGINS_ALL.length;
+    return{status:cp.complete?'done':result.status,checkpoint:cp};
+  }};
+  return{priority,main,fast:windowAdapter('fast'),tail,maintenance,allOriginPriority};
 }

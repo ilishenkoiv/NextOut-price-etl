@@ -26,6 +26,54 @@ export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 // invocation of this coordinator (as often as every 5 minutes via supabase-cron): a retry is
 // attempted at most once per this interval; MAIN and priority still run every time regardless.
 export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
+export const ALL_ORIGIN_PRIORITY_MIN_UNIT_MS = 45_000;
+
+// MAIN/FAST/TAIL may use the shared provider lane only after this same day's reserve has
+// completed, or after the reserve itself durably recorded that its bounded deadline elapsed.
+export function allOriginPriorityReleased(state,instant=Date.now()){
+  const checkpoint=state.dailySelection?.allOriginPriority;
+  return checkpoint?.day===berlinObservedOn(instant)
+    &&(checkpoint.complete===true||checkpoint.deadlineReached===true);
+}
+
+// The reserve pass is deliberately outside the scheduler: before publication it owns one
+// sequential provider lane across the canonical origins.  Its state belongs to dailySelection,
+// so a bounded recovery resumes the same origin and its local cursors without advancing MAIN.
+export async function runAllOriginPriorityFill({state,store,adapter,deadline=Infinity,instant=Date.now(),clock=Date.now}={}) {
+  if(!adapter)throw new Error('All-origin priority adapter is required');
+  const day=berlinObservedOn(instant);
+  const prior=state.dailySelection?.allOriginPriority;
+  const checkpoint=prior?.day===day?prior:{day,startedAt:clock(),steps:0,originIndex:0,currentOrigin:null,completedOrigins:[],origin:null};
+  state.dailySelection={...(state.dailySelection??{}),day,allOriginPriority:checkpoint};
+  await store.save(state);
+  const persistRelease=async()=>{
+    checkpoint.deadlineReached=!checkpoint.complete&&clock()+ALL_ORIGIN_PRIORITY_MIN_UNIT_MS>=deadline;
+    if(checkpoint.deadlineReached)console.log(JSON.stringify({event:'all_origin_priority_deadline',day,currentOrigin:checkpoint.currentOrigin,
+      originIndex:checkpoint.originIndex,completedOrigins:checkpoint.completedOrigins,
+      roulette:{cursor:checkpoint.origin?.roulette?.cursor??0,total:checkpoint.origin?.roulette?.total??null},
+      carousel:{cursor:checkpoint.origin?.carousel?.cursor??0,total:checkpoint.origin?.carousel?.total??null}}));
+    await store.save(state);
+  };
+  try{
+    while(clock()+ALL_ORIGIN_PRIORITY_MIN_UNIT_MS<deadline){
+      if(!await store.lease())throw new Error('All-origin priority forbidden: lease lost');
+      const result=await adapter.step({job:{id:Math.floor(Date.parse(day+'T00:00:00Z')/86400000),planDate:day,startedAt:checkpoint.startedAt,activeMs:0,checkpoint},deadline});
+      Object.assign(checkpoint,result.checkpoint);
+      checkpoint.updatedAt=clock();
+      await store.save(state);
+      if(checkpoint.complete)break;
+      // A delegate yield is normally its short adapter boundary, not permission to start broad
+      // work.  Only the reserve phase's own bounded deadline releases MAIN/FAST/TAIL.
+      if(result.status==='yield'&&clock()+ALL_ORIGIN_PRIORITY_MIN_UNIT_MS>=deadline)break;
+    }
+  }catch(error){
+    checkpoint.lastError={message:error.message,at:clock()};
+    await persistRelease();
+    throw error;
+  }
+  await persistRelease();
+  return checkpoint;
+}
 
 // Post-selection point-refresh budget: how long, at most, the same session spends confirming the
 // day's freshly-selected tickets via the provider (select -> point-refresh -> publish) before
@@ -77,19 +125,29 @@ export function isAutomatedTrigger(env={}){
 // fences each phase transition through CollectionStore.save. Manual selector workflows remain
 // recovery-only; no independently scheduled selection writer exists.
 export async function runDueDailySelection({state,store,db,wave=0,instant=Date.now(),selectionThresholdMinutes=LEGACY_SELECTION_THRESHOLD_MINUTES,
-  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,allOriginPriorityAdapter=null,publishRoulette=publishDailyRoulette,publishWindows=publishDailyWindows}={}) {
   if(!nightlySelectionDue(instant,selectionThresholdMinutes))return{state,published:false};
   const day=berlinObservedOn(instant),snapshotAt=new Date(instant).toISOString();
   const checkpoint=state.dailySelection?.day===day?structuredClone(state.dailySelection):{
     day,rouletteDone:false,windowDone:false,startedAt:instant};
   state.dailySelection=checkpoint;await store.save(state);
   let published=false;
+  let reserveAdvanced=false;
+  // A deadline-resumed reserve continues even after a prior per-origin publisher pass.  That
+  // lets an origin completed later in the same Berlin day publish on its own rather than waiting
+  // for an unrelated incomplete origin or tomorrow's selector.
+  if(allOriginPriorityAdapter&&checkpoint.allOriginPriority?.complete!==true){
+    const completedBefore=new Set(checkpoint.allOriginPriority?.completedOrigins??[]);
+    const reserve=await runAllOriginPriorityFill({state,store,adapter:allOriginPriorityAdapter,deadline:refreshDeadline,instant});
+    checkpoint.allOriginPriority=reserve;
+    reserveAdvanced=[...(reserve.completedOrigins??[])].some(origin=>!completedBefore.has(origin));
+  }
   // Selection never waits for source freshness (see snapshot-daily-origin-cheapest.mjs /
   // snapshot-daily-window-candidates.mjs): both calls below always publish from whatever has
   // already been collected, point-refreshing the SELECTED tickets first (order: select ->
   // point-refresh -> publish). Exactly one selection per Berlin day: rouletteDone/windowDone,
   // once true, are never re-attempted for the same `day`.
-  if(!checkpoint.windowDone){
+  if(!checkpoint.windowDone||reserveAdvanced){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
     const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider,refreshDeadline});
     checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
@@ -102,7 +160,7 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
       await store.save(state);
     }
   }
-  if(!checkpoint.rouletteDone){
+  if(!checkpoint.rouletteDone||reserveAdvanced){
     if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
     const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider,refreshDeadline});
     checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
@@ -184,6 +242,17 @@ export async function main(env=process.env){
       const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
       const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
       const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
+      if(!allOriginPriorityReleased(state)){
+        try{
+          await runAllOriginPriorityFill({state,store,adapter:allAdapters.allOriginPriority,deadline:stopAt});
+        }catch(error){
+          console.error(JSON.stringify({event:'all_origin_priority_failed',source:triggerSource,day:berlinObservedOn(Date.now()),error:error.message}));
+        }
+      }
+      if(!allOriginPriorityReleased(state)){
+        console.log(JSON.stringify({event:'all_origin_priority_blocks_broad',source:triggerSource,day:berlinObservedOn(Date.now())}));
+        return;
+      }
       // Off-cycle exists to advance MAIN (never priority). Offering fast/maintenance here as well
       // would let a trigger that happens to land on the wall-clock 'fast' or 'maintenance' slot
       // (SLOTS is wall-clock-driven, not off-cycle-aware) spend its whole bounded budget on that
@@ -210,6 +279,7 @@ export async function main(env=process.env){
     // post-selection point-refresh below and the regular engine loop further down.
     const sessionEnd=Date.now()+minutes*60000;
     const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+    const allAdapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state});
     // A daily-selection error must never take down the whole session: priority and MAIN below
     // still need to run regardless of this call's outcome. The failure is checkpointed with its
     // message and timestamp, and dailySelectionRetryThrottled keeps a persistently failing
@@ -222,7 +292,8 @@ export async function main(env=process.env){
         // for the post-selection point-refresh sweep, and always leaving
         // DAILY_SELECTION_REFRESH_RESERVE_MS of this session for MAIN/priority afterward.
         const refreshDeadline=Math.min(Date.now()+DAILY_SELECTION_REFRESH_MAX_MS,sessionEnd-DAILY_SELECTION_REFRESH_RESERVE_MS);
-        await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline});
+        await runDueDailySelection({state,store,db,wave,selectionThresholdMinutes,pilotMarketSchedule,provider,refreshDeadline,
+          allOriginPriorityAdapter:allAdapters.allOriginPriority});
         if(state.dailySelection?.lastError){delete state.dailySelection.lastError;await store.save(state);}
       }catch(error){
         state.dailySelection={...(state.dailySelection||{}),lastError:{message:error.message,at:Date.now()}};
@@ -230,10 +301,14 @@ export async function main(env=process.env){
         console.error(JSON.stringify({event:'daily_selection_failed',source:triggerSource,day:berlinObservedOn(Date.now()),error:error.message}));
       }
     }
+    if(!allOriginPriorityReleased(state)){
+      console.log(JSON.stringify({event:'all_origin_priority_blocks_broad',source:triggerSource,day:berlinObservedOn(Date.now())}));
+      return;
+    }
     const end=sessionEnd;
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
     engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,guaranteeDailyMain,
-      handlers:createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>engine?.state})});
+      handlers:allAdapters});
     process.once('SIGTERM',stop);process.once('SIGINT',stop);
     let lastReport=0;
     while(!stopping&&Date.now()+45000<end){
