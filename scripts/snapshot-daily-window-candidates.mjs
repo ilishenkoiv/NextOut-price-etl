@@ -1,6 +1,7 @@
 // Once-per-Berlin-day publication of the complete shared exact-price carousel candidate union.
 // No provider requests: reads existing factual calendars/window_prices and atomically publishes v1.
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import { computeAllWindows } from './collection-windows.mjs';
 import { berlinObservedOn, nightlySelectionDue, publishedSnapshotDestinations, publishedSnapshotOrigins, freshOriginFraction, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
@@ -69,6 +70,21 @@ export function windowCandidatesByOrigin(candidates,expectedOrigins=publishedSna
   return {grouped,publishedOrigins,incompleteOrigins};
 }
 
+// This is deliberately a fingerprint of the factual, eligible exact-window input, not of the
+// daily epoch or generated carousel ordering.  Successful and attempted retry fingerprints are
+// checkpointed separately: a failed retry consumes its exact factual input without being
+// mistaken for a successful per-origin publication.
+export function windowOriginInputFingerprints(candidates){
+  const byOrigin=new Map();
+  for(const row of candidates){const rows=byOrigin.get(row.origin)??[];rows.push([
+    row.flight_type,row.dest,row.departure_at,row.return_at,row.exact_price,row.exact_observed_at,
+    row.transfers,row.airline,row.price_source??null]);byOrigin.set(row.origin,rows);}
+  const fingerprints={};
+  for(const [origin,rows] of byOrigin){rows.sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    fingerprints[origin]=createHash('sha256').update(JSON.stringify(rows)).digest('hex');}
+  return fingerprints;
+}
+
 // Recovery for the short transition period from the legacy all-origin epoch to the
 // per-origin read model.  These are rows the legacy RPC already validated and committed;
 // this path only partitions them and asks the per-origin RPC to create a missing marker.
@@ -97,7 +113,8 @@ async function loadAll(db,table,columns,order,filter){const out=[];for(let from=
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
-  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now,expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false}={}){
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now,expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false,
+  retryOriginInputs=null,retryAfter=null}={}){
   const today=berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — see the
   // matching comment in snapshot-daily-origin-cheapest.mjs's main().
@@ -118,7 +135,28 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   // daily_selection_published event below), same as the roulette pool.
   const freshFraction=freshOriginFraction(rows,instant,publishedSnapshotOrigins());
   const regions=[...new Set(originRegions.map(r=>r.calendar_subdivision_code).filter(Boolean))].sort();const snapshotAt=new Date(instant).toISOString();
-  let candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,originRegions,wave});if(!candidates.length)throw new Error('Daily window candidate selection is empty');
+  let candidates=selectDailyWindowCandidates(rows,{today,snapshotAt,holidays,regions,originRegions,wave});
+  const originInputs=windowOriginInputFingerprints(candidates);
+  if(retryOriginInputs){
+    const retryAfterMs=typeof retryAfter==='number'?retryAfter:Date.parse(retryAfter);
+    const retryOrigins=new Set(Object.keys(originInputs).filter(origin=>{
+      if(originInputs[origin]===retryOriginInputs[origin])return false;
+      // A checkpoint written before this repair has no per-origin fingerprint.  Its one-time
+      // baseline may only admit input observed after ordinary completion; it cannot replay
+      // rows that merely happened to exist before the old global checkpoint.
+      // Origins without a successful fingerprint (failed or zero during ordinary
+      // completion) need a new factual observation after its completion baseline.
+      // A known origin changed from its successful fingerprint is eligible directly.
+      return Object.hasOwn(retryOriginInputs,origin)||!Number.isFinite(retryAfterMs)
+        ||candidates.some(row=>row.origin===origin&&Date.parse(row.exact_observed_at)>retryAfterMs);
+    }));
+    candidates=candidates.filter(row=>retryOrigins.has(row.origin));
+  }
+  if(!candidates.length){
+    if(!retryOriginInputs)throw new Error('Daily window candidate selection is empty');
+    return {published:false,observedOn:today,snapshotAt,candidateRows:0,requestGroups:0,freshFraction,refresh:{attempted:0,refreshed:0,misses:0,errors:0,total:0},
+      publishedOrigins:[],alreadyPublishedOrigins:[],failedOrigins:[],incompleteOrigins:[],originInputs,handledOriginInputs:{},attemptedOriginInputs:{}};
+  }
   const months=horizon(today),origins=[...new Set(candidates.map(row=>row.origin))],dests=[...new Set(candidates.map(row=>row.dest))];
   const monthlyRows=await loadAll(client,'prices','origin,dest,month,direct,any_stops,updated_at,price_source',['origin','dest','month'],
     q=>q.in('month',months).in('origin',origins).in('dest',dests));
@@ -147,20 +185,21 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
     throw new Error(`Manual daily window recovery refused incomplete point refresh (${refresh.attempted}/${refresh.total})`);
   }
   const perOrigin=windowCandidatesByOrigin(candidates,expectedOrigins);
-  const publishedOrigins=[],alreadyPublishedOrigins=[],failedOrigins=[];
+  const publishedOrigins=[],alreadyPublishedOrigins=[],failedOrigins=[],handledOriginInputs={},attemptedOriginInputs={};
   // Sequential by design: one provider/collection lane owns one departure origin at a time.
   for(const origin of perOrigin.publishedOrigins){
     const originCandidates=perOrigin.grouped.get(origin);
+    attemptedOriginInputs[origin]=originInputs[origin];
     const{data,error}=await client.rpc('publish_daily_origin_window_candidates',{
       p_observed_on:today,p_snapshot_at:snapshotAt,p_origin:origin,p_candidates:originCandidates});
     if(error){failedOrigins.push({origin,reason:error.message??String(error)});continue;}
-    (data===true?publishedOrigins:alreadyPublishedOrigins).push(origin);
+    (data===true?publishedOrigins:alreadyPublishedOrigins).push(origin);handledOriginInputs[origin]=originInputs[origin];
   }
   const requestGroups=new Set(candidates.map(routeKey)).size,published=publishedOrigins.length>0;
   console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published,observedOn:today,snapshotAt,
     candidateRows:candidates.length,requestGroups,publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incompleteOrigins,freshFraction,refresh}));
   return{published,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh,
-    publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incompleteOrigins};
+    publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incompleteOrigins,originInputs,handledOriginInputs,attemptedOriginInputs};
 }
 
 export async function manualRecoveryMain({env=process.env,publish=main,providerFactory=options=>new CollectionProvider(options),clock=Date.now}={}){

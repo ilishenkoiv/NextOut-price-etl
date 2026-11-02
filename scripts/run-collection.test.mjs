@@ -39,12 +39,15 @@ test('due daily selection is serialized by the lease and fenced after each check
   const calls=[];
   const result=await runDueDailySelection({state,store,db:{},instant,wave:43,
     publishRoulette:async args=>{calls.push(['roulette',args]);return{rebuilt:true};},
-    publishWindows:async args=>{calls.push(['window',args]);return{published:true};}});
+    publishWindows:async args=>{calls.push(['window',args]);return{published:true,handledOriginInputs:{}};}});
   assert.deepEqual(calls.map(c=>c[0]),['window','roulette']);
   assert.equal(result.published,true);assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
+  assert.ok(Number.isFinite(Date.parse(state.dailySelection.windowNewInputBaselineAt)),
+    'ordinary completion persists a retry baseline even when no origin fingerprint succeeded');
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');assert.ok(saved.length>=4);
   await runDueDailySelection({state,store,db:{},instant,wave:43,
-    publishRoulette:async()=>{throw new Error('already checkpointed');},publishWindows:async()=>{throw new Error('already checkpointed');}});
+    publishRoulette:async()=>{throw new Error('already checkpointed');},
+    publishWindows:async args=>{assert.equal(args.provider,null);return{published:false,handledOriginInputs:{}};}});
 });
 
 test('all-origin reserve checkpoints the current origin and its local cursors at the bounded deadline',async()=>{
@@ -149,6 +152,38 @@ test('exactly one selection per Berlin day: a second due cycle the same day neve
   assert.equal(result.published,false);
   assert.equal(state.dailySelection.rouletteDone,true);
   assert.equal(state.dailySelection.windowDone,true);
+});
+
+test('a completed new-format window checkpoint retries only changed factual origin input without provider work',async()=>{
+  const instant=Date.parse('2026-11-02T07:00:00Z');
+  const state={version:1,jobs:{priority:{done:true,checkpoint:{phase:'done'}}},dailySelection:{day:'2026-11-02',windowDone:true,rouletteDone:true,
+    perOriginCatchupDone:true,windowOriginInputs:{FRA:'fra-input-v1'},windowNewInputBaselineAt:'2026-11-02T06:00:00.000Z'}};
+  const calls=[];const store={lease:async()=>true,save:async()=>{}};
+  await runDueDailySelection({state,store,db:{},instant,provider:{requests:0},refreshDeadline:instant+60_000,
+    publishRoulette:async()=>{throw new Error('roulette must not rerun');},
+    publishWindows:async args=>{calls.push(args);return{published:true,publishedOrigins:['MUC'],alreadyPublishedOrigins:[],failedOrigins:[],candidateRows:1,
+      handledOriginInputs:{MUC:'muc-input-v1'}};}});
+  assert.equal(calls.length,1);assert.equal(calls[0].provider,null,'new-input retry cannot broaden into provider refresh work');
+  assert.deepEqual(calls[0].retryOriginInputs,{FRA:'fra-input-v1'});
+  assert.equal(calls[0].retryAfter,'2026-11-02T06:00:00.000Z','retry uses the persisted ordinary-completion baseline');
+  assert.equal(state.dailySelection.windowOriginInputs.MUC,'muc-input-v1');
+  assert.equal(state.jobs.priority.done,false,'a new local origin publication re-admits the existing priority path');
+});
+
+test('a failed new-input retry persists its attempted fingerprint for the next data-only pass',async()=>{
+  const instant=Date.parse('2026-11-02T07:00:00Z');
+  const state={version:1,jobs:{},dailySelection:{day:'2026-11-02',windowDone:true,rouletteDone:true,
+    perOriginCatchupDone:true,windowOriginInputs:{MUC:'muc-input-v1'},windowNewInputBaselineAt:'2026-11-02T06:00:00.000Z'}};
+  const calls=[];const store={lease:async()=>true,save:async()=>{}};
+  const publishWindows=async args=>{calls.push(args);const fingerprint=calls.length===1?'fra-input-v1':'fra-input-v2';
+    return{published:false,publishedOrigins:[],alreadyPublishedOrigins:[],failedOrigins:[{origin:'FRA',reason:'unavailable'}],candidateRows:1,
+      handledOriginInputs:{},attemptedOriginInputs:{FRA:fingerprint}};};
+  await runDueDailySelection({state,store,db:{},instant,publishRoulette:async()=>{throw new Error('roulette must not rerun');},publishWindows});
+  assert.equal(state.dailySelection.windowAttemptedOriginInputs.FRA,'fra-input-v1');
+  await runDueDailySelection({state,store,db:{},instant:instant+60_000,publishRoulette:async()=>{throw new Error('roulette must not rerun');},
+    publishWindows:async args=>{assert.deepEqual(args.retryOriginInputs,{MUC:'muc-input-v1',FRA:'fra-input-v1'});
+      return{published:false,publishedOrigins:[],alreadyPublishedOrigins:[],failedOrigins:[],candidateRows:0,handledOriginInputs:{},attemptedOriginInputs:{}};}});
+  assert.equal(calls.length,1);assert.equal(calls[0].provider,null,'the failed retry remains data-only');
 });
 
 test('day boundary: yesterday\'s completed selection does not block today\'s — both roulette and carousel/window rebuild for the new Berlin day',async()=>{

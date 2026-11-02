@@ -178,11 +178,69 @@ test('a later FRA per-origin publication failure leaves the earlier MUC publicat
     },
   };
 
-  await assert.rejects(()=>main({db,instant,force:true,expectedOrigins:new Set(['MUC','FRA'])}),/FRA window RPC failed/);
+  const result=await main({db,instant,force:true,expectedOrigins:new Set(['MUC','FRA'])});
   assert.deepEqual(rpcOrigins,['MUC','FRA']);
   assert.ok(visibleByOrigin.get('MUC')?.length,
     'FRA failure is reported without deleting, invalidating, or globally barring the earlier MUC publication');
   assert.equal(visibleByOrigin.has('FRA'),false);
+  assert.deepEqual(result.failedOrigins,[{origin:'FRA',reason:'FRA window RPC failed'}]);
+});
+
+test('new factual per-origin window input retries only that origin after a zero state, rejects invalid input, isolates FRA failure, and is idempotent',async()=>{
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');let windowRows=[];const rpcCalls=[];
+  function serverTable(rows){const builder={select(){return builder;},gte(){return builder;},lte(){return builder;},eq(){return builder;},in(){return builder;},order(){return builder;},
+    range:(from,to)=>Promise.resolve({data:rows.slice(from,to+1),error:null})};return builder;}
+  const db={from(table){
+    if(table==='window_prices')return serverTable(windowRows);
+    if(table==='origin_regions')return serverTable([]);
+    return serverTable([]);
+  },rpc(name,args){rpcCalls.push(args.p_origin);
+    return Promise.resolve(args.p_origin==='FRA'?{data:null,error:new Error('FRA unavailable')}:{data:true,error:null});}};
+  const expectedOrigins=new Set(['MUC','FRA']);
+
+  const zero=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:{}});
+  assert.deepEqual(zero.publishedOrigins,[],'unchanged zero input performs no publication');
+  assert.deepEqual(rpcCalls,[]);
+
+  windowRows=[row('BCN','any',150,{origin:'MUC'})];
+  await main({db,instant,force:true,expectedOrigins,retryOriginInputs:{},retryAfter:'2026-09-22T04:00:00.000Z'});
+  assert.deepEqual(rpcCalls,[],'a pre-repair checkpoint baseline cannot replay an older MUC row');
+
+  windowRows=[row('BCN','any',150,{origin:'MUC',updated_at:'2026-09-22T04:01:00.000Z'})];
+  const muc=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:{}});
+  assert.deepEqual(muc.publishedOrigins,['MUC']);assert.deepEqual(rpcCalls,['MUC']);
+  assert.ok(muc.handledOriginInputs.MUC,'only a successfully handled MUC input becomes durable');
+
+  await main({db,instant,force:true,expectedOrigins,retryOriginInputs:muc.handledOriginInputs});
+  assert.deepEqual(rpcCalls,['MUC'],'the unchanged MUC input is idempotent after success');
+
+  windowRows=[row('ZZZ','any',150,{origin:'MUC'})];
+  const invalid=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:{}});
+  assert.deepEqual(invalid.handledOriginInputs,{});assert.deepEqual(rpcCalls,['MUC'],'invalid input neither publishes nor records success');
+
+  const retryBaseline='2026-09-22T04:00:00.000Z';
+  windowRows=[row('BCN','any',150,{origin:'MUC',updated_at:'2026-09-22T04:01:00.000Z'}),row('FCO','any',175,{origin:'FRA'})];
+  const unchangedFailed=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:muc.handledOriginInputs,retryAfter:retryBaseline});
+  assert.deepEqual(unchangedFailed.publishedOrigins,[]);assert.deepEqual(unchangedFailed.failedOrigins,[]);
+  assert.deepEqual(rpcCalls,['MUC'],'an unchanged pre-completion FRA row after its failed ordinary RPC makes no retry RPC call');
+
+  windowRows=[row('BCN','any',150,{origin:'MUC',updated_at:'2026-09-22T04:01:00.000Z'}),row('FCO','any',175,{origin:'FRA',updated_at:'2026-09-22T04:02:00.000Z'})];
+  const changedFailed=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:muc.handledOriginInputs,retryAfter:retryBaseline});
+  assert.deepEqual(changedFailed.publishedOrigins,[]);assert.deepEqual(changedFailed.failedOrigins,[{origin:'FRA',reason:'FRA unavailable'}]);
+  assert.deepEqual(rpcCalls,['MUC','FRA'],'a changed FRA factual row after the baseline retries exactly once');
+  assert.equal(changedFailed.handledOriginInputs.FRA,undefined,
+    'FRA failure cannot be recorded as a successful input fingerprint');
+
+  const attemptedAfterFailure={...muc.handledOriginInputs,...changedFailed.attemptedOriginInputs};
+  await main({db,instant,force:true,expectedOrigins,retryOriginInputs:attemptedAfterFailure,retryAfter:retryBaseline});
+  assert.deepEqual(rpcCalls,['MUC','FRA'],'the same failed post-baseline FRA input is attempted once, then never retried');
+
+  windowRows=[row('BCN','any',150,{origin:'MUC',updated_at:'2026-09-22T04:01:00.000Z'}),row('FCO','any',180,{origin:'FRA',updated_at:'2026-09-22T04:03:00.000Z'})];
+  const changedAgain=await main({db,instant,force:true,expectedOrigins,retryOriginInputs:attemptedAfterFailure,retryAfter:retryBaseline});
+  assert.deepEqual(changedAgain.failedOrigins,[{origin:'FRA',reason:'FRA unavailable'}]);
+  assert.deepEqual(rpcCalls,['MUC','FRA','FRA'],'a genuinely changed FRA input receives exactly one new attempt');
+  await main({db,instant,force:true,expectedOrigins,retryOriginInputs:{...attemptedAfterFailure,...changedAgain.attemptedOriginInputs},retryAfter:retryBaseline});
+  assert.deepEqual(rpcCalls,['MUC','FRA','FRA'],'the changed input is also suppressed after its failed attempt');
 });
 
 test('selection never waits for source freshness: publishes immediately from a stale source, freshness fraction is recorded but never blocks',async()=>{

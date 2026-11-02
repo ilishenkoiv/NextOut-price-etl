@@ -164,15 +164,44 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
     reserveAdvanced=false;
   }
   // Exactly one ordinary selection per Berlin day: rouletteDone/windowDone, once true, are
-  // never re-attempted for the same `day`.
+  // never re-attempted for the same `day`.  A completed *new-format* window checkpoint has one
+  // narrower exception below: it may compare factual input fingerprints and publish only an
+  // origin which received a later eligible window row.  This is data-only and never replays the
+  // legacy global epoch or wakes the provider.
   if(!checkpoint.windowDone||reserveAdvanced){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
     const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider,refreshDeadline});
-    checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=Date.now();
+    const completedAt=Date.now();
+    checkpoint.windowDone=true;checkpoint.windowPublished=result?.published===true;checkpoint.windowCompletedAt=completedAt;
+    // This applies to every origin, including one whose RPC failed or which had zero
+    // eligible input.  A later coordinator pass may therefore only consider factual
+    // input observed after the ordinary completion, never replay its old rows.
+    checkpoint.windowNewInputBaselineAt=new Date(completedAt).toISOString();
     checkpoint.windowFreshFraction=result?.freshFraction??null;checkpoint.windowRefresh=result?.refresh??null;
     checkpoint.windowCandidateRows=result?.candidateRows??null;
+    if(Object.hasOwn(result??{},'handledOriginInputs')){
+      checkpoint.windowOriginInputs={...(checkpoint.windowOriginInputs??{}),...(result.handledOriginInputs??{})};
+    }
     await store.save(state);published ||= checkpoint.windowPublished===true;
     if(checkpoint.windowPublished&&state.jobs.priority){
+      state.jobs.priority.done=false;state.jobs.priority.completedAt=null;
+      if(state.jobs.priority.checkpoint)state.jobs.priority.checkpoint.phase='roulette';
+      await store.save(state);
+    }
+  }else if(checkpoint.windowOriginInputs||checkpoint.windowNewInputBaselineAt||(Number.isFinite(checkpoint.windowCompletedAt)&&checkpoint.windowNewInputBaselineAt===undefined)){
+    if(!await store.lease())throw new Error('New-input window publication forbidden: lease lost');
+    const retryOriginInputs={...(checkpoint.windowOriginInputs??{}),...(checkpoint.windowAttemptedOriginInputs??{})};
+    const retryAfter=checkpoint.windowNewInputBaselineAt??checkpoint.windowCompletedAt;
+    const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider:null,refreshDeadline:Infinity,
+      retryOriginInputs,retryAfter});
+    checkpoint.windowNewInputCompletedAt=Date.now();
+    checkpoint.windowNewInput={publishedOrigins:result?.publishedOrigins??[],alreadyPublishedOrigins:result?.alreadyPublishedOrigins??[],
+      failedOrigins:result?.failedOrigins??[],candidateRows:result?.candidateRows??0};
+    checkpoint.windowOriginInputs={...checkpoint.windowOriginInputs,...(result?.handledOriginInputs??{})};
+    checkpoint.windowAttemptedOriginInputs={...checkpoint.windowAttemptedOriginInputs,...(result?.attemptedOriginInputs??{})};
+    if(checkpoint.windowNewInputBaselineAt===undefined)checkpoint.windowNewInputBaselineAt=retryAfter;
+    await store.save(state);published ||= result?.published===true;
+    if(result?.published&&state.jobs.priority){
       state.jobs.priority.done=false;state.jobs.priority.completedAt=null;
       if(state.jobs.priority.checkpoint)state.jobs.priority.checkpoint.phase='roulette';
       await store.save(state);
