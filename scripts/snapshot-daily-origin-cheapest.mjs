@@ -173,14 +173,14 @@ export function pilotSourcesReady(rows, instant, expectedOrigins,
 
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
   force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now,
-  expectedOrigins=publishedSnapshotOrigins() } = {}) {
+  expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
   const instant=normalizeInstant(requestedSnapshotAt??clock());const observedOn = berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — the legacy
   // 03:30 default must never re-gate a pilot-mode caller (see run-collection.mjs, which already
   // resolves the same threshold before calling here).
   const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
-  if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
+  if(!catchUpOnly&&!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
   const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });
 
   const freshSince = new Date(clock() - MAX_SOURCE_AGE_MS).toISOString();
@@ -269,25 +269,25 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     for (let i = 0; i < chosen.length; i++) chosen[i] = apply(chosen[i]);
   }
 
-  let publishedOrigins=[];
+  let publishedOrigins=[],failedOrigins=[];
   for(const [origin,originPool] of perOrigin.complete){
     const originRank1=chosen.filter(row=>row.origin===origin);
     const {data:didPublish,error:publishError}=await supabase.rpc('publish_daily_cheapest_origin_selection',{
       p_observed_on:observedOn,p_snapshot_at:snapshotAt,p_origin:origin,p_rank1:originRank1,p_pool:originPool});
-    if(publishError)throw publishError;
+    if(publishError){failedOrigins.push({origin,reason:publishError.message??String(publishError)});continue;}
     if(didPublish===true)publishedOrigins.push(origin);
   }
   if(!publishedOrigins.length){
     const reason=perOrigin.complete.size?'already_published':'no_complete_origins';
-    console.log(JSON.stringify({event:'daily_selection_noop',scope:'roulette',observedOn,reason,incompleteOrigins:perOrigin.incomplete}));
-    return{rebuilt:false,observedOn,snapshotAt:null,reason,incompleteOrigins:perOrigin.incomplete};
+    console.log(JSON.stringify({event:'daily_selection_noop',scope:'roulette',observedOn,reason,incompleteOrigins:perOrigin.incomplete,failedOrigins}));
+    return{rebuilt:false,observedOn,snapshotAt:null,reason,incompleteOrigins:perOrigin.incomplete,failedOrigins};
   }
   console.log(JSON.stringify({event:'daily_selection_published',scope:'roulette',observedOn,snapshotAt,
     rank1Rows:chosen.filter(row=>publishedOrigins.includes(row.origin)).length,poolRows:publishedOrigins.length*10,sourceOffers:offers.length,
-    freshFraction,refresh,publishedOrigins,incompleteOrigins:perOrigin.incomplete}));
+    freshFraction,refresh,publishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incomplete}));
   return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh,
     rank1Rows: chosen.filter(row=>publishedOrigins.includes(row.origin)).length, poolRows: publishedOrigins.length*10,
-    publishedOrigins, incompleteOrigins: perOrigin.incomplete };
+    publishedOrigins, failedOrigins, incompleteOrigins: perOrigin.incomplete };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

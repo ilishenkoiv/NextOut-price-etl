@@ -69,11 +69,35 @@ export function windowCandidatesByOrigin(candidates,expectedOrigins=publishedSna
   return {grouped,publishedOrigins,incompleteOrigins};
 }
 
+// Recovery for the short transition period from the legacy all-origin epoch to the
+// per-origin read model.  These are rows the legacy RPC already validated and committed;
+// this path only partitions them and asks the per-origin RPC to create a missing marker.
+// It deliberately has no provider parameter or exact-price refresh step.
+export async function publishLegacyWindowCandidatesByOrigin(client,today){
+  const legacy=await loadAll(client,'daily_window_candidates',
+    'observed_on,snapshot_at,origin,market,flight_type,region_codes,window_kind,departure_at,return_at,position,dest,destination_id,exact_price,currency,transfers,airline,exact_observed_at,refresh_status,refresh_checked_at,last_error_kind,price_source',
+    ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('observed_on',today));
+  const byOrigin=windowCandidatesByOrigin(legacy);
+  const publishedOrigins=[],alreadyPublishedOrigins=[],failedOrigins=[];
+  for(const origin of byOrigin.publishedOrigins){
+    const rows=byOrigin.grouped.get(origin),snapshotAt=rows[0]?.snapshot_at;
+    try{
+      const{data,error}=await client.rpc('publish_daily_origin_window_candidates',{
+        p_observed_on:today,p_snapshot_at:snapshotAt,p_origin:origin,p_candidates:rows});
+      if(error)throw error;
+      (data===true?publishedOrigins:alreadyPublishedOrigins).push(origin);
+    }catch(error){failedOrigins.push({origin,reason:error.message??String(error)});}
+  }
+  return {published:publishedOrigins.length>0,observedOn:today,candidateRows:legacy.length,
+    publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:byOrigin.incompleteOrigins,
+    refresh:{attempted:0,refreshed:0,misses:0,errors:0,total:0}};
+}
+
 async function loadAll(db,table,columns,order,filter){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);if(filter)q=filter(q);for(const col of order)q=q.order(col,{ascending:true});
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
-  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now,expectedOrigins=publishedSnapshotOrigins()}={}){
+  pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now,expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false}={}){
   const today=berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — see the
   // matching comment in snapshot-daily-origin-cheapest.mjs's main().
@@ -81,6 +105,7 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
+  if(catchUpOnly)return publishLegacyWindowCandidatesByOrigin(client,today);
   // Date bounds stay server-side. Observation age is diagnostic only: a last-known positive exact
   // window remains eligible and is point-refreshed after selection.
   const windowMin=addDays(today,10),windowMax=addMonths(today,4);
@@ -122,20 +147,20 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
     throw new Error(`Manual daily window recovery refused incomplete point refresh (${refresh.attempted}/${refresh.total})`);
   }
   const perOrigin=windowCandidatesByOrigin(candidates,expectedOrigins);
-  const publishedOrigins=[],alreadyPublishedOrigins=[];
+  const publishedOrigins=[],alreadyPublishedOrigins=[],failedOrigins=[];
   // Sequential by design: one provider/collection lane owns one departure origin at a time.
   for(const origin of perOrigin.publishedOrigins){
     const originCandidates=perOrigin.grouped.get(origin);
     const{data,error}=await client.rpc('publish_daily_origin_window_candidates',{
       p_observed_on:today,p_snapshot_at:snapshotAt,p_origin:origin,p_candidates:originCandidates});
-    if(error)throw error;
+    if(error){failedOrigins.push({origin,reason:error.message??String(error)});continue;}
     (data===true?publishedOrigins:alreadyPublishedOrigins).push(origin);
   }
   const requestGroups=new Set(candidates.map(routeKey)).size,published=publishedOrigins.length>0;
   console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published,observedOn:today,snapshotAt,
-    candidateRows:candidates.length,requestGroups,publishedOrigins,alreadyPublishedOrigins,incompleteOrigins:perOrigin.incompleteOrigins,freshFraction,refresh}));
+    candidateRows:candidates.length,requestGroups,publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incompleteOrigins,freshFraction,refresh}));
   return{published,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh,
-    publishedOrigins,alreadyPublishedOrigins,incompleteOrigins:perOrigin.incompleteOrigins};
+    publishedOrigins,alreadyPublishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incompleteOrigins};
 }
 
 export async function manualRecoveryMain({env=process.env,publish=main,providerFactory=options=>new CollectionProvider(options),clock=Date.now}={}){

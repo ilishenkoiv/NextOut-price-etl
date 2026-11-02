@@ -27,6 +27,9 @@ export const OFF_CYCLE_SAFETY_MARGIN_MS = 90_000;
 // attempted at most once per this interval; MAIN and priority still run every time regardless.
 export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
 export const ALL_ORIGIN_PRIORITY_MIN_UNIT_MS = 45_000;
+// One factual transition repair only.  Do not turn old checkpoints into a recurring second
+// daily selection phase after 2026-11-02.
+export const PER_ORIGIN_CATCHUP_DAY = '2026-11-02';
 
 // MAIN/FAST/TAIL may use the shared provider lane only after this same day's reserve has
 // completed, or after the reserve itself durably recorded that its bounded deadline elapsed.
@@ -102,7 +105,8 @@ export function scheduledCollectionDue(state, instant=Date.now(), selectionThres
   const cycle=Math.floor(instant/CYCLE_MS),priority=state.jobs.priority;
   const priorityDue=!priority||priority.id!==cycle||!priority.done;
   const day=berlinObservedOn(instant),selection=state.dailySelection;
-  const selectionIncomplete=selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true;
+  const selectionIncomplete=selection?.day!==day||selection.rouletteDone!==true||selection.windowDone!==true
+    ||(day===PER_ORIGIN_CATCHUP_DAY&&selection?.perOriginCatchupDone!==true);
   // A recent same-day selection failure is not due again yet — see dailySelectionRetryThrottled.
   const selectionDue=nightlySelectionDue(instant,selectionThresholdMinutes)&&selectionIncomplete
     &&!dailySelectionRetryThrottled(state,instant);
@@ -145,8 +149,22 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   // Selection never waits for source freshness (see snapshot-daily-origin-cheapest.mjs /
   // snapshot-daily-window-candidates.mjs): both calls below always publish from whatever has
   // already been collected, point-refreshing the SELECTED tickets first (order: select ->
-  // point-refresh -> publish). Exactly one selection per Berlin day: rouletteDone/windowDone,
-  // once true, are never re-attempted for the same `day`.
+  // point-refresh -> publish). A completed legacy checkpoint gets one separate, data-only
+  // per-origin marker catch-up; it never calls the provider or rewrites an origin.
+  if(day===PER_ORIGIN_CATCHUP_DAY&&checkpoint.windowDone&&checkpoint.rouletteDone&&checkpoint.perOriginCatchupDone!==true){
+    if(!await store.lease())throw new Error('Per-origin daily catch-up forbidden: lease lost');
+    const windowResult=await publishWindows({db,instant,wave,pilotMarketSchedule,provider:null,refreshDeadline:Infinity,catchUpOnly:true});
+    if(!await store.lease())throw new Error('Per-origin daily roulette catch-up forbidden: lease lost');
+    const rouletteResult=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider:null,refreshDeadline:Infinity,catchUpOnly:true});
+    checkpoint.perOriginCatchupDone=true;checkpoint.perOriginCatchupCompletedAt=Date.now();
+    checkpoint.perOriginCatchup={window:windowResult,roulette:rouletteResult};
+    await store.save(state);published ||= windowResult?.published===true||rouletteResult?.rebuilt===true;
+    // The transition replay is the complete data-only action for this historical day.  Do not
+    // turn a reserve advance in the same session into a second, provider-backed selection.
+    reserveAdvanced=false;
+  }
+  // Exactly one ordinary selection per Berlin day: rouletteDone/windowDone, once true, are
+  // never re-attempted for the same `day`.
   if(!checkpoint.windowDone||reserveAdvanced){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
     const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider,refreshDeadline});
