@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { main, manualRecoveryMain, selectDailyWindowCandidates } from './snapshot-daily-window-candidates.mjs';
+import { main, manualRecoveryMain, selectDailyWindowCandidates, windowCandidatesByOrigin } from './snapshot-daily-window-candidates.mjs';
 import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 import { attachCarouselSixMonthMinimum, buildCarouselSixMonthMinimum, chooseCarouselCityForWindow,
   preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
@@ -102,7 +102,7 @@ test('window_prices date filtering stays server-side while an older positive row
     rpc(){throw new Error('rpc not stubbed for this call');},
   };
   let published=null;
-  db.rpc=(name,args)=>{if(name!=='publish_daily_window_candidates')throw new Error('unexpected rpc '+name);published=args;return Promise.resolve({data:true,error:null});};
+  db.rpc=(name,args)=>{if(name!=='publish_daily_origin_window_candidates')throw new Error('unexpected rpc '+name);published=args;return Promise.resolve({data:true,error:null});};
   await main({db,instant,force:true});
   assert.ok(returnedRowCount!==null && returnedRowCount<allRows.length,
     'the DB-side filter must already narrow the row set before it reaches JS (server-side filtering happened)');
@@ -130,7 +130,7 @@ test('manual recovery refuses a partial point-refresh before the publication RPC
   await assert.rejects(()=>main({db:handle.db,instant:Date.parse('2026-09-22T04:00:00Z'),force:true,
     provider:{request:async()=>{requested++;return{kind:'refused',refusal:'server'};}},clock:()=>1000,
     refreshDeadline:1000,requireCompleteRefresh:true}),/refused incomplete point refresh \(0\/1\)/);
-  assert.equal(requested,0);assert.equal(handle.published,null,'partial recovery must not call publish_daily_window_candidates');
+  assert.equal(requested,0);assert.equal(handle.published,null,'partial recovery must not call per-origin publication');
 });
 
 // ---- Select -> point-refresh -> publish (no freshness wait) ---------------------------
@@ -146,6 +146,44 @@ function windowDb(rows,monthly=[]){
     rpc:(name,args)=>{published=args;return Promise.resolve({data:true,error:null});}};
   return {db,get published(){return published;}};
 }
+
+test('per-origin classifier lets factual MUC publish while FRA is incomplete',()=>{
+  const muc=selectDailyWindowCandidates([row('BCN','any',150,{origin:'MUC'})],{today:'2026-09-22',snapshotAt,regions:['DE-BY']});
+  const result=windowCandidatesByOrigin(muc,new Set(['FRA','MUC']));
+  assert.deepEqual(result.publishedOrigins,['MUC']);
+  assert.deepEqual(result.incompleteOrigins,[{origin:'FRA',reason:'no_factual_window_candidates'}]);
+});
+
+test('a later FRA per-origin publication failure leaves the earlier MUC publication visible',async()=>{
+  const instant=Date.parse('2026-09-22T04:00:00.000Z');
+  const windowRows=[row('BCN','any',150,{origin:'MUC'}),row('FCO','any',175,{origin:'FRA'})];
+  const visibleByOrigin=new Map(),rpcOrigins=[];
+  function serverTable(rows){
+    const builder={select(){return builder;},gte(){return builder;},lte(){return builder;},eq(){return builder;},in(){return builder;},order(){return builder;},
+      range:(from,to)=>Promise.resolve({data:rows.slice(from,to+1),error:null})};
+    return builder;
+  }
+  const db={
+    from(table){
+      if(table==='window_prices')return serverTable(windowRows);
+      if(table==='origin_regions')return serverTable([]);
+      return serverTable([]);
+    },
+    rpc(name,args){
+      assert.equal(name,'publish_daily_origin_window_candidates');
+      rpcOrigins.push(args.p_origin);
+      if(args.p_origin==='FRA')return Promise.resolve({data:null,error:new Error('FRA window RPC failed')});
+      visibleByOrigin.set(args.p_origin,args.p_candidates);
+      return Promise.resolve({data:true,error:null});
+    },
+  };
+
+  await assert.rejects(()=>main({db,instant,force:true,expectedOrigins:new Set(['MUC','FRA'])}),/FRA window RPC failed/);
+  assert.deepEqual(rpcOrigins,['MUC','FRA']);
+  assert.ok(visibleByOrigin.get('MUC')?.length,
+    'FRA failure is reported without deleting, invalidating, or globally barring the earlier MUC publication');
+  assert.equal(visibleByOrigin.has('FRA'),false);
+});
 
 test('selection never waits for source freshness: publishes immediately from a stale source, freshness fraction is recorded but never blocks',async()=>{
   const { main } = await import('./snapshot-daily-window-candidates.mjs');
