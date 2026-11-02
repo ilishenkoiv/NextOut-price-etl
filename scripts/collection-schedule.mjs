@@ -1,5 +1,6 @@
 // Shared sequential scheduling core. No network, environment secrets or process
 // side effects on import. Adapters perform one bounded, checkpointed unit at a time.
+import { mainSuccessorCheckpoint } from './main-outstanding.mjs';
 const MINUTE = 60_000;
 export const CYCLE_MS = 30 * MINUTE;
 // export const MAIN_CYCLE_MS = 12 * 60 * MINUTE; // two main passes/day — uncomment to restore
@@ -124,8 +125,19 @@ export function prepareJob(state, task, timestamp) {
     state.missedPriority += Math.max(0,requestedId-current.id-(current.done?1:0));
   // An unfinished main/tail/maintenance pass survives midnight, missed slots and
   // runner replacement. Never advance its plan date just because time advanced.
-  if (current && (current.id === requestedId || (!current.done && task !== 'fast' && task !== 'priority'))) return current;
-  const next = newJob(task, requestedId, timestamp);
+  if (current && !current.done && task !== 'fast' && task !== 'priority') return current;
+  // MAIN is continuous rather than bucket-capped: once a pass completes, its successor must get
+  // a fresh durable identity immediately, even when both passes start inside the same UTC 24-hour
+  // bucket. Keeping the id numeric and monotonic preserves the bigint route-observation contract;
+  // the fresh traversal checkpoint and distinct durable-plan key make every successor rebuild from current
+  // dead/evidence/sample/revival/watch/expansion inputs. Once created, the unfinished guard above
+  // makes repeated ticks reuse that successor instead of creating duplicates.
+  const nextId = task === 'main' && current?.done
+    ? Math.max(requestedId, Number(current.id) + 1)
+    : requestedId;
+  if (current && current.id === nextId) return current;
+  const next = newJob(task, nextId, timestamp);
+  if (task === 'main' && current?.done) next.checkpoint = mainSuccessorCheckpoint(current);
   // The daily weekend-refresh cursor lives across 30-minute priority cycles. Each cycle gets a
   // fresh due/deadline identity while retaining the stable daily-set checkpoint.
   if (task === 'priority' && current?.checkpoint) next.checkpoint = structuredClone(current.checkpoint);
@@ -251,7 +263,10 @@ export class SequentialSchedule {
             after.mainCompletions=[...(after.mainCompletions??[]),{id:job.id,startedAt:job.startedAt,completedAt:this.clock(),
               errors:after.jobs[task].checkpoint?.errors??0,wave:after.jobs[task].checkpoint?.wave??0,
               activeMs:after.jobs[task].activeMs,coverageComplete:after.jobs[task].checkpoint?.coverageComplete===true,
-              outcomes:after.jobs[task].checkpoint?.outcomes??null,retryAttempts:after.jobs[task].checkpoint?.retryAttempts??0}].slice(-16);
+              outcomes:after.jobs[task].checkpoint?.outcomes??null,retryAttempts:after.jobs[task].checkpoint?.retryAttempts??0,
+              unresolvedCells:after.jobs[task].checkpoint?.unresolvedCells??[],
+              outstanding:after.jobs[task].checkpoint?.outstanding??[],
+              unidentifiedOutstanding:after.jobs[task].checkpoint?.unidentifiedOutstanding??[]}].slice(-16);
           }
         }
         if(!reserve&&task===phase.task&&['done','empty','yield'].includes(result.status))after.frame={cycle,phase:after.frame.phase+1,spentMs:0,prioritySpentMs:after.frame.prioritySpentMs??0};
