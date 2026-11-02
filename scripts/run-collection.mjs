@@ -11,6 +11,9 @@ import { publishPilotState } from './pilot-price-metadata.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
+import { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
+
+export { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
 
 // Headroom an off-cycle (priority-not-due) trigger must always leave before the next real due
 // (priority) cycle. Generous relative to observed GH Actions/DB overhead (a due session's own
@@ -27,9 +30,9 @@ export const DAILY_SELECTION_RETRY_MS = 30 * 60_000;
 // Post-selection point-refresh budget: how long, at most, the same session spends confirming the
 // day's freshly-selected tickets via the provider (select -> point-refresh -> publish) before
 // moving on. Capped independently of the session length so a huge pool never starves MAIN/FAST.
-export const DAILY_SELECTION_REFRESH_MAX_MS = 10 * 60_000;
-// Always leave at least this much of the session for MAIN/priority/etc after selection+refresh.
-export const DAILY_SELECTION_REFRESH_RESERVE_MS = 5 * 60_000;
+// Always leave at least DAILY_SELECTION_REFRESH_RESERVE_MS of the session for MAIN/priority/etc
+// after selection+refresh. Both unchanged values live in daily-selection-budget.mjs so the manual
+// recovery publisher uses the same refresh cap.
 
 export async function noOtherActiveRuns(env, fetchImpl = fetch) {
   if (!env.GITHUB_TOKEN || !/^\d+$/.test(env.GITHUB_RUN_ID ?? '') || !/^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? '')) return false;
@@ -86,14 +89,6 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   // already been collected, point-refreshing the SELECTED tickets first (order: select ->
   // point-refresh -> publish). Exactly one selection per Berlin day: rouletteDone/windowDone,
   // once true, are never re-attempted for the same `day`.
-  if(!checkpoint.rouletteDone){
-    if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
-    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider,refreshDeadline});
-    checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
-    checkpoint.rouletteFreshFraction=result?.freshFraction??null;checkpoint.rouletteRefresh=result?.refresh??null;
-    checkpoint.rouletteRank1Rows=result?.rank1Rows??null;checkpoint.roulettePoolRows=result?.poolRows??null;
-    await store.save(state);published ||= checkpoint.roulettePublished===true;
-  }
   if(!checkpoint.windowDone){
     if(!await store.lease())throw new Error('Daily window selection forbidden: lease lost');
     const result=await publishWindows({db,instant,wave,pilotMarketSchedule,provider,refreshDeadline});
@@ -106,6 +101,14 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
       if(state.jobs.priority.checkpoint)state.jobs.priority.checkpoint.phase='roulette';
       await store.save(state);
     }
+  }
+  if(!checkpoint.rouletteDone){
+    if(!await store.lease())throw new Error('Daily roulette selection forbidden: lease lost');
+    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider,refreshDeadline});
+    checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
+    checkpoint.rouletteFreshFraction=result?.freshFraction??null;checkpoint.rouletteRefresh=result?.refresh??null;
+    checkpoint.rouletteRank1Rows=result?.rank1Rows??null;checkpoint.roulettePoolRows=result?.poolRows??null;
+    await store.save(state);published ||= checkpoint.roulettePublished===true;
   }
   if(checkpoint.rouletteDone&&checkpoint.windowDone)checkpoint.completedAt=Date.now();
   await store.save(state);
@@ -244,11 +247,12 @@ export async function main(env=process.env){
             errors:j.checkpoint?.errors,...(k==='main'?{outcomes:j.checkpoint?.outcomes,coverageComplete:j.checkpoint?.coverageComplete,
               retryRound:j.checkpoint?.retryRound??0}:{}),...(k==='priority'?{phase:j.checkpoint?.phase,
               roulette:{cursor:j.checkpoint?.roulette?.cursor,total:j.checkpoint?.roulette?.total,done:j.checkpoint?.roulette?.done,
-                snapshotAt:j.checkpoint?.roulette?.snapshotAt,
+                admittedAt:j.checkpoint?.roulette?.admittedAt,snapshotAt:j.checkpoint?.roulette?.snapshotAt,
                 technicalDeferred:j.checkpoint?.roulette?.technicalDeferred??[],
                 technicalOutcomes:j.checkpoint?.roulette?.technicalOutcomes??[]},
               window:{cursor:j.checkpoint?.weekend?.cursor,total:j.checkpoint?.weekend?.total,done:j.checkpoint?.weekend?.done,
-                snapshotAt:j.checkpoint?.weekend?.snapshotAt,currentDayComplete:j.checkpoint?.weekend?.currentDayComplete,
+                admittedAt:j.checkpoint?.weekend?.admittedAt,snapshotAt:j.checkpoint?.weekend?.snapshotAt,setId:j.checkpoint?.weekend?.setId,
+                currentDayComplete:j.checkpoint?.weekend?.currentDayComplete,
                 blockedReason:j.checkpoint?.weekend?.blockedReason,sourceObservedOn:j.checkpoint?.weekend?.sourceObservedOn}}:{})}]))}));
         lastReport=Date.now();
       }

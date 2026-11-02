@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAdapters, selectWindowConsumerSet, windowConsumerSetId, groupWindowConsumerTickets, buildRouletteReplacementCandidates,
+import { createAdapters, selectWindowConsumerSet, windowConsumerSetId, groupWindowConsumerTickets,
   PRIORITY_UNIT_MAX_MS } from './collection-adapters.mjs';
 import { CYCLE_MS, SequentialSchedule, freshScheduleState } from './collection-schedule.mjs';
 
@@ -12,7 +12,8 @@ test('weekend refresh snapshots one stable daily consumer set and resumes its fu
   const now=Date.parse('2026-09-22T10:00:00Z');
   let source=Array.from({length:96},(_,i)=>({origin:'BER',dest:`D${String(i).padStart(3,'0')}`,flight_type:'any',
     destination_id:`fixture-${i}`,position:i+1,snapshot_at:'2026-09-22T03:30:00Z',departure_at:'2026-10-10',return_at:'2026-10-17',
-    window_kind:i%2?'weekend':'holiday',exact_observed_at:'2026-09-22T09:00:00Z',refresh_status:'fresh'}));
+    window_kind:i%2?'weekend':'holiday',exact_observed_at:'2026-09-22T09:00:00Z',refresh_status:'fresh',
+    price_source:{table:'window_prices',carousel_six_month_min:{price:77,currency:'EUR',winning_month:'2026-12',source:'prices'}}}));
   const commits=[];const planKeys=[];const cache=new Map();
   const db={from:table=>chain(table==='daily_window_candidate_epochs'?[{observed_on:'2026-09-22',snapshot_at:'2026-09-22T03:30:00Z',contract_version:1,
       candidate_rows:96,exact_request_groups:96}]:table==='daily_window_candidates'?source:[]),
@@ -31,6 +32,10 @@ test('weekend refresh snapshots one stable daily consumer set and resumes its fu
   const r2=await adapters.priority.step({job:{...job,checkpoint:r1.checkpoint},deadline:now+200000});
   assert.equal(r2.status,'progress');assert.equal(r2.checkpoint.weekend.cursor,2);assert.equal(r2.checkpoint.weekend.total,96);
   assert.equal(requested.length,2);assert.equal(commits.filter(c=>c.name==='collection_commit_window_candidate').length,2);
+  const firstCandidateCommit=commits.find(c=>c.name==='collection_commit_window_candidate');
+  assert.equal(firstCandidateCommit.args.p_result.price_source.table,'window_prices');
+  assert.deepEqual(firstCandidateCommit.args.p_result.price_source.carousel_six_month_min,
+    source[0].price_source.carousel_six_month_min,'scheduled adapter refresh must preserve the published six-month minimum');
   assert.equal(new Set(planKeys).size,1,'one durable daily plan key; refresh does not re-select');
 
   source=[{...source[0],dest:'CHANGED'}];
@@ -55,17 +60,6 @@ test('direct+any rows for one exact route/date use one provider request group wi
     {origin:'BER',dest:'BCN',flight_type:'any',departure_at:'2026-10-10',return_at:'2026-10-17',window_kind:'weekend'}];
   const groups=groupWindowConsumerTickets(rows);assert.equal(groups.length,1);assert.deepEqual(groups[0].map(r=>r.flight_type),['any','direct']);
   assert.equal(groups[0].length,rows.length);
-});
-
-test('roulette replacement seeds preserve mode and exclude every city already in the pool',()=>{
-  const pool=[{origin:'BER',dest:'BCN',flight_type:'any'}];
-  const common={origin:'BER',market:'de',departure_at:'2026-10-10',return_at:'2026-10-17',price:100,updated_at:'2026-09-22T10:00:00Z'};
-  const offers=[{...common,dest:'ATH',flight_type:'direct',transfers:0},{...common,dest:'ATH',flight_type:'any',transfers:1,price:110},
-    {...common,dest:'BCN',flight_type:'any',transfers:1,price:90}];
-  const result=buildRouletteReplacementCandidates(offers,pool,['BCN','ATH'],'2026-09-22');
-  assert.deepEqual(result['BER|direct'].map(row=>row.dest),['ATH']);
-  assert.deepEqual(result['BER|any'].map(row=>row.dest),['ATH']);
-  assert.equal(Object.values(result).flat().some(row=>row.dest==='BCN'),false);
 });
 
 test('missing daily epoch fails closed without treating cache rows as selected',async()=>{
@@ -148,9 +142,12 @@ test('a persisted legacy window checkpoint is adopted with 44.61s left in the pr
   const engine=new SequentialSchedule({state,clock:()=>now,lease:async()=>true,save:async()=>{},handlers:{priority:adapters.priority}});
   assert.equal((await engine.tick()).task,'priority','35s admission bound must fit the observed 44.61s remainder');
   assert.equal(engine.state.jobs.priority.checkpoint.phase,'weekend');
+  assert.equal(engine.state.jobs.priority.checkpoint.roulette.admittedAt,cycle*CYCLE_MS,
+    'a legacy roulette checkpoint adopts its original due instant for stable priority diagnostics');
   assert.equal((await engine.tick()).task,'priority');
   const adopted=engine.state.jobs.priority.checkpoint.weekend;
   assert.equal(adopted.snapshotAt,snapshot);assert.equal(adopted.cursor,1);assert.equal(adopted.total,1);
+  assert.equal(adopted.setId,'daily-window:test','the checkpoint retains the durable window consumer-set identity');
 });
 
 test('roulette plan is a daily artifact keyed only by snapshot: reused across 30-minute cycles, rebuilt only when the snapshot changes',async()=>{

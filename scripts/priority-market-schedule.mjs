@@ -92,6 +92,15 @@ export function originDueThisCycle(instant, origin) {
   return dueForInterval(instant, policy.intervalMs);
 }
 
+// Owner-controlled selected-ticket refresh: Berlin 08:00 through 22:30, every coordinator
+// half-hour.  The caller must additionally hold the durable server control; this pure gate never
+// enables itself and deliberately does not affect MAIN/FAST/TAIL admission.
+export function selectedPriceRefreshDue(instant, enabled = false) {
+  if (!enabled) return false;
+  const minute = localMinuteOfDay(instant, BERLIN_TIME_ZONE);
+  return minute >= 8 * HOUR && minute <= 22 * HOUR + 30 && minute % 30 === 0;
+}
+
 // Partitions a list of {origin,...} tickets into [due, notDueThisCycle] under the pilot policy.
 // notDueThisCycle tickets keep their existing stored price/source_updated_at untouched this
 // cycle — they are picked up again the next time the shared cadence is due.

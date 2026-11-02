@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { localMinuteOfDay, localWeekday, dueForInterval, priorityMarketPolicy, originDueThisCycle, partitionTicketsByMarketSchedule } from './priority-market-schedule.mjs';
+import { localMinuteOfDay, localWeekday, dueForInterval, priorityMarketPolicy, originDueThisCycle, partitionTicketsByMarketSchedule, selectedPriceRefreshDue } from './priority-market-schedule.mjs';
 import { CYCLE_MS } from './collection-schedule.mjs';
 import { readFileSync } from 'node:fs';
 
@@ -113,4 +113,12 @@ test('the evening window is documented as a search/discovery-based pilot, never 
   assert.match(source, /PILOT CAVEAT/);
   assert.match(source, /search\/discovery[\s\S]{0,20}activity patterns/);
   assert.match(source, /NOT a measured or proven[\s\S]{0,20}purchase peak/);
+});
+
+test('selected refresh is OFF unless durable admission is supplied and has exact Berlin boundaries',()=>{
+ assert.equal(selectedPriceRefreshDue(monday(8,0),false),false);
+ assert.equal(selectedPriceRefreshDue(monday(7,30),true),false);
+ assert.equal(selectedPriceRefreshDue(monday(8,0),true),true);
+ assert.equal(selectedPriceRefreshDue(monday(22,30),true),true);
+ assert.equal(selectedPriceRefreshDue(monday(23,0),true),false);
 });

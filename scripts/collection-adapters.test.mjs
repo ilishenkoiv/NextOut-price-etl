@@ -2,17 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAdapters, MAIN_REQUIRED_PROVIDER_CALLS, projectMainCellMs } from './collection-adapters.mjs';
 import { CollectionYield } from './collection-provider.mjs';
+import { prepareJob, freshScheduleState } from './collection-schedule.mjs';
+import { normalizeOutstanding, mainSuccessorCheckpoint } from './main-outstanding.mjs';
 
-function fixture(plan,response,{tableRows={},clock=()=>100000,rpc,lease=async()=>true,storageList}={}){
+function fixture(plan,response,{tableRows={},clock=()=>100000,rpc,lease=async()=>true,storageList,planResolver,getState}={}){
   const calls=[];
   const chain=data=>new Proxy({}, {get:(_,key)=>key==='then'?Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null})):()=>chain(data)});
   const db={rpc:(name,args)=>{calls.push({name,args});return rpc?rpc(name,args):Promise.resolve({data:true,error:null});},
     from:table=>chain(tableRows[table]??[]),storage:{from:()=>({
       upload:async()=>({data:{},error:null}),list:storageList??(async()=>({data:[],error:null})),remove:async()=>({data:[],error:null})})}};
-  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease,plan:async()=>plan,runId:'123'};
+  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease,plan:planResolver??(async()=>plan),runId:'123'};
   let requests=0;
   const provider={request:async url=>{requests++;return response(requests,url);}};
-  return{adapters:createAdapters({db,store,provider,clock,wave:10}),calls,get requests(){return requests;}};
+  return{adapters:createAdapters({db,store,provider,clock,wave:10,getState}),calls,get requests(){return requests;}};
 }
 function withPilotMarketSchedule(fn){
   const previous=process.env.PRIORITY_MARKET_SCHEDULE;process.env.PRIORITY_MARKET_SCHEDULE='pilot';
@@ -21,6 +23,113 @@ function withPilotMarketSchedule(fn){
 const job={id:1,planDate:'2026-09-16',startedAt:100000,checkpoint:null};
 const mainPlan={months:['2027-01'],routes:[{origin:'FRA',dest:'MAD',stops:0,key:'FRA|MAD'}],breakKeys:[]};
 const offer={departure_at:'2027-01-10T08:00:00Z',return_at:'2027-01-17T09:00:00Z',price:123,transfers:0};
+
+const debt={origin:'FRA',dest:'MAD',month:'2027-01',horizon:['2027-01'],breakKeys:[],wave:10,
+  passIds:[1],cellIds:{1:0},status:'pending',attempts:0,planDate:job.planDate};
+
+test('completed unresolved pass survives durable successor rotation and resolves against a different plan',async()=>{
+  const failed=fixture(mainPlan,()=>({kind:'refused',refusal:'server'}));
+  const first=await failed.adapters.main.step({job,deadline:200000});
+  const done=await failed.adapters.main.step({job:{...job,checkpoint:first.checkpoint},deadline:200000});
+  assert.equal(done.checkpoint.coverageComplete,false);assert.equal(done.checkpoint.outstanding.length,1);
+  const state=freshScheduleState();state.jobs.main={...job,done:true,checkpoint:done.checkpoint};
+  const successor=prepareJob(state,'main',100001);
+  // Simulate the scheduler's fenced save and a runner restart before any provider work.
+  const saved=JSON.parse(JSON.stringify(successor));
+  assert.equal(saved.checkpoint.outstanding[0].dest,'MAD');
+  const urls=[];
+  const changed={...mainPlan,routes:[{origin:'LHR',dest:'DUB',key:'LHR|DUB'}]};
+  const recovered=fixture(changed,(_n,url)=>{urls.push(url);return okFare(120,url.includes('direct=true')?0:1);});
+  const result=await recovered.adapters.main.step({job:saved,deadline:200000});
+  assert.match(urls[0],/origin=FRA/);assert.match(urls[4],/origin=LHR/);
+  assert.equal(result.checkpoint.cursor,1);assert.equal(result.checkpoint.carryResolved,1);
+  assert.deepEqual(result.checkpoint.outstanding,[]);assert.equal(result.checkpoint.coverageComplete,true);
+  assert.equal(done.checkpoint.outcomes.unresolved,1,'historical pass is not rewritten as coverage');
+});
+
+test('duplicate debt merges pass context and a matching normal cell resolves it with one probe set',async()=>{
+  const outstanding=normalizeOutstanding([debt,{...debt,passIds:[2],cellIds:{2:8}}]);
+  assert.equal(outstanding.length,1);assert.deepEqual(outstanding[0].passIds,[1,2]);
+  const f=fixture(mainPlan,(_n,url)=>okFare(120,url.includes('direct=true')?0:1));
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:{cursor:0,errors:0,outstanding,carryTurn:true}},deadline:200000});
+  assert.equal(f.requests,4);assert.deepEqual(result.checkpoint.outstanding,[]);
+  assert.equal(result.checkpoint.outcomes.attempted,1);
+});
+
+test('carry failures persist across restart and cannot monopolize successive MAIN units',async()=>{
+  let now=100000;
+  const changed={...mainPlan,routes:[{origin:'LHR',dest:'DUB',key:'LHR|DUB'}]};
+  const f=fixture(changed,(n,url)=>{if(n===4)now+=61000;return {kind:'refused',refusal:'server'};},{clock:()=>now});
+  const current={...job,id:3,checkpoint:{cursor:0,errors:0,outstanding:[debt],carryTurn:true}};
+  const first=await f.adapters.main.step({job:current,deadline:300000});
+  assert.equal(first.checkpoint.cursor,0);assert.equal(first.checkpoint.carryTurn,false);
+  assert.equal(first.checkpoint.outstanding[0].attempts,1);
+  const saved=JSON.parse(JSON.stringify(first.checkpoint));
+  const next=fixture(changed,(_n,url)=>okFare(120,url.includes('direct=true')?0:1),{clock:()=>now});
+  const second=await next.adapters.main.step({job:{...current,checkpoint:saved},deadline:300000});
+  assert.equal(second.checkpoint.cursor,1,'new traversal resumes despite failed old debt');
+  assert.equal(second.checkpoint.outstanding.length,1);assert.equal(second.checkpoint.coverageComplete,false);
+});
+
+test('changed eligibility keeps expired debt explicit without probing it or blocking new traversal',async()=>{
+  const f=fixture(mainPlan,(_n,url)=>okFare(120,url.includes('direct=true')?0:1));
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:{cursor:0,errors:0,
+    outstanding:[{...debt,month:'2026-08',horizon:['2026-08']}],carryTurn:true}},deadline:200000});
+  assert.equal(f.requests,4);assert.equal(result.status,'done');
+  assert.equal(result.checkpoint.outstanding[0].status,'expired_month');
+  assert.equal(result.checkpoint.coverageComplete,false);
+});
+
+test('legacy missing IDs remain unidentified evidence, never invented or silently marked complete',async()=>{
+  const cp=mainSuccessorCheckpoint({...job,checkpoint:{outcomes:{unresolved:12},errors:48}});
+  assert.deepEqual(cp.unidentifiedOutstanding,[{passId:1,count:12}]);assert.deepEqual(cp.outstanding,[]);
+  const f=fixture(mainPlan,(_n,url)=>okFare(120,url.includes('direct=true')?0:1));
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:cp},deadline:200000});
+  assert.equal(result.status,'done');assert.equal(result.checkpoint.coverageComplete,false);
+  assert.deepEqual(result.checkpoint.unidentifiedOutstanding,cp.unidentifiedOutstanding);
+});
+
+test('deadline yield retains carried identity and current cursor without fabricated outcomes',async()=>{
+  const f=fixture(mainPlan,()=>{throw new CollectionYield('boundary');});
+  const cp={cursor:0,errors:0,outstanding:[debt],carryTurn:true};
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:cp},deadline:200000});
+  assert.equal(result.status,'yield');assert.equal(result.checkpoint.cursor,0);
+  assert.deepEqual(result.checkpoint.outstanding[0].passIds,[1]);
+  assert.equal(result.checkpoint.outcomes.attempted,0);
+});
+
+test('legacy numeric cells hydrate only from the original plan even after successor reordering',async()=>{
+  const changed={...mainPlan,routes:[{origin:'LHR',dest:'DUB',key:'LHR|DUB'}]};
+  const keys=[];
+  const f=fixture(changed,(_n,url)=>okFare(120,url.includes('direct=true')?0:1),{
+    planResolver:async key=>{keys.push(key);return key.includes('main-1-10')?mainPlan:changed;}});
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:{cursor:0,errors:0,carryTurn:true,
+    legacyUnresolved:[{id:1,planDate:job.planDate,wave:10,cellIds:[0]}]}},deadline:200000});
+  assert.deepEqual(keys,['coordinator/main-1-10.json','coordinator/main-3-10.json']);
+  assert.equal(f.calls[0].args.p_price.dest,'MAD');assert.equal(result.checkpoint.carryResolved,1);
+  assert.deepEqual(result.checkpoint.legacyUnresolved,[]);
+});
+
+test('plan-read deadline exhaustion returns the prior cursor and retained debt as a saveable yield',async()=>{
+  const cp={cursor:9,errors:4,outstanding:[debt],carryTurn:false};
+  const f=fixture(mainPlan,()=>assert.fail('no provider call'),{
+    planResolver:async()=>{throw new CollectionYield('Durable plan deadline exhausted');}});
+  const result=await f.adapters.main.step({job:{...job,id:3,checkpoint:cp},deadline:200000});
+  const restarted=JSON.parse(JSON.stringify(result.checkpoint));
+  assert.equal(result.status,'yield');assert.equal(restarted.cursor,9);assert.equal(restarted.errors,4);
+  assert.equal(restarted.outstanding[0].dest,'MAD');assert.equal(f.requests,0);
+});
+
+test('legacy completion history without IDs remains explicit after a successful new traversal',async()=>{
+  const history={id:20725,outcomes:{unresolved:12},errors:48,coverageComplete:false};
+  const f=fixture(mainPlan,(_n,url)=>okFare(120,url.includes('direct=true')?0:1),{
+    getState:()=>({mainCompletions:[history,history]})});
+  const result=await f.adapters.main.step({job,deadline:200000});
+  assert.equal(result.checkpoint.traversalCoverageComplete,true);
+  assert.equal(result.checkpoint.coverageComplete,false);
+  assert.deepEqual(result.checkpoint.unidentifiedOutstanding,[{passId:20725,count:12}]);
+  assert.deepEqual(result.checkpoint.outstanding,[],'no historical identities invented');
+});
 
 test('MAIN capacity counts four mandatory calls plus explicit fallback/retry overhead',()=>{
   assert.equal(MAIN_REQUIRED_PROVIDER_CALLS,4);assert.equal(projectMainCellMs({requestMs:500,dbMs:100}),2100);
@@ -165,7 +274,7 @@ test('pilot market schedule (off by default): a night-hours instant skips priori
     const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
     const nightUtc=Date.parse('2026-01-15T01:00:00Z'); // 02:00 Europe/Berlin — night, mainOnly
     const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc});
-    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:nightUtc,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
     assert.equal(f.requests,0,'no provider call for an origin whose market-local time is inside the night gap');
     assert.equal(result.checkpoint.roulette.total,0);
@@ -178,7 +287,7 @@ test('pilot market schedule (off by default): a DACH peak-hours instant still re
     const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
     const peakUtc=Date.parse('2026-01-15T19:00:00Z'); // 20:00 Europe/Berlin — DACH peak (19:00-23:00)
     const f=fixture({tickets:[ticket],allowedDests:[],replacements:{}},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc});
-    const checkpoint={cycle:job.id,phase:'roulette',dueAt:0,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
+    const checkpoint={cycle:job.id,phase:'roulette',dueAt:peakUtc,roulette:{cycle:job.id,cursor:0,errors:0,done:false}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
     assert.equal(f.requests,1,'the one selected ticket is still refreshed at peak local time');
     assert.equal(result.checkpoint.roulette.total,1);
@@ -193,7 +302,7 @@ test('pilot market schedule (window/carousel path): a night-hours instant skips 
     const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
     const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>nightUtc,
       tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
-    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:nightUtc,roulette:{done:true}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:nightUtc+200000});
     assert.equal(f.requests,0,'no provider call for a window group whose origin is inside the night gap');
     assert.equal(result.checkpoint.weekend.total,0);
@@ -209,7 +318,7 @@ test('pilot market schedule (window/carousel path): a DACH peak-hours instant st
     const plan={day:'2026-01-15',setId:'daily-window:test',selectedAt:'2026-01-15T00:00:00Z',tickets:[ticket],groups:[[ticket]]};
     const f=fixture(plan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>peakUtc,
       tableRows:{daily_window_candidate_epochs:[{observed_on:'2026-01-15',snapshot_at:'2026-01-15T00:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1}]}});
-    const checkpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true}};
+    const checkpoint={cycle:job.id,phase:'weekend',dueAt:peakUtc,roulette:{done:true}};
     const result=await f.adapters.priority.step({job:{...job,checkpoint},deadline:peakUtc+200000});
     assert.equal(f.requests,1,'the one selected window group is still refreshed at peak local time');
     assert.equal(result.checkpoint.weekend.total,1);
@@ -254,16 +363,16 @@ test('weekend phase: an unchanged latest epoch (retry/resume) continues the curs
   assert.equal(result.checkpoint.weekend.done,true);
 });
 
-test('weekend phase: a new epoch publication (or Berlin-day rollover, which always emits one) invalidates in-flight progress',async()=>{
+test('weekend phase: a new epoch waits while the admitted old-epoch pass completes',async()=>{
   const newEpoch={observed_on:'2026-01-16',snapshot_at:'2026-01-16T00:00:00Z',contract_version:1,candidate_rows:2,exact_request_groups:2};
   const f=fixture(twoGroupPlan,()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>someUtc,
     tableRows:{daily_window_candidate_epochs:[newEpoch]}});
   const staleCheckpoint={cycle:job.id,phase:'weekend',dueAt:0,roulette:{done:true},
     weekend:{day:'2026-01-15',dayId:1,cursor:1,done:false,errors:3,passStartedAt:0,snapshotAt:'2026-01-15T00:00:00Z'}};
   const result=await f.adapters.priority.step({job:{...job,checkpoint:staleCheckpoint},deadline:someUtc+200000});
-  assert.equal(result.checkpoint.weekend.snapshotAt,newEpoch.snapshot_at,'adopts the new latest epoch');
-  assert.equal(result.checkpoint.weekend.cursor,1,'restarts at group 0 and advances to 1, discarding the stale cursor=1 from the old epoch');
-  assert.equal(result.checkpoint.weekend.errors,0,'stale error count from the superseded epoch is not carried forward');
+  assert.equal(result.checkpoint.weekend.snapshotAt,'2026-01-15T00:00:00Z','keeps the admitted epoch until cursor reaches total');
+  assert.equal(result.checkpoint.weekend.cursor,2,'continues the pending group instead of restarting or skipping it');
+  assert.equal(result.checkpoint.weekend.errors,3,'in-flight diagnostics remain attached to the admitted pass');
 });
 
 test('weekend phase: no epoch rows at all is reported as blocked, not an empty-latest-row crash',async()=>{

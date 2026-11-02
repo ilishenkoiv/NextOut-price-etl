@@ -40,7 +40,7 @@ test('due daily selection is serialized by the lease and fenced after each check
   const result=await runDueDailySelection({state,store,db:{},instant,wave:43,
     publishRoulette:async args=>{calls.push(['roulette',args]);return{rebuilt:true};},
     publishWindows:async args=>{calls.push(['window',args]);return{published:true};}});
-  assert.deepEqual(calls.map(c=>c[0]),['roulette','window']);
+  assert.deepEqual(calls.map(c=>c[0]),['window','roulette']);
   assert.equal(result.published,true);assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');assert.ok(saved.length>=4);
   await runDueDailySelection({state,store,db:{},instant,wave:43,
@@ -107,12 +107,12 @@ test('day boundary: yesterday\'s completed selection does not block today\'s —
     publishRoulette:async args=>{calls.push('roulette');return{rebuilt:true};},
     publishWindows:async args=>{calls.push('window');return{published:true};}});
   assert.equal(state.dailySelection.day,'2026-09-24','the checkpoint moved to the new Berlin day, not reusing yesterday\'s');
-  assert.deepEqual(calls,['roulette','window'],'both paths rebuild for the new day — neither is silently skipped as "already done"');
+  assert.deepEqual(calls,['window','roulette'],'both paths rebuild for the new day — neither is silently skipped as "already done"');
   assert.equal(result.published,true);
   assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,true);
 });
 
-test('order within one call: roulette publishes before window is even attempted (select -> point-refresh -> publish, per path, in sequence)',async()=>{
+test('order within one call: window publishes before roulette is even attempted (select -> point-refresh -> publish, per path, in sequence)',async()=>{
   const instant=Date.parse('2026-09-24T05:05:00Z');
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
   const store={lease:async()=>true,save:async()=>{}};
@@ -120,7 +120,7 @@ test('order within one call: roulette publishes before window is even attempted 
   const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
     publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true,freshFraction:1,refresh:{attempted:10,refreshed:9,misses:1,errors:0,total:10}};},
     publishWindows:async()=>{calls.push('window');return{published:true,freshFraction:1,refresh:{attempted:5,refreshed:5,misses:0,errors:0,total:5}};}});
-  assert.deepEqual(calls,['roulette','window'],'roulette (select+refresh+publish) completes fully before window starts');
+  assert.deepEqual(calls,['window','roulette'],'window (select+refresh+publish) completes fully before roulette starts');
   assert.equal(result.published,true);
   assert.equal(state.dailySelection.rouletteDone,true);
   assert.equal(state.dailySelection.windowDone,true);
@@ -129,7 +129,7 @@ test('order within one call: roulette publishes before window is even attempted 
   assert.equal(state.dailySelection.windowRefresh.refreshed,5);
 });
 
-test('same-day recovery after a window publication failure resumes only window and preserves the completed roulette checkpoint',async()=>{
+test('same-day recovery after a window publication failure resumes window before the unattempted roulette checkpoint',async()=>{
   const instant=Date.parse('2026-09-24T05:05:00Z');
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
   const saves=[];const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
@@ -137,15 +137,15 @@ test('same-day recovery after a window publication failure resumes only window a
   await assert.rejects(()=>runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
     publishRoulette:async()=>{rouletteCalls++;return{rebuilt:true,rank1Rows:44,poolRows:220};},
     publishWindows:async()=>{windowCalls++;throw new Error('invalid daily window candidate row');}}),/invalid daily window candidate row/);
-  assert.equal(rouletteCalls,1);assert.equal(windowCalls,1);
-  assert.equal(state.dailySelection.rouletteDone,true);assert.equal(state.dailySelection.windowDone,false);
+  assert.equal(rouletteCalls,0);assert.equal(windowCalls,1);
+  assert.equal(state.dailySelection.rouletteDone,false);assert.equal(state.dailySelection.windowDone,false);
   assert.equal(state.jobs.priority.done,true,'priority is not reset against the old window epoch after a failed publication');
   state.dailySelection.lastError={message:'invalid daily window candidate row',at:instant};await store.save(state);
   assert.equal(dailySelectionRetryThrottled(state,instant+5*60_000),true,'same-day recovery obeys the 30-minute throttle');
 
   const retryAt=instant+31*60_000;
   const recovered=await runDueDailySelection({state,store,db:{},instant:retryAt,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
-    publishRoulette:async()=>{throw new Error('completed roulette must not run again');},
+    publishRoulette:async()=>{rouletteCalls++;return{rebuilt:true,rank1Rows:44,poolRows:220};},
     publishWindows:async()=>{windowCalls++;return{published:true,candidateRows:873,freshFraction:0.8};}});
   if(state.dailySelection.lastError){delete state.dailySelection.lastError;await store.save(state);}
   assert.equal(recovered.published,true);assert.equal(rouletteCalls,1);assert.equal(windowCalls,2);
@@ -153,8 +153,27 @@ test('same-day recovery after a window publication failure resumes only window a
   assert.equal(state.dailySelection.windowCandidateRows,873);assert.ok(state.dailySelection.completedAt);
   assert.equal(state.dailySelection.lastError,undefined);
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');
-  assert.ok(saves.some(saved=>saved.dailySelection?.rouletteDone===true&&saved.dailySelection?.windowDone!==true),
-    'partial success is durably checkpointed before window recovery');
+  assert.ok(saves.some(saved=>saved.dailySelection?.rouletteDone!==true&&saved.dailySelection?.windowDone===true),
+    'partial window success is durably checkpointed before roulette runs');
+});
+
+test('a FRA roulette completeness failure leaves the eligible current window epoch published and checkpointed',async()=>{
+  const instant=Date.parse('2026-11-01T21:28:56Z');
+  const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
+  const saves=[];const calls=[];
+  const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
+  await assert.rejects(()=>runDueDailySelection({state,store,db:{},instant,wave:0,
+    publishWindows:async()=>{calls.push('window');return{published:true,candidateRows:873};},
+    publishRoulette:async()=>{calls.push('roulette');throw new Error('Daily roulette publication requires exactly 10 real cities for FRA (0/10)');}}),
+    /requires exactly 10 real cities for FRA \(0\/10\)/);
+  assert.deepEqual(calls,['window','roulette']);
+  assert.equal(state.dailySelection.day,'2026-11-01');
+  assert.equal(state.dailySelection.windowDone,true);assert.equal(state.dailySelection.windowPublished,true);
+  assert.equal(state.dailySelection.windowCandidateRows,873);
+  assert.equal(state.dailySelection.rouletteDone,false,'failed roulette remains retryable');
+  assert.equal(state.jobs.priority.done,false,'the newly published window epoch is admitted to priority');
+  assert.ok(saves.some(saved=>saved.dailySelection?.windowDone===true&&saved.dailySelection?.rouletteDone!==true),
+    'the window checkpoint is durable before the roulette error escapes for normal error recording');
 });
 
 test('legacy (pilotMarketSchedule unset) behaves exactly as the pilot path — both always publish immediately, no freshness gate either way',async()=>{
@@ -222,6 +241,9 @@ test('off-cycle MAIN advance never offers a priority handler and never calls run
 
 test('regular progress logs expose only the checkpointed safe roulette technical diagnostics and later per-key outcomes',()=>{
   const projection=source.slice(source.indexOf("...(k==='priority'?{phase:j.checkpoint?.phase"),source.indexOf("window:{cursor:j.checkpoint?.weekend?.cursor"));
+  const priorityProjection=source.slice(source.indexOf("...(k==='priority'?{phase:j.checkpoint?.phase"),source.indexOf("}}:{})}]))}"));
+  assert.match(priorityProjection,/roulette:\{cursor:[^}]*total:[^}]*admittedAt:[^}]*snapshotAt:/);
+  assert.match(priorityProjection,/window:\{cursor:[^}]*total:[^}]*admittedAt:[^}]*snapshotAt:[^}]*setId:/);
   assert.match(projection,/technicalDeferred:j\.checkpoint\?\.roulette\?\.technicalDeferred\?\?\[\]/);
   assert.match(projection,/technicalOutcomes:j\.checkpoint\?\.roulette\?\.technicalOutcomes\?\?\[\]/);
   assert.doesNotMatch(projection,/TP_TOKEN|Authorization|headers|response\.json|providerUrl/);
