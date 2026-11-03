@@ -28,35 +28,59 @@ test('daily owner publishes ten fixed ranked cities and force never asks SQL to 
 
 test('daily owner reports the immutable same-day SQL no-op',async()=>{
   const db=selectionDb({published:false});const result=await publishSnapshot({db,snapshotAt:'2027-01-05T22:00:00Z',force:true,expectedOrigins:['BER']});
-  assert.deepEqual(result,{rebuilt:false,observedOn:'2027-01-05',snapshotAt:null,reason:'already_published',incompleteOrigins:[]});
+  assert.equal(result.rebuilt,false);assert.equal(result.observedOn,'2027-01-05');assert.equal(result.snapshotAt,null);
+  assert.equal(result.reason,'already_published');assert.deepEqual(result.incompleteOrigins,[]);
 });
 
-test('JavaScript publication guard rejects fewer than ten, duplicate cities, rank gaps and non-positive prices',()=>{
+test('JavaScript publication guard accepts factual contiguous 1–10 pools and rejects malformed rows',()=>{
   const base=offers.map((row,index)=>({...row,rank:index+1}));
-  const invalid=[base.slice(0,9),base.map((r,i)=>({...r,dest:i===9?'AMS':r.dest})),base.map((r,i)=>({...r,rank:i===9?9:r.rank})),base.map((r,i)=>({...r,price:i?r.price:0}))];
-  for(const rows of invalid)assert.throws(()=>assertCompleteDailyRoulettePool(rows,new Set(['BER'])),/exactly 10|duplicate|rank gaps|non-positive/);
+  for(const size of [1,2,3,10])assert.equal(assertCompleteDailyRoulettePool(base.slice(0,size),new Set(['BER'])),true);
+  const invalid=[[],base.map((r,i)=>({...r,dest:i===9?'AMS':r.dest})),base.map((r,i)=>({...r,rank:i===9?9:r.rank})),base.map((r,i)=>({...r,price:i?r.price:0}))];
+  for(const rows of invalid)assert.throws(()=>assertCompleteDailyRoulettePool(rows,new Set(['BER'])),/1–10|duplicate|rank gaps|non-positive/);
 });
 
-test('MUC publishes independently when FRA is incomplete; no MUC ticket is invented when MUC is incomplete',async()=>{
+test('MUC and factual partial FRA pools publish independently; no MUC ticket is invented with no factual input',async()=>{
   const muc=destinations.map((dest,index)=>({...offers[index],origin:'MUC',market:'de',dest,price:100+index}));
   const fra=muc.slice(0,9).map(row=>({...row,origin:'FRA'}));
   const db=selectionDb({rows:[...muc,...fra]});
   const result=await publishSnapshot({db,snapshotAt:'2027-01-05T12:00:00Z',force:true,expectedOrigins:new Set(['MUC','FRA'])});
-  assert.equal(result.rebuilt,true);assert.deepEqual(result.publishedOrigins,['MUC']);
-  assert.deepEqual(result.incompleteOrigins.map(row=>[row.origin,row.availableCities]),[['FRA',9]]);
-  assert.equal(db.writes.length,1);assert.equal(db.writes[0].args.p_origin,'MUC');
+  assert.equal(result.rebuilt,true);assert.deepEqual(result.publishedOrigins,['MUC','FRA']);
+  assert.deepEqual(result.incompleteOrigins,[]);
+  assert.equal(db.writes.length,2);assert.deepEqual(db.writes.map(write=>write.args.p_origin),['MUC','FRA']);
   assert.equal(db.writes[0].args.p_pool.length,10);assert.equal(new Set(db.writes[0].args.p_pool.map(row=>row.dest)).size,10);
 
   const noMuc=selectionDb({rows:fra});
   const none=await publishSnapshot({db:noMuc,snapshotAt:'2027-01-05T12:00:00Z',force:true,expectedOrigins:new Set(['MUC','FRA'])});
-  assert.equal(none.rebuilt,false);assert.equal(none.reason,'no_complete_origins');assert.equal(noMuc.writes.length,0);
+  assert.equal(none.rebuilt,true);assert.deepEqual(none.publishedOrigins,['FRA']);assert.equal(noMuc.writes.length,1);
 });
 
-test('per-origin classifier preserves the ten-real-city reserve invariant without a global preflight',()=>{
+test('per-origin classifier preserves factual contiguous 1–10 pools without a global preflight',()=>{
   const pool=[...offers.map((row,index)=>({...row,origin:'MUC',rank:index+1})),...offers.slice(0,3).map((row,index)=>({...row,origin:'FRA',rank:index+1}))];
   const outcome=completeDailyRoulettePoolsByOrigin(pool,new Set(['MUC','FRA']));
-  assert.equal(outcome.complete.get('MUC').length,10);assert.equal(outcome.complete.has('FRA'),false);
-  assert.deepEqual(outcome.incomplete.map(row=>row.origin),['FRA']);
+  assert.equal(outcome.complete.get('MUC').length,10);assert.equal(outcome.complete.get('FRA').length,3);
+  assert.deepEqual(outcome.incomplete,[]);
+});
+
+test('direct or replayed 3+ partial-rebuild requests never invoke the provider or publication RPC',async()=>{
+  for(const size of [3,10]){
+    const db=selectionDb({rows:offers.slice(0,size)});
+    let providerRequests=0;
+    const request={
+      db,snapshotAt:'2027-01-05T12:00:00Z',force:true,expectedOrigins:new Set(['BER']),
+      rebuildPartialOrigins:['BER'],provider:{request:async()=>{providerRequests++;return {kind:'ok',json:{}};}},
+    };
+    const direct=await publishSnapshot(request);
+    assert.equal(direct.rebuilt,false,'direct request is rejected');
+    assert.equal(direct.reason,'no_valid_partial_rebuild_input');
+    assert.equal(db.reads.filter(read=>read==='offers').length,1);
+
+    const replay=await publishSnapshot(request);
+    assert.equal(replay.rebuilt,false,'replayed request is rejected');
+    assert.equal(replay.reason,'no_valid_partial_rebuild_input');
+    assert.equal(db.reads.filter(read=>read==='offers').length,2,'replay reused the retained database mock');
+    assert.equal(providerRequests,0);
+    assert.equal(db.writes.length,0);
+  }
 });
 
 function harness(tickets,response,{latest='2027-01-05T06:00:00Z',lease=async()=>true}={}){

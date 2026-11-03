@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
+import { hasUsableRouletteDestinationId, selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
   LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES, pilotSourcesReady, freshOriginFraction,
-  PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE } from './snapshot-daily-origin-cheapest.mjs';
+  PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE, rouletteOriginInputFingerprints } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
 
 test('selects one deterministic cheapest real future offer per origin and flight type', () => {
@@ -30,6 +30,25 @@ test('stores up to ten cheapest unique destinations per origin across any and di
   assert.equal(pool[0].price, 49);
   assert.equal(new Set(pool.map((row) => row.dest)).size, 10);
   assert.equal(pool[0].flight_type, 'direct');
+});
+
+test('roulette admission excludes an unmapped candidate before the selector can assign a rank', () => {
+  const candidates = [
+    { origin:'MUC', dest:'FCO', flight_type:'any', price:100, departure_at:'2026-11-20' },
+    { origin:'MUC', dest:'WAW', flight_type:'any', price:50, departure_at:'2026-11-20' },
+  ];
+  const admitted = candidates.filter(hasUsableRouletteDestinationId);
+  assert.deepEqual(admitted.map(row => row.dest), ['FCO']);
+  assert.deepEqual(selectDailyCheapestPool(admitted, '2026-11-03').map(row => [row.dest, row.rank]), [['FCO', 1]]);
+});
+
+test('roulette factual-input fingerprints change for a changed MUC offer but ignore row order',()=>{
+  const rows=[
+    {origin:'MUC',flight_type:'any',dest:'FCO',departure_at:'2026-12-01',return_at:'2026-12-04',price:100,source_updated_at:'2026-11-03T06:01:00.000Z',transfers:0},
+    {origin:'MUC',flight_type:'direct',dest:'ATH',departure_at:'2026-12-02',return_at:'2026-12-05',price:120,source_updated_at:'2026-11-03T06:02:00.000Z',transfers:0},
+  ];
+  assert.equal(rouletteOriginInputFingerprints(rows).MUC,rouletteOriginInputFingerprints([...rows].reverse()).MUC);
+  assert.notEqual(rouletteOriginInputFingerprints(rows).MUC,rouletteOriginInputFingerprints([{...rows[0],price:101},rows[1]]).MUC);
 });
 
 test('production selection derives the approved canonical 22 origins from the shared catalogue',()=>{
@@ -148,6 +167,21 @@ test('freshOriginFraction: partial coverage returns the exact fraction, not a bo
   // pilotSourcesReady is now a thin wrapper: true only once the fraction clears minCoverage.
   assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000), freshRow('MUC', 5 * 60000), freshRow('LHR', 5 * 60000), freshRow('AMS', 5 * 60000)], now, expected), true);
   assert.equal(pilotSourcesReady([freshRow('FRA', 5 * 60000)], now, expected), false);
+});
+
+test('per-origin publication never applies global retention: publishing MUC leaves retained FRA rows untouched', () => {
+  const migration = readFileSync(
+    new URL('../migrations/20261102120000_per_origin_roulette_publication_carousel_fallback.sql', import.meta.url),
+    'utf8',
+  );
+  const match = migration.match(/create or replace function public\.publish_daily_cheapest_origin_selection[\s\S]*?\n\$\$;/);
+  assert.ok(match, 'per-origin publication RPC is present');
+  const publishRpc = match[0];
+  assert.match(publishRpc, /daily_cheapest_origin_selection_runs\(observed_on,origin,snapshot_at\)/);
+  assert.match(publishRpc, /daily_origin_cheapest_pool where observed_on=p_observed_on and origin=p_origin/);
+  assert.match(publishRpc, /insert into public\.daily_origin_cheapest_pool select \* from jsonb_populate_recordset/);
+  assert.doesNotMatch(publishRpc, /delete\s+from\s+public\.daily_origin_cheapest_pool/i);
+  assert.doesNotMatch(publishRpc, /delete\s+from\s+public\.daily_cheapest_origin_selection_runs/i);
 });
 
 // main()-level behavior (immediate publish + point-refresh) is covered in

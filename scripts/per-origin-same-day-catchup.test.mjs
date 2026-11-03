@@ -151,11 +151,11 @@ test('same catch-up pass keeps MUC roulette published when FRA RPC fails, withou
   }finally{if(previous===undefined)delete process.env.SUPABASE_SERVICE_KEY;else process.env.SUPABASE_SERVICE_KEY=previous;}
 });
 
-test('MUC roulette is truthfully unavailable when current validated offers lack ten cities; an old pool is not an input',()=>{
+test('MUC roulette is truthfully unavailable with no current validated offers; an old pool is not an input',()=>{
   const currentPool=selectDailyCheapestPool([],day,10);
   const result=completeDailyRoulettePoolsByOrigin(currentPool,new Set(['MUC']));
   assert.equal(result.complete.size,0);
-  assert.deepEqual(result.incomplete,[{origin:'MUC',reason:'Daily roulette publication requires exactly 10 real cities for MUC (0/10)',availableCities:0}]);
+  assert.deepEqual(result.incomplete,[{origin:'MUC',reason:'Daily roulette publication requires 1–10 real cities for MUC (0/10)',availableCities:0}]);
   const source=readFileSync(new URL('./snapshot-daily-origin-cheapest.mjs',import.meta.url),'utf8');
   const catchupSection=source.slice(source.indexOf('catchUpOnly=false'),source.indexOf('let publishedOrigins'));
   assert.match(catchupSection,/from\('offers'\)/);

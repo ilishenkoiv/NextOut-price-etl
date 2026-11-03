@@ -46,8 +46,30 @@ test('due daily selection is serialized by the lease and fenced after each check
     'ordinary completion persists a retry baseline even when no origin fingerprint succeeded');
   assert.equal(state.jobs.priority.done,false);assert.equal(state.jobs.priority.checkpoint.phase,'roulette');assert.ok(saved.length>=4);
   await runDueDailySelection({state,store,db:{},instant,wave:43,
-    publishRoulette:async()=>{throw new Error('already checkpointed');},
+    publishRoulette:async args=>{assert.equal(args.provider,null);return{rebuilt:false,reason:'no_changed_factual_input',handledOriginInputs:{},attemptedOriginInputs:{}};},
     publishWindows:async args=>{assert.equal(args.provider,null);return{published:false,handledOriginInputs:{}};}});
+});
+
+test('a valid initial 1–2 roulette pool receives exactly one bounded same-run rebuild',async()=>{
+  const instant=Date.parse('2026-11-03T07:00:00Z'),calls=[];
+  const state={version:1,jobs:{}};const store={lease:async()=>true,save:async()=>{}};const provider={requests:0};
+  await runDueDailySelection({state,store,db:{},instant,provider,refreshDeadline:instant+60_000,
+    publishWindows:async()=>({published:false}),
+    publishRoulette:async args=>{calls.push(args);return calls.length===1
+      ? {rebuilt:true,publishedOrigins:['MUC'],poolSizes:{MUC:2},partialOrigins:['MUC']}
+      : {rebuilt:false,publishedOrigins:[],poolSizes:{MUC:2},reason:'already_published'};}});
+  assert.equal(calls.length,2);assert.equal(calls[0].provider,provider);
+  assert.deepEqual(calls[1].rebuildPartialOrigins,['MUC']);assert.equal(calls[1].provider,provider);
+  assert.equal(calls[1].refreshDeadline,instant+60_000);
+  assert.deepEqual(state.dailySelection.roulettePartialRebuild.origins,['MUC']);
+});
+
+test('a 3+ roulette pool does not receive a second same-run rebuild',async()=>{
+  const instant=Date.parse('2026-11-03T07:00:00Z'),calls=[];
+  const state={version:1,jobs:{}};const store={lease:async()=>true,save:async()=>{}};
+  await runDueDailySelection({state,store,db:{},instant,
+    publishWindows:async()=>({published:false}),publishRoulette:async args=>{calls.push(args);return{rebuilt:true,publishedOrigins:['MUC'],poolSizes:{MUC:3},partialOrigins:[]};}});
+  assert.equal(calls.length,1);
 });
 
 test('all-origin reserve checkpoints the current origin and its local cursors at the bounded deadline',async()=>{
@@ -168,6 +190,21 @@ test('a completed new-format window checkpoint retries only changed factual orig
   assert.equal(calls[0].retryAfter,'2026-11-02T06:00:00.000Z','retry uses the persisted ordinary-completion baseline');
   assert.equal(state.dailySelection.windowOriginInputs.MUC,'muc-input-v1');
   assert.equal(state.jobs.priority.done,false,'a new local origin publication re-admits the existing priority path');
+});
+
+test('a completed roulette checkpoint retries only changed factual MUC input without provider work',async()=>{
+  const instant=Date.parse('2026-11-03T07:00:00Z');
+  const state={version:1,jobs:{},dailySelection:{day:'2026-11-03',windowDone:true,rouletteDone:true,
+    rouletteOriginInputs:{FRA:'fra-input-v1'},rouletteNewInputBaselineAt:'2026-11-03T06:00:00.000Z'}};
+  const calls=[];const store={lease:async()=>true,save:async()=>{}};
+  await runDueDailySelection({state,store,db:{},instant,provider:{requests:0},refreshDeadline:instant+60_000,
+    publishWindows:async()=>({published:false,handledOriginInputs:{}}),
+    publishRoulette:async args=>{calls.push(args);return{rebuilt:true,publishedOrigins:['MUC'],failedOrigins:[],poolRows:10,
+      handledOriginInputs:{MUC:'muc-input-v1'}};}});
+  assert.equal(calls.length,1);assert.equal(calls[0].provider,null,'new-input retry cannot broaden into provider refresh work');
+  assert.deepEqual(calls[0].retryOriginInputs,{FRA:'fra-input-v1'});
+  assert.equal(calls[0].retryAfter,'2026-11-03T06:00:00.000Z');
+  assert.equal(state.dailySelection.rouletteOriginInputs.MUC,'muc-input-v1');
 });
 
 test('a failed new-input retry persists its attempted fingerprint for the next data-only pass',async()=>{

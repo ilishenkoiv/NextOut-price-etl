@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { DESTINATIONS } from '../src/data/destinations.js';
 import { expansionTargets } from '../src/data/expansion-targets.js';
@@ -12,6 +13,11 @@ export function publishedSnapshotDestinations(wave=0){
   return new Set([...DESTINATIONS,...expansionTargets(wave)].map(d=>d.iata));
 }
 export function publishedSnapshotOrigins(){return new Set(ORIGINS_ALL);}
+
+export function hasUsableRouletteDestinationId(row) {
+  const destinationId = destinationIdForIata(row?.dest);
+  return typeof destinationId === 'string' && destinationId.trim() !== '';
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -113,14 +119,32 @@ export function selectDailyCheapestPool(offers, today, limit = 10) {
     .sort((a, b) => String(a.origin).localeCompare(String(b.origin)) || a.rank - b.rank);
 }
 
+// This fingerprints only factual, eligible roulette input. It excludes generated snapshot
+// metadata, so unchanged offers cannot cause a same-day retry publication.
+export function rouletteOriginInputFingerprints(pool) {
+  const byOrigin = new Map();
+  for (const row of pool) {
+    const rows = byOrigin.get(row.origin) ?? [];
+    rows.push([row.flight_type,row.dest,row.departure_at,row.return_at,row.price,
+      row.source_updated_at,row.transfers,row.price_source ?? null]);
+    byOrigin.set(row.origin,rows);
+  }
+  const fingerprints={};
+  for(const [origin,rows] of byOrigin){
+    rows.sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    fingerprints[origin]=createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+  }
+  return fingerprints;
+}
+
 export function assertCompleteDailyRoulettePool(pool, expectedOrigins) {
   const expected=expectedOrigins instanceof Set?expectedOrigins:new Set(expectedOrigins);
   const byOrigin=new Map();
   for(const row of pool){const rows=byOrigin.get(row.origin)??[];rows.push(row);byOrigin.set(row.origin,rows);}
   for(const origin of expected){
     const rows=(byOrigin.get(origin)??[]).sort((a,b)=>Number(a.rank)-Number(b.rank));
-    if(rows.length!==10)throw new Error(`Daily roulette publication requires exactly 10 real cities for ${origin} (${rows.length}/10)`);
-    if(new Set(rows.map(row=>row.dest)).size!==10)throw new Error(`Daily roulette publication has duplicate cities for ${origin}`);
+    if(rows.length<1||rows.length>10)throw new Error(`Daily roulette publication requires 1–10 real cities for ${origin} (${rows.length}/10)`);
+    if(new Set(rows.map(row=>row.dest)).size!==rows.length)throw new Error(`Daily roulette publication has duplicate cities for ${origin}`);
     if(rows.some((row,index)=>Number(row.rank)!==index+1))throw new Error(`Daily roulette publication has rank gaps for ${origin}`);
     if(rows.some(row=>!(Number(row.price)>0)))throw new Error(`Daily roulette publication has a non-positive price for ${origin}`);
   }
@@ -130,8 +154,8 @@ export function assertCompleteDailyRoulettePool(pool, expectedOrigins) {
 }
 
 // Publication is deliberately independent by origin.  A sparse source for FRA must not
-// prevent a factual, complete MUC reserve from reaching users.  This classifier never fills
-// missing rows: an incomplete origin is reported and simply omitted from this day's writes.
+// prevent a factual MUC reserve from reaching users. This classifier never fills missing rows:
+// each valid factual contiguous 1–10 prefix is publishable as-is.
 export function completeDailyRoulettePoolsByOrigin(pool, expectedOrigins) {
   const expected=expectedOrigins instanceof Set?expectedOrigins:new Set(expectedOrigins);
   const byOrigin=new Map();
@@ -173,7 +197,8 @@ export function pilotSourcesReady(rows, instant, expectedOrigins,
 
 export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=Number(process.env.SNAPSHOT_EXPANSION_WAVE||0),
   force=process.env.SNAPSHOT_FORCE_REBUILD==='true', pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,clock=Date.now,
-  expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false } = {}) {
+  expectedOrigins=publishedSnapshotOrigins(),catchUpOnly=false,retryOriginInputs=null,retryAfter=null,
+  minimumPoolSizes=null,rebuildPartialOrigins=null } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
   const instant=normalizeInstant(requestedSnapshotAt??clock());const observedOn = berlinObservedOn(instant);
   // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — the legacy
@@ -196,7 +221,9 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
     recordRead('offers', data);
     // Collection can warm new airports before their app metadata/weather/photos
     // are ready. Do not let an unknown destination displace the published pool.
-    offers.push(...data.filter(row=>origins.has(row.origin)&&publishedDestinations.has(row.dest)));
+    // Admit only destinations the app can identify before the selector assigns ranks. This
+    // preserves factual ordering while preventing an unmapped candidate from entering a pool.
+    offers.push(...data.filter(row=>origins.has(row.origin)&&publishedDestinations.has(row.dest)&&hasUsableRouletteDestinationId(row)));
     if (data.length < PAGE) break;
   }
 
@@ -225,7 +252,29 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   source_updated_at: row.updated_at || null,
   price_source: row.price_source || null,
   }));
-  const perOrigin=completeDailyRoulettePoolsByOrigin(pool,origins);
+  const originInputs=rouletteOriginInputFingerprints(pool);
+  let retryOrigins=null;
+  if(rebuildPartialOrigins){
+    retryOrigins=new Set(rebuildPartialOrigins.filter(origin=>{
+      const size=pool.filter(row=>row.origin===origin).length;
+      return Number.isSafeInteger(size)&&size>=1&&size<=2;
+    }));
+    if(!retryOrigins.size)return{rebuilt:false,observedOn,snapshotAt:null,reason:'no_valid_partial_rebuild_input',
+      publishedOrigins:[],failedOrigins:[],incompleteOrigins:[],originInputs,handledOriginInputs:{},attemptedOriginInputs:{},poolSizes:{},partialOrigins:[]};
+  }else if(retryOriginInputs){
+    const retryAfterMs=typeof retryAfter==='number'?retryAfter:Date.parse(retryAfter);
+    retryOrigins=new Set(Object.keys(originInputs).filter(origin=>{
+      if(originInputs[origin]===retryOriginInputs[origin])return false;
+      const poolSize=pool.filter(row=>row.origin===origin).length;
+      const priorSize=minimumPoolSizes?.[origin];
+      if(Number.isSafeInteger(priorSize)) return priorSize>=1&&priorSize<=2&&poolSize>priorSize;
+      return Object.hasOwn(retryOriginInputs,origin)||!Number.isFinite(retryAfterMs)
+        ||pool.some(row=>row.origin===origin&&Date.parse(row.source_updated_at)>retryAfterMs);
+    }));
+    if(!retryOrigins.size)return{rebuilt:false,observedOn,snapshotAt:null,reason:'no_changed_factual_input',
+      publishedOrigins:[],failedOrigins:[],incompleteOrigins:[],originInputs,handledOriginInputs:{},attemptedOriginInputs:{}};
+  }
+  const selectedPool=retryOrigins?pool.filter(row=>retryOrigins.has(row.origin)):pool;
   // Keep the compatibility table's historical contract: one rank-1 row for each origin/mode.
   // The roulette pool above is intentionally different: ten unique destinations per origin.
   const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
@@ -247,6 +296,8 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   }));
 
   if (!chosen.length) throw new Error('No valid future offers found; refusing to write an empty daily snapshot.');
+  const selectedChosen=retryOrigins?chosen.filter(row=>retryOrigins.has(row.origin)):chosen;
+  const perOrigin=completeDailyRoulettePoolsByOrigin(selectedPool,retryOrigins??origins);
 
   // Point-refresh: confirm the SELECTED tickets' exact prices via the provider before publishing
   // (order: select -> point-refresh -> publish). Sequential, normal pace, never re-reads offers.
@@ -257,7 +308,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   let refresh = { attempted: 0, refreshed: 0, misses: 0, errors: 0, total: 0 };
   if (provider) {
     const byKey = new Map();
-    for (const row of [...pool, ...chosen]) byKey.set(ticketKey(row), row);
+    for (const row of [...selectedPool, ...selectedChosen]) byKey.set(ticketKey(row), row);
     const tickets = [...byKey.values()];
     const { confirmed, ...stats } = await pointRefreshTickets(tickets, { provider, clock, deadline: refreshDeadline, sourceTable: 'offers' });
     refresh = stats;
@@ -265,29 +316,37 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
       const c = confirmed.get(ticketKey(row));
       return c ? { ...row, price: c.price, transfers: c.transfers, source_updated_at: c.updated_at, price_source: c.price_source ?? row.price_source } : row;
     };
-    for (let i = 0; i < pool.length; i++) pool[i] = apply(pool[i]);
-    for (let i = 0; i < chosen.length; i++) chosen[i] = apply(chosen[i]);
+    for (let i = 0; i < selectedPool.length; i++) selectedPool[i] = apply(selectedPool[i]);
+    for (let i = 0; i < selectedChosen.length; i++) selectedChosen[i] = apply(selectedChosen[i]);
   }
 
-  let publishedOrigins=[],failedOrigins=[];
+  let publishedOrigins=[],failedOrigins=[],handledOriginInputs={},attemptedOriginInputs={};
+  const poolSizes={},partialOrigins=[];
   for(const [origin,originPool] of perOrigin.complete){
-    const originRank1=chosen.filter(row=>row.origin===origin);
+    const originRank1=selectedChosen.filter(row=>row.origin===origin);
+    attemptedOriginInputs[origin]=originInputs[origin];
     const {data:didPublish,error:publishError}=await supabase.rpc('publish_daily_cheapest_origin_selection',{
       p_observed_on:observedOn,p_snapshot_at:snapshotAt,p_origin:origin,p_rank1:originRank1,p_pool:originPool});
     if(publishError){failedOrigins.push({origin,reason:publishError.message??String(publishError)});continue;}
-    if(didPublish===true)publishedOrigins.push(origin);
+    if(didPublish===true){
+      publishedOrigins.push(origin);
+      if(originPool.length<=2)partialOrigins.push(origin);
+    }
+    handledOriginInputs[origin]=originInputs[origin];
+    poolSizes[origin]=originPool.length;
   }
   if(!publishedOrigins.length){
     const reason=perOrigin.complete.size?'already_published':'no_complete_origins';
     console.log(JSON.stringify({event:'daily_selection_noop',scope:'roulette',observedOn,reason,incompleteOrigins:perOrigin.incomplete,failedOrigins}));
-    return{rebuilt:false,observedOn,snapshotAt:null,reason,incompleteOrigins:perOrigin.incomplete,failedOrigins};
+    return{rebuilt:false,observedOn,snapshotAt:null,reason,incompleteOrigins:perOrigin.incomplete,...(failedOrigins.length?{failedOrigins}:{}),
+      ...((retryOriginInputs||rebuildPartialOrigins)?{originInputs,handledOriginInputs,attemptedOriginInputs,poolSizes,partialOrigins}:{})};
   }
   console.log(JSON.stringify({event:'daily_selection_published',scope:'roulette',observedOn,snapshotAt,
-    rank1Rows:chosen.filter(row=>publishedOrigins.includes(row.origin)).length,poolRows:publishedOrigins.length*10,sourceOffers:offers.length,
+    rank1Rows:selectedChosen.filter(row=>publishedOrigins.includes(row.origin)).length,poolRows:publishedOrigins.reduce((count,origin)=>count+(poolSizes[origin]??0),0),sourceOffers:offers.length,
     freshFraction,refresh,publishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incomplete}));
   return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh,
-    rank1Rows: chosen.filter(row=>publishedOrigins.includes(row.origin)).length, poolRows: publishedOrigins.length*10,
-    publishedOrigins, failedOrigins, incompleteOrigins: perOrigin.incomplete };
+    rank1Rows:selectedChosen.filter(row=>publishedOrigins.includes(row.origin)).length,poolRows:publishedOrigins.reduce((count,origin)=>count+(poolSizes[origin]??0),0),
+    publishedOrigins,failedOrigins,incompleteOrigins:perOrigin.incomplete,originInputs,handledOriginInputs,attemptedOriginInputs,poolSizes,partialOrigins };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -213,7 +213,33 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
     checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
     checkpoint.rouletteFreshFraction=result?.freshFraction??null;checkpoint.rouletteRefresh=result?.refresh??null;
     checkpoint.rouletteRank1Rows=result?.rank1Rows??null;checkpoint.roulettePoolRows=result?.poolRows??null;
+    checkpoint.roulettePoolSizes={...(checkpoint.roulettePoolSizes??{}),...(result?.poolSizes??{})};
+    checkpoint.rouletteNewInputBaselineAt=new Date(checkpoint.rouletteCompletedAt).toISOString();
+    if(Object.hasOwn(result??{},'handledOriginInputs')){
+      checkpoint.rouletteOriginInputs={...(checkpoint.rouletteOriginInputs??{}),...(result.handledOriginInputs??{})};
+    }
     await store.save(state);published ||= checkpoint.roulettePublished===true;
+    const partialOrigins=(result?.partialOrigins??[]).filter(origin=>checkpoint.roulettePoolSizes?.[origin]>=1&&checkpoint.roulettePoolSizes?.[origin]<=2);
+    if(partialOrigins.length){
+      if(!await store.lease())throw new Error('Partial roulette rebuild forbidden: lease lost');
+      const rebuild=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider,refreshDeadline,rebuildPartialOrigins:partialOrigins});
+      checkpoint.roulettePartialRebuild={origins:partialOrigins,completedAt:Date.now(),publishedOrigins:rebuild?.publishedOrigins??[],
+        failedOrigins:rebuild?.failedOrigins??[],poolRows:rebuild?.poolRows??0,reason:rebuild?.reason??null};
+      checkpoint.roulettePoolSizes={...checkpoint.roulettePoolSizes,...(rebuild?.poolSizes??{})};
+      await store.save(state);published ||= rebuild?.rebuilt===true;
+    }
+  }else if(checkpoint.rouletteOriginInputs||checkpoint.rouletteNewInputBaselineAt||(Number.isFinite(checkpoint.rouletteCompletedAt)&&checkpoint.rouletteNewInputBaselineAt===undefined)){
+    if(!await store.lease())throw new Error('New-input roulette publication forbidden: lease lost');
+    const retryOriginInputs={...(checkpoint.rouletteOriginInputs??{}),...(checkpoint.rouletteAttemptedOriginInputs??{})};
+    const retryAfter=checkpoint.rouletteNewInputBaselineAt??checkpoint.rouletteCompletedAt;
+    const result=await publishRoulette({db,snapshotAt,expansionWave:wave,pilotMarketSchedule,provider:null,refreshDeadline:Infinity,
+      retryOriginInputs,retryAfter,minimumPoolSizes:checkpoint.roulettePoolSizes??null});
+    checkpoint.rouletteNewInputCompletedAt=Date.now();
+    checkpoint.rouletteNewInput={publishedOrigins:result?.publishedOrigins??[],failedOrigins:result?.failedOrigins??[],poolRows:result?.poolRows??0};
+    checkpoint.rouletteOriginInputs={...checkpoint.rouletteOriginInputs,...(result?.handledOriginInputs??{})};
+    checkpoint.rouletteAttemptedOriginInputs={...checkpoint.rouletteAttemptedOriginInputs,...(result?.attemptedOriginInputs??{})};
+    if(checkpoint.rouletteNewInputBaselineAt===undefined)checkpoint.rouletteNewInputBaselineAt=retryAfter;
+    await store.save(state);published ||= result?.rebuilt===true;
   }
   if(checkpoint.rouletteDone&&checkpoint.windowDone)checkpoint.completedAt=Date.now();
   await store.save(state);
