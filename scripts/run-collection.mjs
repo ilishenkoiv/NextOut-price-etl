@@ -5,6 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 import { CollectionStore, oldRunnerHasStopped } from './collection-store.mjs';
 import { CollectionProvider } from './collection-provider.mjs';
 import { SequentialSchedule, freshScheduleState, CYCLE_MS, offCycleMainBudget, runBoundedMainAdvance } from './collection-schedule.mjs';
+import { selectedPriceRefreshDue } from './priority-market-schedule.mjs';
 import { createAdapters } from './collection-adapters.mjs';
 import { resetEgress, egressSummary } from './collection-egress.mjs';
 import { publishPilotState } from './pilot-price-metadata.mjs';
@@ -266,6 +267,9 @@ export async function main(env=process.env){
   if(env.COLLECTION_MODE!=='coordinated')throw new Error('Coordinated mode has not been enabled');
   for(const key of ['TP_TOKEN','SUPABASE_SERVICE_KEY','GITHUB_TOKEN'])if(!env[key])throw new Error(`Missing required ${key}`);
   const triggerSource=collectionTriggerSource(env),automated=isAutomatedTrigger(env);
+  const selectedRefreshOnly=env.SELECTED_PRICE_REFRESH_ONLY==='true';
+  if(selectedRefreshOnly&&(env.GITHUB_EVENT_NAME!=='schedule'||env.SELECTED_PRICE_REFRESH_CANDIDATE!=='owner-manual'))
+    throw new Error('Selected refresh-only mode requires the scheduled owner-manual candidate');
   console.log(JSON.stringify({event:'collection_trigger',source:triggerSource,githubEvent:env.GITHUB_EVENT_NAME||null}));
   const wave=Number(env.EXPANSION_WAVE??0);expansionTargets(wave);
   const minutes=Number(env.COLLECTION_SESSION_MINUTES??25);
@@ -273,7 +277,7 @@ export async function main(env=process.env){
   // Normal intersection of runs (another workflow already in progress, or GitHub state is
   // unreadable): not an error, just this run standing down. Exit 0, not 1 — a real lease/DB
   // failure below still throws and exits 1.
-  if(!await noOtherActiveRuns(env)){console.log('skipped: other active workflow run or unknown GitHub state; no collection started');return;}
+  if(!selectedRefreshOnly&&!await noOtherActiveRuns(env)){console.log('skipped: other active workflow run or unknown GitHub state; no collection started');return;}
   let dbDeadline=Infinity; let activeStore=null;
   const db=createClient(env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',env.SUPABASE_SERVICE_KEY,{
     auth:{persistSession:false,autoRefreshToken:false},global:{fetch:async(input,init={})=>{
@@ -287,6 +291,34 @@ export async function main(env=process.env){
   activeStore=store;
   let claimed=false,engine=null,stopping=false;const stop=()=>{stopping=true;};
   try{
+    if(selectedRefreshOnly){
+      // GitHub cron may start a few minutes late; admit against its containing half-hour slot.
+      // The shared durable control is still re-read by each adapter phase before provider work.
+      const dueAt=Math.floor(Date.now()/CYCLE_MS)*CYCLE_MS;
+      if(!selectedPriceRefreshDue(dueAt,true)){
+        console.log(JSON.stringify({event:'selected_refresh_not_due',source:triggerSource,dueAt}));return;
+      }
+      const previous=await store.inspect();
+      const state=await store.claim(previous?.owner??null);
+      if(!state){console.log('skipped: selected refresh lease unavailable');return;}
+      claimed=true;
+      if(state.version!==1||!state.jobs||typeof state.jobs!=='object')throw new Error('Unsupported stored checkpoint');
+      const deadline=Date.now()+minutes*60000;
+      const provider=new CollectionProvider({token:env.TP_TOKEN,lease:()=>store.lease()});
+      const adapters=createAdapters({db,store,provider,wave,setDbDeadline:value=>{dbDeadline=value;},getState:()=>state});
+      const cycle=Math.floor(dueAt/CYCLE_MS);
+      let checkpoint={cycle,dueAt,phase:'roulette',auditDone:true,auditProcessed:0,
+        roulette:{cycle,cursor:0,errors:0,done:false,admittedAt:dueAt,technicalDeferred:[],technicalOutcomes:[]}};
+      let status='progress';
+      while(status!=='done'&&Date.now()+45_000<deadline){
+        const result=await adapters.priority.step({job:{id:cycle,planDate:berlinObservedOn(dueAt),startedAt:dueAt,checkpoint},deadline});
+        checkpoint=result.checkpoint;status=result.status;
+        if(status==='yield')break;
+      }
+      console.log(JSON.stringify({event:'selected_refresh_only_complete',source:triggerSource,status,
+        roulette:checkpoint.roulette,carousel:checkpoint.weekend}));
+      return;
+    }
     const previous=await store.inspect();
     // Same normal-intersection case as above (an old runner from the previous cycle has not yet
     // confirmed it stopped): stand down cleanly, exit 0. A real lease/DB failure below still throws.

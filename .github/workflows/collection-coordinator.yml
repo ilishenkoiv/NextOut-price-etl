@@ -1,5 +1,7 @@
 name: Sequential data collection
 on:
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       rollout_action:
@@ -63,9 +65,11 @@ jobs:
              (inputs.trigger_source != 'supabase-cron' && !inputs.validate_only)))
         env:
           COLLECTION_MODE: ${{ inputs.trigger_source == 'supabase-cron' && vars.COLLECTION_MODE || (github.event_name == 'workflow_dispatch' && 'coordinated' || vars.COLLECTION_MODE) }}
-          COLLECTION_SESSION_MINUTES: ${{ inputs.trigger_source == 'supabase-cron' && '25' || (github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '25') }}
+          COLLECTION_SESSION_MINUTES: ${{ github.event_name == 'schedule' && '25' || (inputs.trigger_source == 'supabase-cron' && '25' || (github.event_name == 'workflow_dispatch' && inputs.smoke_minutes || '25')) }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-          COLLECTION_TRIGGER_SOURCE: ${{ inputs.trigger_source || github.event_name }}
+          COLLECTION_TRIGGER_SOURCE: ${{ github.event_name == 'schedule' && 'selected-refresh-schedule' || inputs.trigger_source || github.event_name }}
+          SELECTED_PRICE_REFRESH_ONLY: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          SELECTED_PRICE_REFRESH_CANDIDATE: ${{ vars.SELECTED_PRICE_REFRESH_CANDIDATE || '' }}
           EXPANSION_WAVE: ${{ vars.EXPANSION_WAVE || '0' }}
           SNAPSHOT_EXPANSION_WAVE: ${{ vars.SNAPSHOT_EXPANSION_WAVE || '0' }}
           GUARANTEE_DAILY_MAIN: ${{ vars.GUARANTEE_DAILY_MAIN || 'false' }}

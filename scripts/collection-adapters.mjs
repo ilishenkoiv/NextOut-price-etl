@@ -63,6 +63,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // This is a code-availability guard only.  It never enables the feature: every admitted
   // cycle must also read an enabled, current durable control row with MAIN rollback clear.
   const selectedPriceRefreshCandidate=process.env.SELECTED_PRICE_REFRESH_CANDIDATE==='owner-manual';
+  const selectedRefreshOnly=process.env.SELECTED_PRICE_REFRESH_ONLY==='true';
   async function selectedRefreshControl(admittedAt, deadline) {
     if (!selectedPriceRefreshCandidate || !selectedPriceRefreshDue(admittedAt, true)) return {active:false,generation:null};
     const rows=await query(()=>db.from('selected_price_refresh_control').select('enabled,generation,main12h_rollback').eq('singleton',true).limit(1),deadline,{retry:true,op:'selected_price_refresh_control'});
@@ -497,6 +498,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if(cp.phase==='roulette'){
         const r=cp.roulette;
         const selectedAdmission=await selectedRefreshControl(r.admittedAt,deadline);
+        // The dedicated scheduled runner must never fall back to legacy priority work when the
+        // durable control is OFF, rolling back, absent, or has an invalid generation.
+        if(selectedRefreshOnly&&!selectedAdmission.active){
+          r.total=0;r.done=true;cp.phase='weekend';return{status:'progress',checkpoint:cp};
+        }
         // Once admitted, a sub-pass owns one immutable snapshot and cadence instant until its
         // cursor genuinely reaches total. A later scheduler cycle may observe a newer snapshot,
         // but it must finish this admitted set before a future pass can adopt that snapshot.
@@ -592,6 +598,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,
           passStartedAt:clock(),admittedAt:Number.isFinite(cp.dueAt)?cp.dueAt:now};}
         if(!Number.isFinite(w.admittedAt))w.admittedAt=Number.isFinite(w.dueAt)?w.dueAt:previousDueAt;
+        const selectedAdmission=await selectedRefreshControl(w.admittedAt,deadline);
+        if(selectedRefreshOnly&&!selectedAdmission.active){
+          w.total=0;w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
+          return{status:'done',checkpoint:cp};
+        }
         // Latest-row-only: snapshot_at is UNIQUE on this table (see
         // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
         // same row ascending-order .at(-1) used to, without paging the whole epoch history
@@ -623,7 +634,6 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         // the full daily set; only which groups get touched THIS cycle is narrowed by each
         // group's origin's market-local time of day. Every group from one groupWindowConsumerTickets
         // bucket shares one origin (grouped by [origin,dest,departure_at,return_at]).
-        const selectedAdmission=await selectedRefreshControl(w.admittedAt,deadline);
         const effectiveGroups=selectedAdmission.active
           ? plan.groups
           : pilotMarketSchedule?plan.groups.filter(g=>originDueThisCycle(w.admittedAt,g[0].origin)):plan.groups;
