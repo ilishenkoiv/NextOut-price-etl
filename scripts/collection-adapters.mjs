@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
 import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
 import { normalizeOutstanding, retainMainCell, mainCellKey, retainUnidentifiedHistory } from './main-outstanding.mjs';
-import { selectedRefreshAdmission, replacementDecision, rouletteAlternate, carouselAlternate, isFreshConfirmed } from './selected-price-refresh-contract.mjs';
+import { selectedRefreshAdmission, replacementDecision, rouletteRevisionDecision, carouselAlternate, isFreshConfirmed } from './selected-price-refresh-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -562,26 +562,26 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
           const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
             transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          if(result.status==='error')deferTechnical(ticket,{response,outcome:result});
-          if(result.status==='no_result'){
-            if(selectedAdmission.active){
-              const alternatives=await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
-                ['price','dest'],q=>q.eq('origin',ticket.origin).eq('flight_type',ticket.flight_type),deadline);
-              const occupied=new Set(plan.tickets.filter(row=>row.origin===ticket.origin).map(row=>row.dest));
-              const alternate=rouletteAlternate(alternatives,ticket,clock(),occupied);
-              const decision=replacementDecision('roulette','confirmed_absent',alternate);
-              await commit('collection_commit_selected_roulette',{p_ticket:{...ticketPayload(ticket),allowed_dests:[ticket.dest,...(alternate?[alternate.dest]:[])]},p_generation:selectedAdmission.generation,
-                p_result:{status:'confirmed_absent',outcome:decision.outcome,replacement:alternate}},deadline);
-              recordTechnicalOutcome(ticket,decision.outcome);r.cursor++;
-            }else{
-              await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:result},deadline);
-              recordTechnicalOutcome(ticket,'retained_no_result');r.cursor++;
-            }
+          if(selectedAdmission.active){
+            // The fenced RPC is the only selected-refresh writer.  It delegates a verified fare
+            // to the existing factual refresh and records an exclusion for every other result.
+            // No offer lookup/replacement exists here: remaining-pool choice stays in the app's
+            // existing history/quota resolver over the same server-published ten tickets.
+            const revision=rouletteRevisionDecision(result.status);
+            await commit('collection_commit_selected_roulette',{p_ticket:ticketPayload(ticket),p_generation:selectedAdmission.generation,
+              p_result:{status:result.status,revision,fare:result.status==='found'?patch:null}},deadline);
+            if(result.status==='error')deferTechnical(ticket,{response,outcome:result});
+            else { recordTechnicalOutcome(ticket,revision.visibility);r.cursor++; }
+          }else if(result.status==='no_result'){
+            await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:result},deadline);
+            recordTechnicalOutcome(ticket,'retained_no_result');r.cursor++;
+          }else if(result.status==='error'){
+            deferTechnical(ticket,{response,outcome:result});
           }
-          if(result.status==='found'){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
+          if(result.status==='found'&&!selectedAdmission.active){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
             const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
             p_observed_at:patch.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
-          if(result.status==='found'){recordTechnicalOutcome(ticket,'refreshed');r.cursor++;}
+          if(result.status==='found'&&!selectedAdmission.active){recordTechnicalOutcome(ticket,'refreshed');r.cursor++;}
         }
         r.total=effectiveTickets.length;r.done=r.cursor>=r.total;
         cp.phase='weekend';

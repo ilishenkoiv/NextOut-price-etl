@@ -11,6 +11,15 @@ export function replacementDecision(surface, outcome, replacement = null) {
   return { outcome:'replaced', replacement };
 }
 
+// The roulette daily pool is immutable.  A selected 30-minute recheck may only publish a
+// per-ticket verification revision: a fresh verified fare keeps that ticket visible, every
+// other outcome excludes it.  It never imports a city from offers or rebuilds membership.
+export function rouletteRevisionDecision(outcome) {
+  return outcome === 'found'
+    ? { visibility:'verified', reason:null }
+    : { visibility:'excluded', reason:outcome === 'no_result' ? 'confirmed_absent' : 'unconfirmed' };
+}
+
 // The database row, not an environment value, is the durable authority.  The source-side
 // feature gate only prevents pre-migration code from querying a table which does not exist yet.
 export function selectedRefreshAdmission(control, instant) {
