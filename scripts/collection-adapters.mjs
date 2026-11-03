@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
 import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
 import { normalizeOutstanding, retainMainCell, mainCellKey, retainUnidentifiedHistory } from './main-outstanding.mjs';
-import { selectedRefreshAdmission, replacementDecision, rouletteAlternate, carouselAlternate } from './selected-price-refresh-contract.mjs';
+import { selectedRefreshAdmission, replacementDecision, rouletteAlternate, carouselAlternate, isFreshConfirmed } from './selected-price-refresh-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -381,17 +381,26 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   }
 
   async function selectedCarouselOutcome(ticket, response, outcome, generation, deadline) {
-    // A selected-carousel technical/unconfirmed response proves neither a fare nor an absence.
-    // Do not fall through to persistExactOutcome: its legacy error handling records a miss via
-    // collection_commit_window_candidate, which would mutate the frozen selected set.
-    if (outcome.status !== 'no_result') return outcome.status !== 'error';
+    if (outcome.status === 'found') {
+      const fare=withPriceProvenance([{...outcome,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),
+        flight_type:ticket.flight_type}],'window_prices')[0];
+      await commit('collection_commit_selected_carousel',{p_ticket:ticket,p_generation:generation,
+        p_result:{status:'found',fare}},deadline);
+      return true;
+    }
     const now=clock();
     const alternatives=await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
       ['price','dest'],q=>q.eq('origin',ticket.origin).eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at),deadline);
+    const current=alternatives.find(row=>row.dest===ticket.dest&&isFreshConfirmed(row,now));
     const alternate=carouselAlternate(alternatives,ticket,now);
-    const decision=replacementDecision('carousel','confirmed_absent',alternate);
+    // All non-found outcomes, including technical/unconfirmed ones, create one fenced
+    // revision. A still-fresh selected city wins; otherwise the exact-date fallback is
+    // chosen by carouselAlternate without inventing a price or changing date identity.
+    const decision=current
+      ?replacementDecision('carousel','fresh')
+      :replacementDecision('carousel',outcome.status,alternate);
     await commit('collection_commit_selected_carousel',{p_ticket:ticket,p_generation:generation,
-      p_result:{status:'confirmed_absent',outcome:decision.outcome,replacement:alternate}},deadline);
+      p_result:{status:outcome.status==='no_result'?'confirmed_absent':outcome.status,outcome:decision.outcome,replacement:decision.replacement}},deadline);
     return true;
   }
 

@@ -13,16 +13,21 @@ test('eligible Berlin half-hour cadence is bounded and DST-safe through Intl',()
   assert.equal(selectedPriceRefreshDue(Date.parse('2026-12-01T22:00:00Z'),true),false);
 });
 
-test('fresh equal price holds and technical or unconfirmed outcomes are no-ops',()=>{
+test('fresh/equal price holds while an unconfirmed carousel outcome applies its factual fallback',()=>{
   assert.equal(isFreshConfirmed(fresh,now),true);
   assert.deepEqual(replacementDecision('roulette','fresh',fresh),{outcome:'retain_fresh',replacement:null});
-  assert.deepEqual(replacementDecision('carousel','timeout',fresh),{outcome:'retain_unconfirmed',replacement:null});
+  assert.deepEqual(replacementDecision('carousel','timeout',fresh),{outcome:'replaced',replacement:fresh});
 });
 
-test('confirmed absence selects server-only roulette alternate and exact-date carousel alternate',()=>{
-  const rows=[fresh,{...fresh,dest:'LIS',price:88,departure_at:'2027-03-01',return_at:'2027-03-06'}];
+test('carousel fallback prioritizes a <=30m exact-date city, then the freshest factual exact-date city',()=>{
+  const rows=[
+    {...fresh,dest:'LIS',price:88,departure_at:'2027-03-01',return_at:'2027-03-06'},
+    {...fresh,dest:'BCN',price:60,updated_at:new Date(now-31*60_000).toISOString()},
+    {...fresh,dest:'MAD',price:120,updated_at:new Date(now-5*60_000).toISOString()},
+  ];
   assert.equal(rouletteAlternate(rows,{...fresh,dest:'FCO'},now,new Set(['FCO'])).dest,'LIS');
   assert.equal(carouselAlternate(rows,{...fresh,dest:'FCO'},now).dest,'MAD');
+  assert.equal(carouselAlternate(rows.filter(row=>row.dest!=='MAD'),{...fresh,dest:'FCO'},now).dest,'BCN');
   assert.deepEqual(replacementDecision('carousel','confirmed_absent',fresh),{outcome:'replaced',replacement:fresh});
 });
 

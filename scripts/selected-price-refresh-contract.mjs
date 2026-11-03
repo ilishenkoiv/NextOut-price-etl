@@ -3,7 +3,10 @@
 export function replacementDecision(surface, outcome, replacement = null) {
   if (!['roulette','carousel'].includes(surface)) throw new Error('Unknown surface');
   if (outcome === 'fresh') return { outcome:'retain_fresh', replacement:null };
-  if (outcome !== 'confirmed_absent') return { outcome:'retain_unconfirmed', replacement:null };
+  // The carousel must publish an atomically decided fallback even when a recheck did
+  // not prove absence (timeout, technical/provider refusal, malformed response).
+  // Roulette keeps its established retention-only handling for those outcomes.
+  if (outcome !== 'confirmed_absent' && surface !== 'carousel') return { outcome:'retain_unconfirmed', replacement:null };
   if (!replacement) return { outcome:'retain_no_alternate', replacement:null };
   return { outcome:'replaced', replacement };
 }
@@ -30,10 +33,17 @@ export function rouletteAlternate(rows, ticket, now, occupiedDestinations = new 
 }
 
 export function carouselAlternate(rows, ticket, now) {
-  return rows.filter(row => row.origin === ticket.origin && row.flight_type === ticket.flight_type
+  const matching = rows.filter(row => row.origin === ticket.origin && row.flight_type === ticket.flight_type
       && row.dest !== ticket.dest && row.departure_at === ticket.departure_at && row.return_at === ticket.return_at
-      && isFreshConfirmed(row, now))
-    .sort((a,b) => Number(a.price) - Number(b.price) || String(a.dest).localeCompare(String(b.dest)))[0] ?? null;
+      && Number.isFinite(Number(row.price)) && Number(row.price) > 0
+      && Number.isFinite(Date.parse(row.updated_at)));
+  // Prefer an exact-date city confirmed during this 30-minute cycle.  If none exists,
+  // retain the freshest factual exact-date city; its timestamp is carried to the revision
+  // and is never manufactured as a new fare observation.
+  return matching.sort((a,b) => Number(isFreshConfirmed(b, now)) - Number(isFreshConfirmed(a, now))
+    || Date.parse(b.updated_at) - Date.parse(a.updated_at)
+    || Number(a.price) - Number(b.price)
+    || String(a.dest).localeCompare(String(b.dest)))[0] ?? null;
 }
 
 export function carouselReplacementKey({epoch,origin,flightType,windowKind,departureAt,returnAt,originalCandidateId}) {
