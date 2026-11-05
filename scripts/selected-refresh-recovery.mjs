@@ -127,16 +127,41 @@ async function latestRoulette(db) {
   return data ?? [];
 }
 
-async function latestCarousel(db) {
-  const { data: epoch, error } = await db.from('daily_window_candidate_epochs').select('observed_on,snapshot_at')
-    .order('snapshot_at', { ascending: false }).limit(1).maybeSingle();
-  if (error) throw new Error(`Selected carousel epoch read failed: ${error.message}`);
-  if (!epoch) return [];
-  const { data, error: rowsError } = await db.from('daily_window_candidates')
-    .select('observed_on,snapshot_at,origin,destination_id,dest,flight_type,departure_at,return_at,transfers,airline')
-    .eq('snapshot_at', epoch.snapshot_at).order('origin').order('departure_at').order('flight_type');
-  if (rowsError) throw new Error(`Selected carousel ticket read failed: ${rowsError.message}`);
-  return data ?? [];
+export function berlinDay(now = Date.now) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(now()));
+  const value = key => parts.find(part => part.type === key)?.value;
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+
+// A run is admitted only when its declared publication counts describe precisely the rows loaded
+// through its own (observed_on, origin, snapshot_at) identity. This deliberately turns an absent,
+// stale, or partially replaced run into a truthful no-op before any provider or carousel RPC work.
+export function acceptedCarouselRun(run, candidates, observedOn) {
+  if (run?.observed_on !== observedOn || run.contract_version !== 1 || !Number.isInteger(run.candidate_rows)
+    || !Number.isInteger(run.exact_request_groups) || run.candidate_rows < 1 || run.exact_request_groups < 1) return [];
+  if (candidates.length !== run.candidate_rows) return [];
+  const groups = new Set(candidates.map(candidate => [candidate.flight_type, date(candidate.departure_at), date(candidate.return_at)].join('|')));
+  if (groups.size !== run.exact_request_groups) return [];
+  return candidates;
+}
+
+export async function latestCarousel(db, now = Date.now) {
+  const observedOn = berlinDay(now);
+  const { data: runs, error } = await db.from('daily_origin_window_candidate_runs')
+    .select('observed_on,origin,snapshot_at,contract_version,candidate_rows,exact_request_groups')
+    .eq('observed_on', observedOn).eq('contract_version', 1).order('origin');
+  if (error) throw new Error(`Selected carousel run read failed: ${error.message}`);
+  const tickets = [];
+  for (const run of runs ?? []) {
+    const { data: candidates, error: rowsError } = await db.from('daily_origin_window_candidates')
+      .select('observed_on,snapshot_at,origin,destination_id,dest,flight_type,departure_at,return_at,transfers,airline')
+      .eq('observed_on', run.observed_on).eq('origin', run.origin).eq('snapshot_at', run.snapshot_at)
+      .order('departure_at').order('flight_type');
+    if (rowsError) throw new Error(`Selected carousel ticket read failed: ${rowsError.message}`);
+    tickets.push(...acceptedCarouselRun(run, candidates ?? [], observedOn));
+  }
+  return tickets;
 }
 
 async function commit(db, store, name, args) {
@@ -172,7 +197,7 @@ export async function runSelectedRefresh({ env = process.env, db: injectedDb, pr
       await commit(db, store, ROULETTE_RPC, { ...store.args(), p_generation: generation, p_ticket: identity, p_result: rouletteResult(ticket, outcome, now) });
       summary.roulette.attempted++;
     }
-    for (const ticket of await latestCarousel(db)) {
+    for (const ticket of await latestCarousel(db, now)) {
       if (now() + 9000 >= deadline) break;
       const identity = carouselTicket(ticket), outcome = await refreshOutcome(ticket, provider, deadline, now);
       await commit(db, store, CAROUSEL_RPC, { p_ticket: identity, p_generation: generation, p_result: carouselResult(ticket, outcome, now) });

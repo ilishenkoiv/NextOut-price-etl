@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertManualSelectedRequest, assertSelectedControl, carouselResult, carouselTicket, rouletteResult, rouletteTicket } from './selected-refresh-recovery.mjs';
+import { acceptedCarouselRun, assertManualSelectedRequest, assertSelectedControl, berlinDay, carouselResult, carouselTicket, rouletteResult, rouletteTicket } from './selected-refresh-recovery.mjs';
 
 const ticket = { observed_on: '2026-11-05', snapshot_at: '2026-11-05T05:00:00Z', origin: 'BER', dest: 'BCN', destination_id: 'barcelona',
   flight_type: 'any', rank: 1, departure_at: '2026-12-04', return_at: '2026-12-07', transfers: 1 };
@@ -28,7 +28,7 @@ test('roulette payload matches the live owner/token/generation contract and foun
 
 test('selected roulette reads only supported pool columns', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./selected-refresh-recovery.mjs', import.meta.url), 'utf8'));
-  const rouletteRead = source.match(/async function latestRoulette[\s\S]*?\n}\n\nasync function latestCarousel/)[0];
+  const rouletteRead = source.match(/async function latestRoulette[\s\S]*?\n}\n\nexport function berlinDay/)[0];
   assert.match(rouletteRead, /\.select\('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers'\)/);
   assert.doesNotMatch(rouletteRead, /airline/);
 });
@@ -40,6 +40,29 @@ test('carousel payload contains factual selected destination/date identity; no-r
   assert.equal(result.status, 'confirmed_absent'); assert.deepEqual(result.replacement, identity);
   const found = carouselResult(ticket, { status: 'found', price: 99, source: { transfers: 1 } }, () => Date.parse('2026-11-05T06:00:00Z'));
   assert.equal(found.status, 'found'); assert.deepEqual(found.replacement, identity); assert.equal(found.fare.price, 99);
+});
+
+test('current Berlin-day per-origin carousel run accepts only its declared exact candidate set', () => {
+  const run = { observed_on: '2026-11-05', origin: 'BER', snapshot_at: ticket.snapshot_at, contract_version: 1, candidate_rows: 2, exact_request_groups: 2 };
+  const candidates = [ticket, { ...ticket, destination_id: 'rome', dest: 'FCO', departure_at: '2026-12-11', return_at: '2026-12-14' }];
+  assert.deepEqual(acceptedCarouselRun(run, candidates, '2026-11-05'), candidates);
+  assert.equal(berlinDay(() => Date.parse('2026-11-05T23:30:00Z')), '2026-11-06');
+});
+
+test('absent, mismatched, and stale carousel runs are no-ops before an RPC ticket can form', () => {
+  const run = { observed_on: '2026-11-05', origin: 'BER', snapshot_at: ticket.snapshot_at, contract_version: 1, candidate_rows: 1, exact_request_groups: 1 };
+  assert.deepEqual(acceptedCarouselRun(run, [], '2026-11-05'), []);
+  assert.deepEqual(acceptedCarouselRun({ ...run, candidate_rows: 2 }, [ticket], '2026-11-05'), []);
+  assert.deepEqual(acceptedCarouselRun(run, [ticket], '2026-11-06'), []);
+});
+
+test('carousel reader uses the per-origin run triple and not the legacy global epoch', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./selected-refresh-recovery.mjs', import.meta.url), 'utf8'));
+  const reader = source.match(/export async function latestCarousel[\s\S]*?\n}\n\nasync function commit/)[0];
+  assert.match(reader, /daily_origin_window_candidate_runs/);
+  assert.match(reader, /daily_origin_window_candidates/);
+  assert.match(reader, /\.eq\('observed_on', run\.observed_on\)\.eq\('origin', run\.origin\)\.eq\('snapshot_at', run\.snapshot_at\)/);
+  assert.doesNotMatch(reader, /daily_window_candidate_epochs|daily_window_candidates/);
 });
 
 test('manual selected runner contains no coordinator, MAIN, or daily-selection entry point', async () => {
