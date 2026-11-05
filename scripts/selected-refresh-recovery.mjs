@@ -121,7 +121,7 @@ async function latestRoulette(db) {
   if (error) throw new Error(`Selected roulette epoch read failed: ${error.message}`);
   if (!latest) return [];
   const { data, error: rowsError } = await db.from('daily_origin_cheapest_pool')
-    .select('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers,airline')
+    .select('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers')
     .eq('snapshot_at', latest.snapshot_at).order('origin').order('flight_type').order('rank');
   if (rowsError) throw new Error(`Selected roulette ticket read failed: ${rowsError.message}`);
   return data ?? [];

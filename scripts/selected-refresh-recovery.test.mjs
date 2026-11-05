@@ -22,7 +22,15 @@ test('roulette payload matches the live owner/token/generation contract and foun
   assert.deepEqual(rouletteTicket(ticket), { observed_on: ticket.observed_on, origin: 'BER', snapshot_at: ticket.snapshot_at, dest: 'BCN', flight_type: 'any', departure_at: '2026-12-04', return_at: '2026-12-07', rank: 1 });
   const result = rouletteResult(ticket, { status: 'found', price: 99, source: { transfers: 1 } }, () => Date.parse('2026-11-05T06:00:00Z'));
   assert.equal(result.status, 'found'); assert.equal(result.fare.price, 99); assert.ok(result.fare.updated_at);
+  assert.equal(result.fare.airline, null, 'roulette outcome does not require an airline from the pool ticket');
   assert.deepEqual(rouletteResult(ticket, { status: 'no_result' }), { status: 'no_result' });
+});
+
+test('selected roulette reads only supported pool columns', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./selected-refresh-recovery.mjs', import.meta.url), 'utf8'));
+  const rouletteRead = source.match(/async function latestRoulette[\s\S]*?\n}\n\nasync function latestCarousel/)[0];
+  assert.match(rouletteRead, /\.select\('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers'\)/);
+  assert.doesNotMatch(rouletteRead, /airline/);
 });
 
 test('carousel payload contains factual selected destination/date identity; no-result is confirmed_absent', () => {
