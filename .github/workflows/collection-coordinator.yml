@@ -20,6 +20,11 @@ on:
         type: choice
         options: [manual, supabase-cron]
         default: manual
+      selected_refresh_candidate:
+        description: 'Owner-manual selected roulette-to-carousel recovery only'
+        type: choice
+        options: [none, owner-manual]
+        default: none
 concurrency:
   group: nextout-data-collection
   queue: max
@@ -59,6 +64,7 @@ jobs:
         if: >-
           github.event_name != 'workflow_dispatch' ||
           (inputs.rollout_action == 'none' &&
+            inputs.selected_refresh_candidate == 'none' &&
             ((inputs.trigger_source == 'supabase-cron' && vars.COLLECTION_MODE == 'coordinated') ||
              (inputs.trigger_source != 'supabase-cron' && !inputs.validate_only)))
         env:
@@ -79,6 +85,16 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/run-collection.mjs
+      - name: Recover already-selected roulette and carousel tickets (owner-manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.rollout_action == 'none' && inputs.selected_refresh_candidate == 'owner-manual'
+        env:
+          SELECTED_REFRESH_CANDIDATE: ${{ inputs.selected_refresh_candidate }}
+          COLLECTION_SESSION_MINUTES: '25'
+          GITHUB_TOKEN: ${{ github.token }}
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
+        run: node scripts/selected-refresh-recovery.mjs
   rollout-control:
     if: github.event_name == 'workflow_dispatch' && inputs.rollout_action != 'none'
     runs-on: ubuntu-latest
