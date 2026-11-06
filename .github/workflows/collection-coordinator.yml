@@ -1,5 +1,7 @@
 name: Sequential data collection
 on:
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       rollout_action:

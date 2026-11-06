@@ -16,12 +16,12 @@ test('every old main/window/audit/snapshot job is disabled in coordinated mode',
     assert.equal(gates,jobs,file);
   }
 });
-test('single coordinator uses external/manual dispatch, a bounded due session and no scheduled artifacts',()=>{
+test('single coordinator retains manual dispatch and owns the 30-minute schedule',()=>{
   const text=fs.readFileSync(new URL('collection-coordinator.yml',dir),'utf8');
   assert.match(text,/if: vars.COLLECTION_MODE == 'coordinated'/);
   assert.match(text,/smoke_minutes:[\s\S]*default: '15'/);
   assert.match(text,/workflow_dispatch:/);
-  assert.doesNotMatch(text,/^\s*schedule:/m);
+  assert.match(text,/^\s*schedule:\s*\n\s+- cron: '\*\/30 \* \* \* \*'/m);
   assert.match(text,/trigger_source:[\s\S]*options: \[manual, supabase-cron\]/);
   assert.match(text,/Collection trigger source=\$\{TRIGGER_SOURCE\}/);
   assert.match(text,/COLLECTION_SESSION_MINUTES:.*trigger_source == 'supabase-cron'.*'25'/);
