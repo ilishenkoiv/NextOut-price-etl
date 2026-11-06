@@ -171,7 +171,7 @@ begin
     or (v_replacement->>'updated_at')::timestamptz>clock_timestamp()+interval '5 minutes' then
     raise exception 'invalid or stale selected carousel alternate';
   end if;
-  select to_jsonb(c) into v_candidate from public.daily_window_candidates c
+  select to_jsonb(c) into v_candidate from public.daily_origin_window_candidates c
     where c.observed_on=(v_replacement->>'observed_on')::date
       and c.snapshot_at=(v_replacement->>'snapshot_at')::timestamptz
       and c.origin=v_replacement->>'origin' and c.destination_id=v_replacement->>'destination_id'
