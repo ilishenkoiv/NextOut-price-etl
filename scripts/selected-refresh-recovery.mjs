@@ -10,6 +10,8 @@ import { classifyResponse } from './check-flight-price-feedback.mjs';
 import { marketForOrigin } from '../src/data/origin-markets.js';
 import { withPriceProvenance } from './price-provenance.mjs';
 import { noOtherActiveRuns } from './run-collection.mjs';
+import { carouselReplacement, retainedResult, rouletteReplacement, selectCarouselAlternate, selectRouletteAlternate,
+  withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 export const SELECTED_REFRESH_CANDIDATE = 'owner-manual';
 export const SELECTED_REFRESH_MINUTES = 25;
@@ -73,21 +75,31 @@ function fareFor(ticket, outcome, now) {
   };
 }
 
-export function rouletteResult(ticket, outcome, now = Date.now) {
+export function rouletteResult(ticket, outcome, now = Date.now, pool = []) {
   if (outcome.status === 'found') return { status: 'found', fare: fareFor(ticket, outcome, now) };
-  return outcome.status === 'no_result' ? { status: 'no_result' } : { status: 'error', detail: outcome.detail ?? 'provider_error' };
+  if (outcome.status === 'no_result') {
+    const replacement = rouletteReplacement(selectRouletteAlternate(pool, ticket, now()));
+    return replacement
+      ? { status: 'confirmed_absent', outcome: 'replaced', replacement }
+      : { status: 'confirmed_absent', outcome: 'retained' };
+  }
+  return retainedResult(outcome);
 }
 
-export function carouselResult(ticket, outcome, now = Date.now) {
+export function carouselResult(ticket, outcome, now = Date.now, candidates = []) {
   if (outcome.status === 'found') {
     // The target RPC rejects a replacement whose factual destination identity differs from the
     // selected carousel ticket. Keep those fields explicit rather than letting provider output
     // invent or substitute a destination.
     return { status: 'found', fare: fareFor(ticket, outcome, now), replacement: carouselTicket(ticket) };
   }
-  if (outcome.status === 'no_result') return { status: 'confirmed_absent', replacement: carouselTicket(ticket) };
-  const status = ['technical', 'timeout', 'rate_limit', 'unconfirmed'].includes(outcome.status) ? outcome.status : 'error';
-  return { status, detail: outcome.detail ?? 'provider_error', replacement: carouselTicket(ticket) };
+  if (outcome.status === 'no_result') {
+    const replacement = carouselReplacement(selectCarouselAlternate(candidates, ticket, now()));
+    return replacement
+      ? { status: 'confirmed_absent', outcome: 'replaced', replacement }
+      : { status: 'confirmed_absent', outcome: 'retained' };
+  }
+  return retainedResult(outcome);
 }
 
 function requestUrl(ticket) {
@@ -115,16 +127,21 @@ async function selectedControl(db) {
   return data;
 }
 
-async function latestRoulette(db) {
+async function latestRoulette(db, generation) {
   const { data: latest, error } = await db.from('daily_origin_cheapest_pool').select('snapshot_at,observed_on')
     .order('snapshot_at', { ascending: false }).limit(1).maybeSingle();
   if (error) throw new Error(`Selected roulette epoch read failed: ${error.message}`);
   if (!latest) return [];
   const { data, error: rowsError } = await db.from('daily_origin_cheapest_pool')
-    .select('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers')
+    .select('observed_on,snapshot_at,origin,dest,flight_type,rank,departure_at,return_at,transfers,price,source_updated_at,price_source')
     .eq('snapshot_at', latest.snapshot_at).order('origin').order('flight_type').order('rank');
   if (rowsError) throw new Error(`Selected roulette ticket read failed: ${rowsError.message}`);
-  return data ?? [];
+  const { data: revisions, error: revisionsError } = await db.from('roulette_pool_ticket_revisions')
+    .select('snapshot_at,origin,flight_type,rank,dest,departure_at,return_at,visibility,reason,generation')
+    .eq('snapshot_at', latest.snapshot_at).eq('generation', generation)
+    .order('origin').order('flight_type').order('rank');
+  if (revisionsError) throw new Error(`Selected roulette revision read failed: ${revisionsError.message}`);
+  return withCurrentRouletteRevisionState(data ?? [], revisions ?? []);
 }
 
 export function berlinDay(now = Date.now) {
@@ -155,11 +172,11 @@ export async function latestCarousel(db, now = Date.now) {
   const tickets = [];
   for (const run of runs ?? []) {
     const { data: candidates, error: rowsError } = await db.from('daily_origin_window_candidates')
-      .select('observed_on,snapshot_at,origin,destination_id,dest,flight_type,departure_at,return_at,transfers,airline')
+      .select('observed_on,snapshot_at,origin,destination_id,dest,flight_type,departure_at,return_at,position,transfers,airline,exact_price,exact_observed_at,refresh_status,price_source')
       .eq('observed_on', run.observed_on).eq('origin', run.origin).eq('snapshot_at', run.snapshot_at)
       .order('departure_at').order('flight_type');
     if (rowsError) throw new Error(`Selected carousel ticket read failed: ${rowsError.message}`);
-    tickets.push(...acceptedCarouselRun(run, candidates ?? [], observedOn));
+    tickets.push(...acceptedCarouselRun(run, (candidates ?? []).map(candidate => ({ ...candidate, price: candidate.exact_price })), observedOn));
   }
   return tickets;
 }
@@ -191,16 +208,18 @@ export async function runSelectedRefresh({ env = process.env, db: injectedDb, pr
   const provider = injectedProvider ?? new CollectionProvider({ token: env.TP_TOKEN, lease: () => store.lease() });
   const summary = { roulette: { attempted: 0 }, carousel: { attempted: 0 }, generation };
   try {
-    for (const ticket of await latestRoulette(db)) {
+    const rouletteTickets = await latestRoulette(db, generation);
+    for (const ticket of rouletteTickets) {
       if (now() + 9000 >= deadline) break;
       const identity = rouletteTicket(ticket), outcome = await refreshOutcome(ticket, provider, deadline, now);
-      await commit(db, store, ROULETTE_RPC, { ...store.args(), p_generation: generation, p_ticket: identity, p_result: rouletteResult(ticket, outcome, now) });
+      await commit(db, store, ROULETTE_RPC, { ...store.args(), p_generation: generation, p_ticket: identity, p_result: rouletteResult(ticket, outcome, now, rouletteTickets) });
       summary.roulette.attempted++;
     }
-    for (const ticket of await latestCarousel(db, now)) {
+    const carouselTickets = await latestCarousel(db, now);
+    for (const ticket of carouselTickets) {
       if (now() + 9000 >= deadline) break;
       const identity = carouselTicket(ticket), outcome = await refreshOutcome(ticket, provider, deadline, now);
-      await commit(db, store, CAROUSEL_RPC, { p_ticket: identity, p_generation: generation, p_result: carouselResult(ticket, outcome, now) });
+      await commit(db, store, CAROUSEL_RPC, { p_ticket: identity, p_generation: generation, p_result: carouselResult(ticket, outcome, now, carouselTickets) });
       summary.carousel.attempted++;
     }
     return summary;

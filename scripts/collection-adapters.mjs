@@ -21,6 +21,8 @@ import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
 import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
+import { carouselReplacement, isBerlinSelectedRefreshDaytime, retainedResult, rouletteReplacement,
+  selectCarouselAlternate, selectRouletteAlternate, selectedRefreshAdmission, withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -121,6 +123,35 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const accepted=await query(() => db.rpc(name, { ...store.args(), ...payload }), deadline, { retry: true, op: name });
     if(accepted!==true)throw new Error('Collection write was not acknowledged');
     return accepted;
+  }
+
+  async function readSelectedRefreshAdmission(deadline) {
+    const control = await query(() => db.from('selected_price_refresh_control')
+      .select('singleton,enabled,generation,main12h_rollback').eq('singleton', true).maybeSingle(), deadline,
+    { retry: true, op: 'selected_price_refresh_control_read' });
+    return selectedRefreshAdmission(Array.isArray(control) ? control[0] : control);
+  }
+
+  async function readCurrentRouletteRevisionState(snapshotAt, generation, deadline) {
+    if (!snapshotAt) return [];
+    return load('roulette_pool_ticket_revisions',
+      'snapshot_at,origin,flight_type,rank,dest,departure_at,return_at,visibility,reason,generation',
+      ['origin','flight_type','rank','dest'], q => q.eq('snapshot_at', snapshotAt).eq('generation', generation), deadline);
+  }
+
+  // The carousel selected RPC has the deployed three-argument signature. Keep the coordinator
+  // fence at the caller boundary and do not retry a complete-revision write after an ambiguous
+  // transport result; the next ordinary cadence re-reads the durable selected set.
+  async function commitSelectedCarousel(ticket, generation, result, deadline) {
+    if (clock() + 9000 >= deadline) throw new CollectionYield('Selected carousel write would cross boundary', 'boundary');
+    if (!await store.lease()) throw new Error('Selected carousel write forbidden: lease lost');
+    const response = await db.rpc('collection_commit_selected_carousel', { p_ticket: ticket, p_generation: generation, p_result: result });
+    if (response.error) {
+      logDbError({ op: 'collection_commit_selected_carousel', error: response.error, status: response.status, attempt: 1 });
+      throw new Error(`Collection database operation failed: collection_commit_selected_carousel (${dbErrorCode(response.error)})`);
+    }
+    if (response.data !== true) throw new Error('Selected carousel write was not acknowledged');
+    if (!await store.lease()) throw new Error('Selected carousel write forbidden: lease lost after commit');
   }
 
   // Claims and completes ONE flight_price_audits row, or returns claimed:false when the queue is
@@ -326,7 +357,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     },
   };
 
-  async function persistExactOutcome(ticket,response,outcome,deadline) {
+  async function persistExactOutcome(ticket,response,outcome,deadline,selected = null) {
     const now = new Date(clock()).toISOString(); const market = marketForOrigin(ticket.origin);
     let fare = null; let miss = null;
     if (outcome.status==='found') {
@@ -339,18 +370,29 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         departure_at:ticket.departure_at,return_at:ticket.return_at,window_kind:ticket.window_kind,
         outcome:outcome.status==='no_result'?'empty':'http_error',detail:outcome.detail,checked_at:now };
     }
-    if(ticket.snapshot_at&&ticket.position&&ticket.destination_id){const candidateResult=fare?{status:'found',price:fare.price,
-      transfers:fare.transfers,airline:fare.airline,updated_at:fare.updated_at,checked_at:fare.updated_at,
-      price_source:preserveCarouselSixMonthMinimum(fare.price_source,ticket.price_source)}
-      :{status:outcome.status,detail:outcome.detail};
-      await commit('collection_commit_window_candidate',{p_ticket:ticket,p_result:candidateResult},deadline);
+    if(ticket.snapshot_at&&ticket.position&&ticket.destination_id){
+      if (selected?.active) {
+        const candidateResult = fare
+          ? { status: 'found', fare: { ...fare, price_source: preserveCarouselSixMonthMinimum(fare.price_source, ticket.price_source) } }
+          : outcome.status === 'no_result'
+            ? (() => { const replacement = carouselReplacement(selectCarouselAlternate(selected.candidates, ticket, clock()));
+              return replacement ? { status: 'confirmed_absent', outcome: 'replaced', replacement } : { status: 'confirmed_absent', outcome: 'retained' }; })()
+            : retainedResult(outcome);
+        await commitSelectedCarousel(ticket, selected.generation, candidateResult, deadline);
+      } else {
+        const candidateResult=fare?{status:'found',price:fare.price,
+          transfers:fare.transfers,airline:fare.airline,updated_at:fare.updated_at,checked_at:fare.updated_at,
+          price_source:preserveCarouselSixMonthMinimum(fare.price_source,ticket.price_source)}
+          :{status:outcome.status,detail:outcome.detail};
+        await commit('collection_commit_window_candidate',{p_ticket:ticket,p_result:candidateResult},deadline);
+      }
     }else await commit('collection_commit_window',{p_fare:fare,p_miss:miss},deadline);
     if(fare){const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
       p_observed_at:now}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
     return outcome.status!=='error';
   }
 
-  async function exact(ticket, deadline) {
+  async function exact(ticket, deadline, selected = null) {
     const params = new URLSearchParams({ origin:ticket.origin,destination:ticket.dest,
       departure_at:ticket.departure_at,return_at:ticket.return_at,direct:String(ticket.flight_type==='direct'),
       market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500' });
@@ -358,17 +400,17 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     const outcome = response.kind==='ok' ? classifyResponse(response.json,{
       origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type,
     }) : {status:'error',detail:response.kind==='refused'?'provider_refused':'provider_error'};
-    return persistExactOutcome(ticket,response,outcome,deadline);
+    return persistExactOutcome(ticket,response,outcome,deadline,selected);
   }
 
-  async function exactGroup(tickets,deadline){
+  async function exactGroup(tickets,deadline,selected = null){
     if(!tickets.length)return true;const ticket=tickets[0];
     const params=new URLSearchParams({origin:ticket.origin,destination:ticket.dest,departure_at:ticket.departure_at,
       return_at:ticket.return_at,direct:'false',market:marketForOrigin(ticket.origin),currency:'eur',one_way:'false',limit:'500'});
     const response=await provider.request('https://api.travelpayouts.com/aviasales/v3/prices_for_dates?'+params,deadline-9000);
     let ok=true;for(const member of tickets){const outcome=response.kind==='ok'?classifyResponse(response.json,{origin:member.origin,dest:member.dest,
       depart:member.departure_at,ret:member.return_at,mode:member.flight_type}):{status:'error',detail:response.kind==='refused'?'provider_refused':'provider_error'};
-      ok=(await persistExactOutcome(member,response,outcome,deadline))&&ok;}return ok;
+      ok=(await persistExactOutcome(member,response,outcome,deadline,selected))&&ok;}return ok;
   }
 
   async function windowWasRefreshedRecently(ticket,deadline){
@@ -448,6 +490,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     if(cp.roulette&&!cp.roulette.done&&!Number.isFinite(cp.roulette.admittedAt))
       cp.roulette.admittedAt=Number.isFinite(cp.roulette.dueAt)?cp.roulette.dueAt:previousDueAt;
     deadline=Math.min(deadline,clock()+PRIORITY_UNIT_MAX_MS);
+    // The normal priority owner remains unchanged. During Berlin daytime it may additionally use
+    // the selected-price contract, but only after reading its durable control on this unit; an
+    // OFF/rollback/invalid generation falls through to the exact legacy write path.
+    const selectedAdmission = isBerlinSelectedRefreshDaytime(clock())
+      ? await readSelectedRefreshAdmission(deadline)
+      : { active: false, generation: null };
     try {
       if(cp.phase==='audit'){
         const audit=await claimAndFinishOneAudit(deadline,today);
@@ -526,12 +574,24 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
             {origin:ticket.origin,dest:ticket.dest,depart:ticket.departure_at,ret:ticket.return_at,mode:ticket.flight_type}).price===result.price):undefined;
           const patch=withPriceProvenance([{...result,updated_at:new Date(clock()).toISOString(),market:marketForOrigin(ticket.origin),flight_type:ticket.flight_type,
             transfers:Number.isInteger(source?.transfers)?source.transfers:null,airline:typeof source?.airline==='string'?source.airline:null}],'offers')[0];
-          if(result.status==='error')deferTechnical(ticket,{response,outcome:result});
+          if(result.status==='error'){
+            deferTechnical(ticket,{response,outcome:result});
+            if (selectedAdmission.active) await commit('collection_commit_selected_roulette', { p_generation: selectedAdmission.generation,
+              p_ticket: ticketPayload(ticket), p_result: retainedResult(result) }, deadline);
+          }
           if(result.status==='no_result'){
-            await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:result},deadline);
+            if (selectedAdmission.active) {
+              const currentPool=withCurrentRouletteRevisionState(plan.tickets,
+                await readCurrentRouletteRevisionState(admittedSnapshot,selectedAdmission.generation,deadline));
+              const replacement=rouletteReplacement(selectRouletteAlternate(currentPool,ticket,clock()));
+              await commit('collection_commit_selected_roulette',{p_generation:selectedAdmission.generation,p_ticket:ticketPayload(ticket),
+                p_result:replacement?{status:'confirmed_absent',outcome:'replaced',replacement}:{status:'confirmed_absent',outcome:'retained'}},deadline);
+            } else await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:result},deadline);
             recordTechnicalOutcome(ticket,'retained_no_result');r.cursor++;
           }
-          if(result.status==='found'){await commit('collection_commit_roulette',{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
+          if(result.status==='found'){await commit(selectedAdmission.active?'collection_commit_selected_roulette':'collection_commit_roulette',selectedAdmission.active
+            ?{p_generation:selectedAdmission.generation,p_ticket:ticketPayload(ticket),p_result:{status:'found',fare:patch}}
+            :{p_ticket:ticketPayload(ticket),p_result:patch},deadline);
             const revived=await query(()=>db.rpc('collection_revive_route',{...store.args(),p_origin:ticket.origin,p_dest:ticket.dest,
             p_observed_at:patch.updated_at}),deadline,{retry:true,op:'collection_revive_route'});if(revived!==true)throw new Error('Route revival was not acknowledged');}
           if(result.status==='found'){recordTechnicalOutcome(ticket,'refreshed');r.cursor++;}
@@ -565,12 +625,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
           if(currentDayEpoch)delete w.blockedReason;else w.blockedReason='stale_daily_window_candidate_epoch';}
         const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
-          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_observed_at,refresh_status,price_source',
+          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_price,transfers,airline,exact_observed_at,refresh_status,price_source',
             ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
-          const selected=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
-            updated_at:t.exact_observed_at}));
-          return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selected,
-            groups:groupWindowConsumerTickets(selected)};
+          const selectedTickets=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
+            price:t.exact_price,updated_at:t.exact_observed_at}));
+          return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selectedTickets,
+            groups:groupWindowConsumerTickets(selectedTickets)};
         });
         // PILOT (off by default): same principle as roulette above — the cached plan/groups stay
         // the full daily set; only which groups get touched THIS cycle is narrowed by each
@@ -583,7 +643,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           if(isSuspendedOrigin(group[0].origin)){w.cursor++;w.suspended=(w.suspended??0)+group.length;}
           else if(group[0].departure_at<today){w.cursor++;w.expired=(w.expired??0)+group.length;}
           else{const age=Math.max(...group.map(ticket=>Math.max(0,clock()-Date.parse(ticket.updated_at))).filter(Number.isFinite));
-            const ok=await exactGroup(group,deadline);w.cursor++;w.errors+=ok?0:1;
+            const ok=await exactGroup(group,deadline,selectedAdmission.active?{ active:true,generation:selectedAdmission.generation,candidates:plan.tickets }:null);w.cursor++;w.errors+=ok?0:1;
             w.oldestAgeMs=Math.max(w.oldestAgeMs??0,Number.isFinite(age)?age:0);w.lastRefreshedAt=clock();}
         }
         w.done=w.cursor>=w.total;cp.weekend=w;
