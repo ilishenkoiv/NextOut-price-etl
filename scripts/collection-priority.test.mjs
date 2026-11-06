@@ -34,9 +34,9 @@ test('daytime primary carousel refresh preserves exact dates and uses only a cur
     dest:index===0?'BCN':index===1?'FCO':'MAD',destination_id,flight_type:'any',departure_at:'2026-12-04',return_at:'2026-12-07',position:index+1,
     window_kind:'weekend',exact_price:index===0?100:index===1?88:77,transfers:1,airline:null,exact_observed_at:'2026-11-06T09:45:00Z',refresh_status:index===1?'unavailable':'fresh',price_source:{source:'fixture'}}));
   const calls=[];const db={from:table=>chain(table==='selected_price_refresh_control'
-    ?{singleton:true,enabled:true,generation:1,main12h_rollback:false}:table==='daily_window_candidate_epochs'
-      ?[{observed_on:'2026-11-06',snapshot_at:snapshot,contract_version:1,candidate_rows:2,exact_request_groups:2}]
-      :table==='daily_window_candidates'?candidates:[]),
+    ?{singleton:true,enabled:true,generation:1,main12h_rollback:false}:table==='daily_origin_window_candidate_runs'
+      ?[{observed_on:'2026-11-06',origin:'BER',snapshot_at:snapshot,contract_version:1,candidate_rows:3,exact_request_groups:1}]
+      :table==='daily_origin_window_candidates'?candidates:[]),
     rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},storage:{from:()=>({})}};
   const store={args:()=>({p_owner:'owner',p_token:11}),lease:async()=>true,runId:'run',plan:async(_key,build)=>build()};
   const adapter=createAdapters({db,store,provider:{request:async()=>({kind:'ok',json:{success:true,data:[]}})},clock:()=>now}).priority;

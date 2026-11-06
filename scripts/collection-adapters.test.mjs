@@ -3,13 +3,20 @@ import assert from 'node:assert/strict';
 import { createAdapters, MAIN_REQUIRED_PROVIDER_CALLS, projectMainCellMs } from './collection-adapters.mjs';
 import { CollectionYield } from './collection-provider.mjs';
 
-function fixture(plan,response,{tableRows={},clock=()=>100000,rpc,lease=async()=>true,storageList}={}){
+function fixture(plan,response,{tableRows={},clock=()=>100000,rpc,lease=async()=>true,storageList,buildPlan=false,filterRows=false}={}){
   const calls=[];
-  const chain=data=>new Proxy({}, {get:(_,key)=>key==='then'?Promise.resolve({data,error:null}).then.bind(Promise.resolve({data,error:null})):()=>chain(data)});
+  const chain=(data,filters=[])=>new Proxy({}, {get:(_,key)=>{
+    if(key==='then'){
+      const filtered=filterRows&&Array.isArray(data)?data.filter(row=>filters.every(([field,value])=>row?.[field]===value)):data;
+      const result=Promise.resolve({data:filtered,error:null});return result.then.bind(result);
+    }
+    if(key==='eq')return(field,value)=>chain(data,[...filters,[field,value]]);
+    return()=>chain(data,filters);
+  }});
   const db={rpc:(name,args)=>{calls.push({name,args});return rpc?rpc(name,args):Promise.resolve({data:true,error:null});},
     from:table=>chain(tableRows[table]??[]),storage:{from:()=>({
       upload:async()=>({data:{},error:null}),list:storageList??(async()=>({data:[],error:null})),remove:async()=>({data:[],error:null})})}};
-  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease,plan:async()=>plan,runId:'123'};
+  const store={args:()=>({p_owner:'test-owner',p_token:1}),lease,plan:async(_key,build)=>buildPlan?build():plan,runId:'123'};
   let requests=0;
   const provider={request:async url=>{requests++;return response(requests,url);}};
   return{adapters:createAdapters({db,store,provider,clock,wave:10}),calls,get requests(){return requests;}};
@@ -275,6 +282,80 @@ test('weekend phase: no epoch rows at all is reported as blocked, not an empty-l
   assert.equal(result.status,'done');
   assert.equal(result.checkpoint.weekend.blockedReason,'no_daily_window_candidate_epoch');
   assert.equal(result.checkpoint.weekend.done,true);
+});
+
+const selectedCarouselNow=Date.parse('2026-01-15T12:00:00Z');
+const selectedCarouselRun={observed_on:'2026-01-15',origin:'FRA',snapshot_at:'2026-01-15T07:00:00Z',contract_version:1,candidate_rows:1,exact_request_groups:1};
+const selectedCarouselTicket={observed_on:'2026-01-15',origin:'FRA',snapshot_at:'2026-01-15T07:00:00Z',destination_id:'madrid',dest:'MAD',
+  flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',position:1,window_kind:'weekend',exact_price:123,transfers:0,
+  airline:null,exact_observed_at:'2026-01-15T07:00:00Z',refresh_status:'fresh',price_source:{source:'fixture'}};
+const selectedCarouselControl=[{singleton:true,enabled:true,generation:1,main12h_rollback:false}];
+const selectedWeekendCheckpoint={cycle:job.id,phase:'weekend',dueAt:selectedCarouselNow,roulette:{done:true}};
+
+test('selected carousel mode loads a current per-origin snapshot and commits only its exact candidate identity',async()=>{
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>selectedCarouselNow,buildPlan:true,tableRows:{
+    selected_price_refresh_control:selectedCarouselControl,
+    daily_origin_window_candidate_runs:[selectedCarouselRun],
+    daily_origin_window_candidates:[selectedCarouselTicket],
+  },filterRows:true});
+  const result=await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+  const commit=f.calls.find(call=>call.name==='collection_commit_selected_carousel');
+  assert.equal(f.requests,1);
+  assert.equal(result.status,'done');
+  assert.deepEqual(commit.args.p_ticket,{...selectedCarouselTicket,nights:7,price:123,updated_at:selectedCarouselTicket.exact_observed_at});
+  assert.equal(commit.args.p_generation,1);
+});
+
+test('selected carousel mode validates per-origin request groups by flight type and exact dates',async()=>{
+  const alternate={...selectedCarouselTicket,destination_id:'barcelona',dest:'BCN',position:2};
+  const run={...selectedCarouselRun,candidate_rows:2,exact_request_groups:1};
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[offer]}}),{clock:()=>selectedCarouselNow,buildPlan:true,filterRows:true,tableRows:{
+    selected_price_refresh_control:selectedCarouselControl,
+    daily_origin_window_candidate_runs:[run],
+    daily_origin_window_candidates:[selectedCarouselTicket,alternate],
+  }});
+  const result=await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+  assert.equal(result.status,'progress');
+  assert.equal(result.checkpoint.weekend.total,2);
+  assert.equal(f.requests,1);
+  assert.equal(f.calls.some(call=>call.name==='collection_commit_selected_carousel'),true);
+});
+
+test('selected carousel mode fails closed for absent or stale origin snapshots without a provider request or RPC',async()=>{
+  for(const runs of [[],[{...selectedCarouselRun,observed_on:'2026-01-14'}]]){
+    const f=fixture({},()=>{throw new Error('missing or stale selected snapshot must not call provider');},{clock:()=>selectedCarouselNow,buildPlan:true,tableRows:{
+      selected_price_refresh_control:selectedCarouselControl,
+      daily_origin_window_candidate_runs:runs,
+      daily_origin_window_candidates:[selectedCarouselTicket],
+    },filterRows:true});
+    const result=await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+    assert.equal(result.status,'done');
+    assert.equal(f.requests,0);
+    assert.equal(f.calls.some(call=>call.name==='collection_commit_selected_carousel'),false);
+    assert.equal(result.checkpoint.weekend.done,true);
+  }
+});
+
+test('selected carousel mode fails closed when any current origin snapshot is ambiguous or incomplete',async()=>{
+  const mucRun={...selectedCarouselRun,origin:'MUC',snapshot_at:'2026-01-15T08:00:00Z',candidate_rows:2,exact_request_groups:2};
+  const mucTicket={...selectedCarouselTicket,origin:'MUC',snapshot_at:mucRun.snapshot_at,destination_id:'rome',dest:'FCO'};
+  const cases=[
+    {filterRows:false,runs:[selectedCarouselRun,{...selectedCarouselRun,observed_on:'2026-01-14'}],candidates:[selectedCarouselTicket]},
+    {filterRows:true,runs:[selectedCarouselRun,{...selectedCarouselRun,snapshot_at:'2026-01-15T08:00:00Z'}],candidates:[selectedCarouselTicket]},
+    {filterRows:true,runs:[selectedCarouselRun,mucRun],candidates:[selectedCarouselTicket,mucTicket]},
+  ];
+  for(const {filterRows,runs,candidates} of cases){
+    const f=fixture({},()=>{throw new Error('unsafe selected snapshot must not call provider');},{clock:()=>selectedCarouselNow,buildPlan:true,filterRows,tableRows:{
+      selected_price_refresh_control:selectedCarouselControl,
+      daily_origin_window_candidate_runs:runs,
+      daily_origin_window_candidates:candidates,
+    }});
+    const result=await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+    assert.equal(result.status,'done');
+    assert.equal(f.requests,0);
+    assert.equal(f.calls.some(call=>call.name==='collection_commit_selected_carousel'),false);
+    assert.equal(result.checkpoint.weekend.done,true);
+  }
 });
 
 const maintenanceNow=Date.parse('2026-09-27T01:05:00Z'); // 03:05 Europe/Berlin

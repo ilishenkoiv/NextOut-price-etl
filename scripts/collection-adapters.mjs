@@ -139,6 +139,78 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       ['origin','flight_type','rank','dest'], q => q.eq('snapshot_at', snapshotAt).eq('generation', generation), deadline);
   }
 
+  const candidateDate = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.slice(0, 10)) ? value.slice(0, 10) : null;
+  const sameOriginCarouselSnapshot = (candidate, run) => candidate?.observed_on === run?.observed_on
+    && candidate?.origin === run?.origin && candidate?.snapshot_at === run?.snapshot_at;
+  const hasCurrentOriginCarouselRunIdentity = (run, observedOn) => typeof run?.origin === 'string' && run.origin.length > 0
+    && typeof run?.snapshot_at === 'string' && Number.isFinite(Date.parse(run.snapshot_at))
+    && berlinDay(Date.parse(run.snapshot_at)) === observedOn;
+  const hasExactOriginCarouselIdentity = candidate => typeof candidate?.destination_id === 'string' && candidate.destination_id.length > 0
+    && typeof candidate?.dest === 'string' && candidate.dest.length > 0
+    && ['direct','any'].includes(candidate?.flight_type)
+    && candidateDate(candidate.departure_at) != null && candidateDate(candidate.return_at) != null
+    && candidateDate(candidate.return_at) > candidateDate(candidate.departure_at)
+    && Number.isSafeInteger(Number(candidate.position)) && Number(candidate.position) > 0;
+
+  // A selected carousel RPC accepts only a ticket from one current per-origin snapshot. Any
+  // missing, stale, mixed, or incomplete run deliberately yields no tickets: the RPC is then not
+  // called and its already visible card/price remains untouched.
+  function acceptedCurrentOriginCarouselCandidates(run, candidates, observedOn) {
+    if (run?.observed_on !== observedOn || run.contract_version !== 1 || !Number.isSafeInteger(Number(run.candidate_rows))
+      || !Number.isSafeInteger(Number(run.exact_request_groups)) || Number(run.candidate_rows) < 1
+      || Number(run.exact_request_groups) < 1 || !Array.isArray(candidates) || candidates.length !== Number(run.candidate_rows)) return [];
+    if (candidates.some(candidate => !sameOriginCarouselSnapshot(candidate, run) || !hasExactOriginCarouselIdentity(candidate))) return [];
+    const identities = new Set(candidates.map(candidate => [candidate.destination_id,candidate.dest,candidate.flight_type,
+      candidateDate(candidate.departure_at),candidateDate(candidate.return_at),candidate.position].join('|')));
+    if (identities.size !== candidates.length) return [];
+    // The per-origin publication contract counts request groups by the exact selected
+    // flight variant and dates, independently of how the primary adapter later batches
+    // provider calls by destination.
+    const requestGroups = new Set(candidates.map(candidate => [candidate.flight_type,
+      candidateDate(candidate.departure_at),candidateDate(candidate.return_at)].join('|')));
+    if (requestGroups.size !== Number(run.exact_request_groups)) return [];
+    return candidates;
+  }
+
+  async function currentOriginCarouselPlan(observedOn, dayId, deadline) {
+    const runs = await load('daily_origin_window_candidate_runs',
+      'observed_on,origin,snapshot_at,contract_version,candidate_rows,exact_request_groups',
+      ['origin','snapshot_at'], q => q.eq('observed_on', observedOn).eq('contract_version', 1), deadline);
+    const currentRuns = runs.filter(run => run.observed_on === observedOn && run.contract_version === 1
+      && hasCurrentOriginCarouselRunIdentity(run, observedOn));
+    if (currentRuns.length !== runs.length) return { day: observedOn, setId: null, selectedAt: null, tickets: [], groups: [],
+      blockedReason: 'stale_current_origin_window_candidate_run' };
+    const origins = new Set(currentRuns.map(run => run.origin));
+    if (origins.size !== currentRuns.length) return { day: observedOn, setId: null, selectedAt: null, tickets: [], groups: [],
+      blockedReason: 'ambiguous_current_origin_window_candidate_run' };
+    if (!currentRuns.length) return { day: observedOn, setId: null, selectedAt: null, tickets: [], groups: [],
+      blockedReason: 'no_current_origin_window_candidate_run' };
+    const tickets = [];
+    for (const run of currentRuns) {
+      const candidates = await load('daily_origin_window_candidates',
+        'observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_price,transfers,airline,exact_observed_at,refresh_status,price_source',
+        ['flight_type','departure_at','return_at','position'], q => q.eq('observed_on', observedOn)
+          .eq('origin', run.origin).eq('snapshot_at', run.snapshot_at), deadline);
+      const accepted = acceptedCurrentOriginCarouselCandidates(run, candidates, observedOn);
+      // One incomplete or stale per-origin snapshot makes the whole selected carousel unsafe:
+      // do not refresh a subset, so no selected RPC can alter the visible card/price.
+      if (!accepted.length) return { day: observedOn, setId: null, selectedAt: null, tickets: [], groups: [],
+        blockedReason: 'no_current_origin_window_candidate_snapshot' };
+      tickets.push(...accepted);
+    }
+    const signature = currentRuns.map(run => [run.observed_on,run.origin,run.snapshot_at,run.contract_version,
+      run.candidate_rows,run.exact_request_groups].join('|')).sort().join('\n');
+    const planId = BigInt('0x' + createHash('sha256').update(signature).digest('hex').slice(0, 16)).toString();
+    return store.plan(`coordinator/selectedwindowrefresh-${dayId}-${planId}.json`, async () => {
+      const selectedTickets = tickets.map(ticket => ({ ...ticket,
+        nights: (Date.parse(ticket.return_at+'T00:00:00Z')-Date.parse(ticket.departure_at+'T00:00:00Z'))/DAY,
+        price: ticket.exact_price, updated_at: ticket.exact_observed_at }));
+      return { day: observedOn, setId: `daily-origin-window:${planId}`,
+        selectedAt: currentRuns.map(run => run.snapshot_at).sort().at(-1), tickets: selectedTickets,
+        groups: groupWindowConsumerTickets(selectedTickets) };
+    });
+  }
+
   // The carousel selected RPC has the deployed three-argument signature. Keep the coordinator
   // fence at the caller boundary and do not retry a complete-revision write after an ambiguous
   // transport result; the next ordinary cadence re-reads the durable selected set.
@@ -605,33 +677,41 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
         if(!w||w.done){const dayId=Math.floor(Date.parse(today+'T00:00:00Z')/DAY);w={day:today,dayId,cursor:0,done:false,errors:0,
           passStartedAt:clock(),admittedAt:Number.isFinite(cp.dueAt)?cp.dueAt:now};}
         if(!Number.isFinite(w.admittedAt))w.admittedAt=Number.isFinite(w.dueAt)?w.dueAt:previousDueAt;
-        // Latest-row-only: snapshot_at is UNIQUE on this table (see
-        // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
-        // same row ascending-order .at(-1) used to, without paging the whole epoch history
-        // on every weekend-phase tick.
-        const epochs=await query(()=>db.from('daily_window_candidate_epochs')
-          .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
-          .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_window_candidate_epochs_latest'});
-        recordRead('daily_window_candidate_epochs',epochs);
-        if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.currentDayComplete=false;w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
-          return{status:'done',checkpoint:cp};}
-        const latestEpoch=epochs[0];
-        const epoch=w.snapshotAt?{...latestEpoch,snapshot_at:w.snapshotAt,observed_on:w.sourceObservedOn??w.day}:latestEpoch;
-        const epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
-        const currentDayEpoch=epoch.observed_on===w.day;
-        if(!w.snapshotAt)w={...w,cursor:0,snapshotAt:epoch.snapshot_at,
-          sourceObservedOn:epoch.observed_on,currentDayComplete:currentDayEpoch,
-          ...(currentDayEpoch?{}:{blockedReason:'stale_daily_window_candidate_epoch'})};
-        else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
-          if(currentDayEpoch)delete w.blockedReason;else w.blockedReason='stale_daily_window_candidate_epoch';}
-        const plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
-          const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_price,transfers,airline,exact_observed_at,refresh_status,price_source',
-            ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
-          const selectedTickets=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
-            price:t.exact_price,updated_at:t.exact_observed_at}));
-          return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selectedTickets,
-            groups:groupWindowConsumerTickets(selectedTickets)};
-        });
+        let plan;
+        if (selectedAdmission.active) {
+          plan = await currentOriginCarouselPlan(w.day, w.dayId, deadline);
+          if (w.setId !== undefined && w.setId !== plan.setId) { w.cursor = 0; w.errors = 0; }
+          w.sourceObservedOn = w.day; w.currentDayComplete = !plan.blockedReason;
+          if (plan.blockedReason) w.blockedReason = plan.blockedReason; else delete w.blockedReason;
+        } else {
+          // Latest-row-only: snapshot_at is UNIQUE on this table (see
+          // 20260922140000_daily_window_candidates.sql), so desc+limit(1) returns exactly the
+          // same row ascending-order .at(-1) used to, without paging the whole epoch history
+          // on every weekend-phase tick.
+          const epochs=await query(()=>db.from('daily_window_candidate_epochs')
+            .select('observed_on,snapshot_at,contract_version,candidate_rows,exact_request_groups')
+            .order('snapshot_at',{ascending:false}).limit(1),deadline,{retry:true,op:'daily_window_candidate_epochs_latest'});
+          recordRead('daily_window_candidate_epochs',epochs);
+          if(!epochs.length){w.blockedReason='no_daily_window_candidate_epoch';w.currentDayComplete=false;w.done=true;cp.weekend=w;cp.phase='done';cp.completedAt=clock();
+            return{status:'done',checkpoint:cp};}
+          const latestEpoch=epochs[0];
+          const epoch=w.snapshotAt?{...latestEpoch,snapshot_at:w.snapshotAt,observed_on:w.sourceObservedOn??w.day}:latestEpoch;
+          const epochId=String(Math.max(0,Date.parse(epoch.snapshot_at)||0));
+          const currentDayEpoch=epoch.observed_on===w.day;
+          if(!w.snapshotAt)w={...w,cursor:0,snapshotAt:epoch.snapshot_at,
+            sourceObservedOn:epoch.observed_on,currentDayComplete:currentDayEpoch,
+            ...(currentDayEpoch?{}:{blockedReason:'stale_daily_window_candidate_epoch'})};
+          else{w.sourceObservedOn=epoch.observed_on;w.currentDayComplete=currentDayEpoch;
+            if(currentDayEpoch)delete w.blockedReason;else w.blockedReason='stale_daily_window_candidate_epoch';}
+          plan=await store.plan(`coordinator/windowrefresh-${w.dayId}-${epochId}.json`,async()=>{
+            const tickets=await load('daily_window_candidates','observed_on,snapshot_at,origin,market,dest,destination_id,flight_type,departure_at,return_at,position,window_kind,exact_price,transfers,airline,exact_observed_at,refresh_status,price_source',
+              ['origin','flight_type','departure_at','return_at','position'],q=>q.eq('snapshot_at',epoch.snapshot_at),deadline);
+            const selectedTickets=tickets.map(t=>({...t,nights:(Date.parse(t.return_at+'T00:00:00Z')-Date.parse(t.departure_at+'T00:00:00Z'))/DAY,
+              price:t.exact_price,updated_at:t.exact_observed_at}));
+            return{day:w.day,setId:`daily-window:${epoch.snapshot_at}`,selectedAt:epoch.snapshot_at,tickets:selectedTickets,
+              groups:groupWindowConsumerTickets(selectedTickets)};
+          });
+        }
         // PILOT (off by default): same principle as roulette above — the cached plan/groups stay
         // the full daily set; only which groups get touched THIS cycle is narrowed by each
         // group's origin's market-local time of day. Every group from one groupWindowConsumerTickets
