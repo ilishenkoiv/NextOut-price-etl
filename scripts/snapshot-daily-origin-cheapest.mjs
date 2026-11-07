@@ -131,6 +131,26 @@ export function assertCompleteDailyRoulettePool(pool, expectedOrigins) {
   return true;
 }
 
+// The daily writer is atomic for the set it receives, but its contract is per origin: every
+// submitted origin must have exactly ten distinct real cities.  Keep a short source result for
+// an incomplete origin instead of sending its partial rows (or inventing a tenth city).
+export function completeDailyRoulettePoolsByOrigin(pool, expectedOrigins) {
+  const expected=expectedOrigins instanceof Set?expectedOrigins:new Set(expectedOrigins);
+  const byOrigin=new Map();
+  for(const row of pool){const rows=byOrigin.get(row.origin)??[];rows.push(row);byOrigin.set(row.origin,rows);}
+  const completeOrigins=[],incompleteOrigins=[],completePool=[];
+  for(const origin of expected){
+    const rows=(byOrigin.get(origin)??[]).sort((a,b)=>Number(a.rank)-Number(b.rank));
+    try{
+      assertCompleteDailyRoulettePool(rows,[origin]);
+      completeOrigins.push(origin);completePool.push(...rows);
+    }catch{
+      incompleteOrigins.push({origin,availableCities:new Set(rows.map(row=>row.dest)).size});
+    }
+  }
+  return {pool:completePool,completeOrigins,incompleteOrigins};
+}
+
 // Observability only, never a gate: the fraction of expected origins that show at least one
 // offer no older than `maxAgeMs`. Selection never waits for this to clear a threshold (see
 // main() below) — it is logged so a slow/broken source pass is visible without re-reading the
@@ -193,7 +213,7 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   const freshFraction = freshOriginFraction(offers, instant, origins);
 
   const snapshotAt = new Date(instant).toISOString();
-  const pool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
+  const selectedPool = selectDailyCheapestPool(offers, observedOn, 10).map((row) => ({
   observed_on: observedOn,
   snapshot_at: snapshotAt,
   created_at: snapshotAt,
@@ -211,10 +231,18 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   source_updated_at: row.updated_at || null,
   price_source: row.price_source || null,
   }));
-  assertCompleteDailyRoulettePool(pool,origins);
+  const poolStatus=completeDailyRoulettePoolsByOrigin(selectedPool,origins);
+  if(!poolStatus.completeOrigins.length){
+    console.log(JSON.stringify({event:'daily_selection_not_published',scope:'roulette',observedOn,
+      reason:'no_complete_origins',incompleteOrigins:poolStatus.incompleteOrigins}));
+    return {rebuilt:false,observedOn,snapshotAt:null,reason:'no_complete_origins',
+      incompleteOrigins:poolStatus.incompleteOrigins,rank1Rows:0,poolRows:0};
+  }
+  const pool=poolStatus.pool;
+  assertCompleteDailyRoulettePool(pool,poolStatus.completeOrigins);
   // Keep the compatibility table's historical contract: one rank-1 row for each origin/mode.
   // The roulette pool above is intentionally different: ten unique destinations per origin.
-  const chosen = selectDailyCheapest(offers, observedOn).map((row) => ({
+  const chosen = selectDailyCheapest(offers, observedOn).filter(row=>poolStatus.completeOrigins.includes(row.origin)).map((row) => ({
     observed_on: observedOn,
     snapshot_at: snapshotAt,
     created_at: snapshotAt,
@@ -264,8 +292,10 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   if(didPublish!==true){console.log(JSON.stringify({event:'daily_selection_noop',scope:'roulette',observedOn,reason:'already_published'}));
     return{rebuilt:false,observedOn,snapshotAt:null,reason:'already_published'};}
   console.log(JSON.stringify({event:'daily_selection_published',scope:'roulette',observedOn,snapshotAt,
-    rank1Rows:chosen.length,poolRows:pool.length,sourceOffers:offers.length,freshFraction,refresh}));
-  return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh, rank1Rows: chosen.length, poolRows: pool.length };
+    rank1Rows:chosen.length,poolRows:pool.length,sourceOffers:offers.length,freshFraction,refresh,
+    publishedOrigins:poolStatus.completeOrigins,incompleteOrigins:poolStatus.incompleteOrigins}));
+  return { rebuilt: true, observedOn, snapshotAt, freshFraction, refresh, rank1Rows: chosen.length, poolRows: pool.length,
+    publishedOrigins:poolStatus.completeOrigins,incompleteOrigins:poolStatus.incompleteOrigins };
 }
 
 export async function manualRecoveryMain({env=process.env,providerFactory=options=>new CollectionProvider(options),clock=Date.now,...options}={}){

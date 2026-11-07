@@ -47,6 +47,19 @@ test('due daily selection is serialized by the lease and fenced after each check
     publishRoulette:async()=>{throw new Error('already checkpointed');},publishWindows:async()=>{throw new Error('already checkpointed');}});
 });
 
+test('an incomplete roulette origin is checkpointed as truthful non-publication without resetting MAIN coverage or blocking carousel publication',async()=>{
+  const instant=Date.parse('2026-11-07T06:00:00Z');
+  const state={version:1,completedMainCoverage:0,jobs:{main:{done:false,checkpoint:{cursor:7,total:110}},priority:{id:1,done:true,checkpoint:{phase:'done'}}}};
+  const mainBefore=structuredClone(state.jobs.main);const store={lease:async()=>true,save:async()=>{}};const calls=[];
+  const result=await runDueDailySelection({state,store,db:{},instant,
+    publishRoulette:async()=>{calls.push('roulette');return{rebuilt:false,reason:'no_complete_origins',incompleteOrigins:[{origin:'SZG',availableCities:3}],rank1Rows:0,poolRows:0};},
+    publishWindows:async()=>{calls.push('window');return{published:true,candidateRows:4};}});
+  assert.deepEqual(calls,['roulette','window']);assert.equal(result.published,true);
+  assert.deepEqual(state.dailySelection.rouletteIncompleteOrigins,[{origin:'SZG',availableCities:3}]);
+  assert.equal(state.dailySelection.roulettePublished,false);assert.equal(state.dailySelection.windowPublished,true);
+  assert.equal(state.completedMainCoverage,0);assert.deepEqual(state.jobs.main,mainBefore,'daily publication never resets MAIN checkpoint/coverage');
+});
+
 test('the provider and its point-refresh deadline are threaded into both publish paths, and a daily_selection_published line is logged with counts',async()=>{
   const instant=Date.parse('2026-09-23T07:00:00Z');
   const state={version:1,jobs:{}};

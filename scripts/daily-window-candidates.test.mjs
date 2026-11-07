@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { main, manualRecoveryMain, selectDailyWindowCandidates } from './snapshot-daily-window-candidates.mjs';
+import { main, manualRecoveryMain, publishWindowCandidatesByOrigin, selectDailyWindowCandidates } from './snapshot-daily-window-candidates.mjs';
 import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 import { attachCarouselSixMonthMinimum, buildCarouselSixMonthMinimum, chooseCarouselCityForWindow,
   preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
@@ -23,6 +23,17 @@ test('daily server set publishes the complete positive exact union, including la
 test('any mode may use the cheaper observed direct row without dropping the independent direct candidate',()=>{
   const out=selectDailyWindowCandidates([row('BCN','direct',90),row('BCN','any',120)],{today:'2026-09-22',snapshotAt,regions:['DE-BE']});
   assert.deepEqual(out.map(r=>[r.flight_type,r.exact_price]),[['any',90],['direct',90]]);
+});
+
+test('per-origin publisher sends the exact v1 atomic writer payload and preserves an object price source',async()=>{
+  const [candidate]=selectDailyWindowCandidates([row('BCN','any',150,{price_source:null})],{today:'2026-09-22',snapshotAt,regions:['DE-BE']});
+  const calls=[];const client={rpc:async(name,args)=>{calls.push({name,args});return{data:true,error:null};}};
+  const result=await publishWindowCandidatesByOrigin(client,'2026-09-22',[candidate]);
+  assert.deepEqual(result,{published:true,publishedOrigins:['BER'],alreadyPublishedOrigins:[]});
+  assert.equal(calls.length,1);assert.equal(calls[0].name,'publish_daily_origin_window_candidates');
+  assert.deepEqual(calls[0].args,{p_observed_on:'2026-09-22',p_snapshot_at:snapshotAt,p_origin:'BER',p_candidates:[candidate]});
+  assert.equal(calls[0].args.p_candidates[0].contract_version,1);
+  assert.deepEqual(calls[0].args.p_candidates[0].price_source,{});
 });
 
 test('selection fails closed for unknown identity, invalid observation, non-factual dates and unpublished expansion wave',()=>{
@@ -102,7 +113,7 @@ test('window_prices date filtering stays server-side while an older positive row
     rpc(){throw new Error('rpc not stubbed for this call');},
   };
   let published=null;
-  db.rpc=(name,args)=>{if(name!=='publish_daily_window_candidates')throw new Error('unexpected rpc '+name);published=args;return Promise.resolve({data:true,error:null});};
+  db.rpc=(name,args)=>{if(name!=='publish_daily_origin_window_candidates')throw new Error('unexpected rpc '+name);published=args;return Promise.resolve({data:true,error:null});};
   await main({db,instant,force:true});
   assert.ok(returnedRowCount!==null && returnedRowCount<allRows.length,
     'the DB-side filter must already narrow the row set before it reaches JS (server-side filtering happened)');
@@ -130,7 +141,7 @@ test('manual recovery refuses a partial point-refresh before the publication RPC
   await assert.rejects(()=>main({db:handle.db,instant:Date.parse('2026-09-22T04:00:00Z'),force:true,
     provider:{request:async()=>{requested++;return{kind:'refused',refusal:'server'};}},clock:()=>1000,
     refreshDeadline:1000,requireCompleteRefresh:true}),/refused incomplete point refresh \(0\/1\)/);
-  assert.equal(requested,0);assert.equal(handle.published,null,'partial recovery must not call publish_daily_window_candidates');
+  assert.equal(requested,0);assert.equal(handle.published,null,'partial recovery must not call the per-origin publisher');
 });
 
 // ---- Select -> point-refresh -> publish (no freshness wait) ---------------------------

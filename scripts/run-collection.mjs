@@ -95,6 +95,7 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
     checkpoint.rouletteDone=true;checkpoint.roulettePublished=result?.rebuilt===true;checkpoint.rouletteCompletedAt=Date.now();
     checkpoint.rouletteFreshFraction=result?.freshFraction??null;checkpoint.rouletteRefresh=result?.refresh??null;
     checkpoint.rouletteRank1Rows=result?.rank1Rows??null;checkpoint.roulettePoolRows=result?.poolRows??null;
+    checkpoint.rouletteIncompleteOrigins=result?.incompleteOrigins??[];
     await store.save(state);published ||= checkpoint.roulettePublished===true;
   }
   if(!checkpoint.windowDone){
@@ -114,7 +115,7 @@ export async function runDueDailySelection({state,store,db,wave=0,instant=Date.n
   await store.save(state);
   if(checkpoint.rouletteDone||checkpoint.windowDone)console.log(JSON.stringify({event:'daily_selection_published',day,published,
     roulette:{published:checkpoint.roulettePublished,freshFraction:checkpoint.rouletteFreshFraction,rank1Rows:checkpoint.rouletteRank1Rows,
-      poolRows:checkpoint.roulettePoolRows,refresh:checkpoint.rouletteRefresh},
+      poolRows:checkpoint.roulettePoolRows,incompleteOrigins:checkpoint.rouletteIncompleteOrigins,refresh:checkpoint.rouletteRefresh},
     window:{published:checkpoint.windowPublished,freshFraction:checkpoint.windowFreshFraction,candidateRows:checkpoint.windowCandidateRows,
       refresh:checkpoint.windowRefresh}}));
   return{state,published};

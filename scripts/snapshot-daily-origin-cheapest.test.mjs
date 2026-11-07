@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectDailyCheapest, selectDailyCheapestPool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
+import { selectDailyCheapest, selectDailyCheapestPool, completeDailyRoulettePoolsByOrigin, assertCompleteDailyRoulettePool, poolExistsForObservedOn, berlinObservedOn, nightlySelectionDue, publishedSnapshotOrigins,
   LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES, pilotSourcesReady, freshOriginFraction,
   PILOT_SOURCE_FRESHNESS_MS, PILOT_MIN_FRESH_ORIGIN_COVERAGE } from './snapshot-daily-origin-cheapest.mjs';
 import { readFileSync } from 'node:fs';
@@ -30,6 +30,16 @@ test('stores up to ten cheapest unique destinations per origin across any and di
   assert.equal(pool[0].price, 49);
   assert.equal(new Set(pool.map((row) => row.dest)).size, 10);
   assert.equal(pool[0].flight_type, 'direct');
+});
+
+test('a partial SZG pool is truthfully omitted while a complete origin remains an exact pool10 publication candidate',()=>{
+  const full=Array.from({length:10},(_,index)=>({origin:'MUC',dest:`M${index}`,rank:index+1,price:100+index}));
+  const partial=Array.from({length:3},(_,index)=>({origin:'SZG',dest:`S${index}`,rank:index+1,price:200+index}));
+  const result=completeDailyRoulettePoolsByOrigin([...full,...partial],new Set(['MUC','SZG']));
+  assert.deepEqual(result.completeOrigins,['MUC']);
+  assert.deepEqual(result.incompleteOrigins,[{origin:'SZG',availableCities:3}]);
+  assert.equal(result.pool.some(row=>row.origin==='SZG'),false,'the 3/10 source pool is never passed to publication');
+  assert.doesNotThrow(()=>assertCompleteDailyRoulettePool(result.pool,result.completeOrigins));
 });
 
 test('production selection derives the approved 18 active departures from the shared catalogue',()=>{

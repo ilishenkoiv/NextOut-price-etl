@@ -51,7 +51,7 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
       origin:row.origin,market:marketForOrigin(row.origin),flight_type:mode,region_codes:entry.window.regionCodes,
       window_kind:entry.window.kind,departure_at:row.departure_at,return_at:row.return_at,dest:row.dest,destination_id:destinationIdForIata(row.dest),
       exact_price:Number(row.price),currency:'EUR',transfers:Number.isInteger(row.transfers)?row.transfers:null,airline:row.airline??null,
-      exact_observed_at:row.updated_at,refresh_status:'fresh',refresh_checked_at:row.updated_at,last_error_kind:null,price_source:row.price_source??null});}
+      exact_observed_at:row.updated_at,refresh_status:'fresh',refresh_checked_at:row.updated_at,last_error_kind:null,price_source:row.price_source??{}});}
   const groups=new Map();for(const row of candidates){const key=[row.origin,row.flight_type,row.departure_at,row.return_at].join('|');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
   const orderedGroups=[...groups.values()].sort((a,b)=>a[0].origin.localeCompare(b[0].origin)||a[0].flight_type.localeCompare(b[0].flight_type)
     ||a[0].departure_at.localeCompare(b[0].departure_at)||a[0].return_at.localeCompare(b[0].return_at));
@@ -69,6 +69,29 @@ export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],r
 
 async function loadAll(db,table,columns,order,filter){const out=[];for(let from=0;;from+=PAGE){let q=db.from(table).select(columns);if(filter)q=filter(q);for(const col of order)q=q.order(col,{ascending:true});
   const{data,error}=await q.range(from,from+PAGE-1);if(error)throw error;out.push(...(data??[]));recordRead(table,data);if((data??[]).length<PAGE)return out;}}
+
+// The live reader admits each origin only through its own atomic run triple.  Partition the
+// already-selected factual candidates here so an incomplete or failed origin cannot block a
+// completed one, and so no global legacy epoch is written as a side effect.
+export function windowCandidatesByOrigin(candidates){
+  const grouped=new Map();
+  for(const candidate of candidates){const rows=grouped.get(candidate.origin)??[];rows.push(candidate);grouped.set(candidate.origin,rows);}
+  return [...grouped.entries()].sort(([a],[b])=>a.localeCompare(b)).map(([origin,rows])=>({origin,
+    candidates:rows.sort((a,b)=>a.flight_type.localeCompare(b.flight_type)||a.departure_at.localeCompare(b.departure_at)
+      ||a.return_at.localeCompare(b.return_at)||a.position-b.position)}));
+}
+
+export async function publishWindowCandidatesByOrigin(client,today,candidates){
+  const publishedOrigins=[],alreadyPublishedOrigins=[];
+  for(const {origin,candidates:originCandidates} of windowCandidatesByOrigin(candidates)){
+    const snapshotAt=originCandidates[0]?.snapshot_at;
+    const{data,error}=await client.rpc('publish_daily_origin_window_candidates',{
+      p_observed_on:today,p_snapshot_at:snapshotAt,p_origin:origin,p_candidates:originCandidates});
+    if(error)throw new Error(`Daily window origin publication failed for ${origin}: ${error.message}`);
+    (data===true?publishedOrigins:alreadyPublishedOrigins).push(origin);
+  }
+  return {published:publishedOrigins.length>0,publishedOrigins,alreadyPublishedOrigins};
+}
 
 export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSHOT_EXPANSION_WAVE??0),force=process.env.SNAPSHOT_FORCE_REBUILD==='true',
   pilotMarketSchedule=false,provider=null,refreshDeadline=Infinity,requireCompleteRefresh=false,clock=Date.now}={}){
@@ -119,10 +142,12 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   if(requireCompleteRefresh&&(!provider||refresh.attempted!==refresh.total)){
     throw new Error(`Manual daily window recovery refused incomplete point refresh (${refresh.attempted}/${refresh.total})`);
   }
-  const{data,error}=await client.rpc('publish_daily_window_candidates',{p_observed_on:today,p_snapshot_at:snapshotAt,p_candidates:candidates});if(error)throw error;
-  const requestGroups=new Set(candidates.map(routeKey)).size;console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published:data===true,observedOn:today,snapshotAt,
-    candidateRows:candidates.length,requestGroups,origins:new Set(candidates.map(r=>r.origin)).size,freshFraction,refresh}));
-  return{published:data===true,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh};
+  const publication=await publishWindowCandidatesByOrigin(client,today,candidates);
+  const requestGroups=new Set(candidates.map(routeKey)).size;console.log(JSON.stringify({event:'daily_selection_published',scope:'window',published:publication.published,observedOn:today,snapshotAt,
+    candidateRows:candidates.length,requestGroups,origins:new Set(candidates.map(r=>r.origin)).size,freshFraction,refresh,
+    publishedOrigins:publication.publishedOrigins,alreadyPublishedOrigins:publication.alreadyPublishedOrigins}));
+  return{published:publication.published,observedOn:today,snapshotAt,candidateRows:candidates.length,requestGroups,freshFraction,refresh,
+    publishedOrigins:publication.publishedOrigins,alreadyPublishedOrigins:publication.alreadyPublishedOrigins};
 }
 
 export async function manualRecoveryMain({env=process.env,publish=main,providerFactory=options=>new CollectionProvider(options),clock=Date.now}={}){
