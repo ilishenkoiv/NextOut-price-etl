@@ -28,24 +28,45 @@ test('daytime primary roulette refresh uses the selected RPC and only a current 
   assert.equal(calls[0].args.p_result.replacement.dest,'D02','confirmed-unavailable FCO cannot replace the selected city');
 });
 
-test('daytime primary carousel refresh preserves exact dates and uses only a current different-city candidate',async()=>{
+test('daytime primary carousel refresh replaces every missing confirmed selected fare with only a current exact-date city',async()=>{
   const now=Date.parse('2026-11-06T10:00:00Z'),snapshot='2026-11-06T03:30:00Z';
   const candidates=['barcelona','rome','madrid'].map((destination_id,index)=>({observed_on:'2026-11-06',snapshot_at:snapshot,origin:'BER',market:'de',
     dest:index===0?'BCN':index===1?'FCO':'MAD',destination_id,flight_type:'any',departure_at:'2026-12-04',return_at:'2026-12-07',position:index+1,
     window_kind:'weekend',exact_price:index===0?100:index===1?88:77,transfers:1,airline:null,exact_observed_at:'2026-11-06T09:45:00Z',refresh_status:index===1?'unavailable':'fresh',price_source:{source:'fixture'}}));
+  candidates.push({...candidates[0],destination_id:'lisbon',dest:'LIS',position:1,departure_at:'2026-12-11',return_at:'2026-12-14',exact_price:55});
+  for(const response of [{kind:'ok',json:{success:true,data:[]}},{kind:'timeout'}]){
+    const calls=[];const db={from:table=>chain(table==='selected_price_refresh_control'
+      ?{singleton:true,enabled:true,generation:1,main12h_rollback:false}:table==='daily_origin_window_candidate_runs'
+        ?[{observed_on:'2026-11-06',origin:'BER',snapshot_at:snapshot,contract_version:1,candidate_rows:4,exact_request_groups:2}]
+        :table==='daily_origin_window_candidates'?candidates:[]),
+      rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},storage:{from:()=>({})}};
+    const store={args:()=>({p_owner:'owner',p_token:11}),lease:async()=>true,runId:'run',plan:async(_key,build)=>build()};
+    const adapter=createAdapters({db,store,provider:{request:async()=>response},clock:()=>now}).priority;
+    const result=await adapter.step({job:{id:1,planDate:'2026-11-06',checkpoint:{cycle:1,dueAt:now,phase:'weekend',auditDone:true,
+      roulette:{cycle:1,done:true,errors:0}}},deadline:now+200000});
+    assert.equal(result.checkpoint.weekend.cursor,1);assert.equal(calls.length,1);
+    assert.equal(calls[0].name,'collection_commit_selected_carousel');assert.equal(calls[0].args.p_generation,1);
+    assert.equal(calls[0].args.p_result.outcome,'replaced');assert.equal(calls[0].args.p_result.replacement.destination_id,'madrid');
+    assert.equal(calls[0].args.p_result.replacement.departure_at,'2026-12-04');
+    assert.equal(calls[0].args.p_result.replacement.return_at,'2026-12-07');
+  }
+});
+
+test('daytime primary carousel retains its technical truth when no fresh exact-date alternate exists',async()=>{
+  const now=Date.parse('2026-11-06T10:00:00Z'),snapshot='2026-11-06T03:30:00Z';
+  const selected={observed_on:'2026-11-06',snapshot_at:snapshot,origin:'BER',market:'de',dest:'BCN',destination_id:'barcelona',flight_type:'any',
+    departure_at:'2026-12-04',return_at:'2026-12-07',position:1,window_kind:'weekend',exact_price:100,transfers:1,airline:null,
+    exact_observed_at:'2026-11-06T09:45:00Z',refresh_status:'fresh',price_source:{source:'fixture'}};
   const calls=[];const db={from:table=>chain(table==='selected_price_refresh_control'
     ?{singleton:true,enabled:true,generation:1,main12h_rollback:false}:table==='daily_origin_window_candidate_runs'
-      ?[{observed_on:'2026-11-06',origin:'BER',snapshot_at:snapshot,contract_version:1,candidate_rows:3,exact_request_groups:1}]
-      :table==='daily_origin_window_candidates'?candidates:[]),
+      ?[{observed_on:'2026-11-06',origin:'BER',snapshot_at:snapshot,contract_version:1,candidate_rows:1,exact_request_groups:1}]
+      :table==='daily_origin_window_candidates'?[selected]:[]),
     rpc:(name,args)=>{calls.push({name,args});return Promise.resolve({data:true,error:null});},storage:{from:()=>({})}};
   const store={args:()=>({p_owner:'owner',p_token:11}),lease:async()=>true,runId:'run',plan:async(_key,build)=>build()};
-  const adapter=createAdapters({db,store,provider:{request:async()=>({kind:'ok',json:{success:true,data:[]}})},clock:()=>now}).priority;
-  const result=await adapter.step({job:{id:1,planDate:'2026-11-06',checkpoint:{cycle:1,dueAt:now,phase:'weekend',auditDone:true,
+  const adapter=createAdapters({db,store,provider:{request:async()=>({kind:'timeout'})},clock:()=>now}).priority;
+  await adapter.step({job:{id:1,planDate:'2026-11-06',checkpoint:{cycle:1,dueAt:now,phase:'weekend',auditDone:true,
     roulette:{cycle:1,done:true,errors:0}}},deadline:now+200000});
-  assert.equal(result.checkpoint.weekend.cursor,1);assert.equal(calls.length,1);
-  assert.equal(calls[0].name,'collection_commit_selected_carousel');assert.equal(calls[0].args.p_generation,1);
-  assert.equal(calls[0].args.p_result.outcome,'replaced');assert.equal(calls[0].args.p_result.replacement.destination_id,'madrid');
-  assert.equal(calls[0].args.p_result.replacement.departure_at,'2026-12-04');
+  assert.deepEqual(calls[0].args.p_result,{status:'unconfirmed',outcome:'retained',detail:'provider_error'});
 });
 
 test('weekend refresh snapshots one stable daily consumer set and resumes its full cursor without reselection',async()=>{

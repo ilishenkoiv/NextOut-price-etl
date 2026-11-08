@@ -38,11 +38,13 @@ test('selected roulette reads only supported pool columns', async () => {
   assert.match(rouletteRead, /\.eq\('generation', generation\)/);
 });
 
-test('carousel payload keeps factual selected identity and retains old price unless an alternate is current-confirmed', () => {
+test('carousel payload keeps factual selected identity and preserves unconfirmed retention when no alternate is current-confirmed', () => {
   const identity = carouselTicket(ticket);
   assert.deepEqual(Object.keys(identity).sort(), ['departure_at', 'dest', 'destination_id', 'flight_type', 'observed_on', 'origin', 'return_at', 'snapshot_at']);
   const result = carouselResult(ticket, { status: 'no_result' });
   assert.deepEqual(result, { status: 'confirmed_absent', outcome: 'retained' });
+  assert.deepEqual(carouselResult(ticket, { status: 'technical', detail: 'provider_error' }),
+    { status: 'unconfirmed', outcome: 'retained', detail: 'provider_error' });
   const found = carouselResult(ticket, { status: 'found', price: 99, source: { transfers: 1 } }, () => Date.parse('2026-11-05T06:00:00Z'));
   assert.equal(found.status, 'found'); assert.deepEqual(found.replacement, identity); assert.equal(found.fare.price, 99);
 });
@@ -56,8 +58,10 @@ test('manual recovery shares the primary exact-pool and exact-date alternate bou
   assert.equal(roulette.outcome, 'replaced'); assert.equal(roulette.replacement.dest, 'D1');
   const candidates = [{ ...ticket, position: 1, price: 99, exact_observed_at: '2026-11-05T05:45:00Z', refresh_status: 'fresh', price_source: {} },
     { ...ticket, destination_id: 'rome', dest: 'FCO', position: 2, price: 88, exact_observed_at: '2026-11-05T05:45:00Z', refresh_status: 'fresh', price_source: {} }];
-  const carousel = carouselResult(ticket, { status: 'no_result' }, clock, candidates);
-  assert.equal(carousel.outcome, 'replaced'); assert.equal(carousel.replacement.destination_id, 'rome');
+  for (const outcome of [{ status: 'no_result' }, { status: 'technical', detail: 'provider_error' }, { status: 'timeout', detail: 'timeout' }]) {
+    const carousel = carouselResult(ticket, outcome, clock, candidates);
+    assert.equal(carousel.outcome, 'replaced'); assert.equal(carousel.replacement.destination_id, 'rome');
+  }
   const unavailableCarousel = carouselResult(ticket, { status: 'no_result' }, clock,
     candidates.map(row => row.dest === 'FCO' ? { ...row, refresh_status: 'unavailable' } : row));
   assert.equal(unavailableCarousel.outcome, 'retained', 'manual recovery shares persisted carousel availability');

@@ -446,10 +446,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if (selected?.active) {
         const candidateResult = fare
           ? { status: 'found', fare: { ...fare, price_source: preserveCarouselSixMonthMinimum(fare.price_source, ticket.price_source) } }
-          : outcome.status === 'no_result'
-            ? (() => { const replacement = carouselReplacement(selectCarouselAlternate(selected.candidates, ticket, clock()));
-              return replacement ? { status: 'confirmed_absent', outcome: 'replaced', replacement } : { status: 'confirmed_absent', outcome: 'retained' }; })()
-            : retainedResult(outcome);
+          : (() => { const replacement = carouselReplacement(selectCarouselAlternate(selected.candidates, ticket, clock()));
+            return replacement ? { status: 'confirmed_absent', outcome: 'replaced', replacement } : retainedResult(outcome); })();
         await commitSelectedCarousel(ticket, selected.generation, candidateResult, deadline);
       } else {
         const candidateResult=fare?{status:'found',price:fare.price,

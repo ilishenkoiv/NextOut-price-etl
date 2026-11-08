@@ -156,6 +156,16 @@ test('a saved wave is retained when the next runner has a different rollout sett
   const result=await f.adapters.main.step({job:{...job,checkpoint:{cursor:0,errors:0,wave:0}},deadline:200000});
   assert.equal(result.checkpoint.wave,0);
 });
+
+test('legacy window-candidate refresh keeps its technical result and never uses selected-carousel replacement',async()=>{
+  const ticket={origin:'FRA',dest:'MAD',destination_id:'madrid',snapshot_at:'2026-01-15T07:00:00Z',position:1,flight_type:'direct',
+    departure_at:'2027-01-10',return_at:'2027-01-17',nights:7,window_kind:'weekend'};
+  const f=fixture({tickets:[ticket]},()=>({kind:'timeout'}));
+  const result=await f.adapters.fast.step({job,deadline:200000});
+  assert.equal(f.calls[0].name,'collection_commit_window_candidate');
+  assert.deepEqual(f.calls[0].args.p_result,{status:'error',detail:'provider_error'});
+  assert.equal(result.checkpoint.errors,1);
+});
 test('malformed roulette data preserves the existing offer and defers the ticket to the next pass',async()=>{
   const ticket={origin:'FRA',dest:'MAD',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17'};
   const f=fixture({tickets:[ticket]},()=>({kind:'ok',json:{success:true,data:{}}}));

@@ -93,13 +93,10 @@ export function carouselResult(ticket, outcome, now = Date.now, candidates = [])
     // invent or substitute a destination.
     return { status: 'found', fare: fareFor(ticket, outcome, now), replacement: carouselTicket(ticket) };
   }
-  if (outcome.status === 'no_result') {
-    const replacement = carouselReplacement(selectCarouselAlternate(candidates, ticket, now()));
-    return replacement
-      ? { status: 'confirmed_absent', outcome: 'replaced', replacement }
-      : { status: 'confirmed_absent', outcome: 'retained' };
-  }
-  return retainedResult(outcome);
+  const replacement = carouselReplacement(selectCarouselAlternate(candidates, ticket, now()));
+  return replacement
+    ? { status: 'confirmed_absent', outcome: 'replaced', replacement }
+    : retainedResult(outcome);
 }
 
 function requestUrl(ticket) {

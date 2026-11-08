@@ -1,6 +1,7 @@
 // Pure selected-price refresh decisions shared by the primary coordinator and the retained
 // owner-manual recovery entry point. A replacement is permitted only from the immutable selected
-// set and only when its exact fare is currently confirmed; inconclusive checks retain the ticket.
+// set and only when its exact fare is currently confirmed; an inconclusive check retains the
+// ticket when no such alternate exists.
 export const SELECTED_PRICE_FRESH_MS = 30 * 60_000;
 export const SELECTED_PRICE_MAX_FUTURE_MS = 5 * 60_000;
 
