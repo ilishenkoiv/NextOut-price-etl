@@ -77,15 +77,11 @@ export function berlinObservedOn(value = Date.now()) {
   return new Date(timestamp).toLocaleDateString('en-CA',{timeZone:'Europe/Berlin'});
 }
 
-// Legacy threshold: 03:30 Berlin. Under the always-on 30-minute refresh this was already well
-// after a full night of fresh priority passes, so sources feeding the pool were reliably fresh.
-export const LEGACY_SELECTION_THRESHOLD_MINUTES = 3 * 60 + 30;
-// PILOT threshold: 06:00 Berlin (owner spec 2026-09-26). Selection never waits for source
-// freshness (see freshOriginFraction below — observability only) and the selected tickets are
-// point-refreshed via the provider immediately after selection, before publishing, so an earlier
-// trigger than the old 07:05 is safe: staleness is resolved by the point-refresh, not by timing
-// selection after a priority pass.
-export const PILOT_SELECTION_THRESHOLD_MINUTES = 6 * 60;
+// Both legacy and pilot daily formation use the same 06:30 Europe/Berlin wall-clock gate.
+// Selection never waits for source freshness (see freshOriginFraction below — observability only)
+// and the selected tickets are point-refreshed via the provider immediately before publishing.
+export const LEGACY_SELECTION_THRESHOLD_MINUTES = 6 * 60 + 30;
+export const PILOT_SELECTION_THRESHOLD_MINUTES = 6 * 60 + 30;
 
 export function nightlySelectionDue(value = Date.now(), thresholdMinutes = LEGACY_SELECTION_THRESHOLD_MINUTES) {
   const timestamp=typeof value==='number'?value:Date.parse(value);
@@ -182,9 +178,8 @@ export async function main({ db, snapshotAt: requestedSnapshotAt, expansionWave=
   expectedOrigins=publishedSnapshotOrigins(),requireCompleteRefresh=false } = {}) {
   if (!SUPABASE_SERVICE_KEY) throw new Error('Missing required secret: SUPABASE_SERVICE_KEY.');
   const instant=normalizeInstant(requestedSnapshotAt??clock());const observedOn = berlinObservedOn(instant);
-  // Pilot's own threshold is the only one consulted when pilotMarketSchedule is set — the legacy
-  // 03:30 default must never re-gate a pilot-mode caller (see run-collection.mjs, which already
-  // resolves the same threshold before calling here).
+  // The caller selects the mode-specific named constant; both currently share the common 06:30
+  // Berlin gate, and this function never falls back to an unrelated default for pilot callers.
   const selectionThresholdMinutes=pilotMarketSchedule?PILOT_SELECTION_THRESHOLD_MINUTES:LEGACY_SELECTION_THRESHOLD_MINUTES;
   if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{rebuilt:false,observedOn,snapshotAt:null,reason:'not_due'};
   const supabase = db ?? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } });

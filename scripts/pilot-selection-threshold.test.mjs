@@ -1,16 +1,11 @@
-// Regression tests for the 2026-09-26 owner spec:
-//  - Daily full selection threshold moves from 07:05 to 06:00 Berlin under
-//    PRIORITY_MARKET_SCHEDULE=pilot.
-//  - The pilot path is the ONLY threshold consulted when pilotMarketSchedule is set — the
-//    legacy 03:30 default must never re-gate a pilot-mode caller from inside main() itself
-//    (both snapshot-daily-origin-cheapest.mjs and snapshot-daily-window-candidates.mjs used to
-//    call nightlySelectionDue(instant) with no threshold argument, silently defaulting to legacy).
+// Regression tests for the common 06:30 Europe/Berlin daily formation gate.
+// Both named modes retain their own caller path, but must use the identical threshold.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 // The selection owner reads its service key at import time, so set it before importing.
 process.env.SUPABASE_SERVICE_KEY ??= 'test-service-key';
-const { main: publishDailyRoulette, PILOT_SELECTION_THRESHOLD_MINUTES } = await import('./snapshot-daily-origin-cheapest.mjs');
+const { main: publishDailyRoulette, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } = await import('./snapshot-daily-origin-cheapest.mjs');
 const { main: publishDailyWindows } = await import('./snapshot-daily-window-candidates.mjs');
 
 const settle = (result) => ({ then: (onFulfilled, onRejected) => Promise.resolve(result).then(onFulfilled, onRejected) });
@@ -27,37 +22,42 @@ function stubDb({ rows = freshOffers, publish = true } = {}) {
   return { from: () => chain, rpc: () => settle({ data: publish, error: null }) };
 }
 
-test('PILOT_SELECTION_THRESHOLD_MINUTES is 06:00 Berlin (360)', () => {
-  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 6 * 60);
+test('legacy and pilot formation thresholds are both 06:30 Berlin (390)', () => {
+  assert.equal(LEGACY_SELECTION_THRESHOLD_MINUTES, 6 * 60 + 30);
+  assert.equal(PILOT_SELECTION_THRESHOLD_MINUTES, 6 * 60 + 30);
 });
 
-test('roulette selection (snapshot-daily-origin-cheapest.mjs): pilot threshold alone gates it — 05:59 not due, 06:00 due, legacy 03:30 never re-gates', async () => {
+test('roulette selection: 06:29 Berlin is not due and 06:30 is due', async () => {
   const db = stubDb();
-  const notYet = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T04:59:00.000Z', pilotMarketSchedule: true }); // 05:59 Berlin (CET)
+  const notYet = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T05:29:00.000Z', pilotMarketSchedule: true }); // 06:29 Berlin (CET)
   assert.equal(notYet.rebuilt, false);
   assert.equal(notYet.reason, 'not_due');
-  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T05:00:00.000Z',pilotMarketSchedule:true,expectedOrigins:['BER'] }); // 06:00 Berlin
+  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T05:30:00.000Z',pilotMarketSchedule:true,expectedOrigins:['BER'] }); // 06:30 Berlin
   assert.equal(due.rebuilt, true);
 });
 
-test('window/carousel selection (snapshot-daily-window-candidates.mjs): same pilot-only gate at 06:00 Berlin', async () => {
-  const window = { origin: 'BER', dest: 'BCN', flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17',
+test('window/carousel selection: 06:29 Berlin is not due and 06:30 is due', async () => {
+  const window = { origin: 'BER', dest: 'BCN', flight_type: 'any', departure_at: '2026-01-30', return_at: '2026-02-01',
     price: 120, transfers: 1, airline: null, updated_at: '2026-01-15T05:00:00.000Z', price_source: null };
   const db = stubDb({ rows: [window] });
-  const notYet = await publishDailyWindows({ db, instant: Date.parse('2026-01-15T04:59:00.000Z'), pilotMarketSchedule: true });
+  const notYet = await publishDailyWindows({ db, instant: Date.parse('2026-01-15T05:29:00.000Z'), pilotMarketSchedule: true });
   assert.equal(notYet.published, false);
   assert.equal(notYet.reason, 'not_due');
+  const due = await publishDailyWindows({ db, instant: Date.parse('2026-01-15T05:30:00.000Z'), pilotMarketSchedule: true });
+  assert.equal(due.published, true);
 });
 
-test('without pilotMarketSchedule, both scripts keep the untouched legacy 03:30 default', async () => {
+test('without pilotMarketSchedule, the legacy named path uses the same 06:30 gate', async () => {
   const db = stubDb();
-  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T02:30:00.000Z',expectedOrigins:['BER'] }); // 03:30 Berlin, legacy-due
+  const due = await publishDailyRoulette({ db, snapshotAt:'2026-01-15T05:30:00.000Z',expectedOrigins:['BER'] }); // 06:30 Berlin
   assert.equal(due.rebuilt, true);
-  const notDue = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T02:29:00.000Z' }); // 03:29 Berlin, legacy not-yet-due
+  const notDue = await publishDailyRoulette({ db, snapshotAt: '2026-01-15T05:29:00.000Z' }); // 06:29 Berlin
   assert.equal(notDue.reason, 'not_due');
-  const window = { origin: 'BER', dest: 'BCN', flight_type: 'any', departure_at: '2027-01-10', return_at: '2027-01-17',
-    price: 120, transfers: 1, airline: null, updated_at: '2026-01-15T02:00:00.000Z', price_source: null };
+  const window = { origin: 'BER', dest: 'BCN', flight_type: 'any', departure_at: '2026-01-30', return_at: '2026-02-01',
+    price: 120, transfers: 1, airline: null, updated_at: '2026-01-15T05:00:00.000Z', price_source: null };
   const dbW = stubDb({ rows: [window] });
-  const notDueW = await publishDailyWindows({ db: dbW, instant: Date.parse('2026-01-15T01:29:00.000Z') }); // 02:29 Berlin
+  const notDueW = await publishDailyWindows({ db: dbW, instant: Date.parse('2026-01-15T05:29:00.000Z') }); // 06:29 Berlin
   assert.equal(notDueW.reason, 'not_due');
+  const dueW = await publishDailyWindows({ db: dbW, instant: Date.parse('2026-01-15T05:30:00.000Z') });
+  assert.equal(dueW.published, true);
 });

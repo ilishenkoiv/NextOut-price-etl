@@ -82,10 +82,10 @@ test('the provider and its point-refresh deadline are threaded into both publish
 });
 
 test('morning transition (pilot): selection never waits for source freshness — publishes and marks the day done on the very first due cycle',async()=>{
-  const instant=Date.parse('2026-09-24T05:05:00Z'); // 07:05 Berlin — pilot threshold just reached
+  const instant=Date.parse('2026-09-24T05:05:00Z'); // 07:05 Berlin — already past the common 06:30 threshold
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:123,checkpoint:{phase:'done'}}}};
   const store={lease:async()=>true,save:async()=>{}};
-  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60+30,
     publishRoulette:async()=>({rebuilt:true,freshFraction:0.4}),
     publishWindows:async()=>({published:true,freshFraction:0.4})});
   assert.equal(result.published,true);
@@ -111,7 +111,7 @@ test('exactly one selection per Berlin day: a second due cycle the same day neve
 });
 
 test('day boundary: yesterday\'s completed selection does not block today\'s — both roulette and carousel/window rebuild for the new Berlin day',async()=>{
-  const instant=Date.parse('2026-09-24T05:00:00Z'); // a new Berlin day, legacy threshold already past
+  const instant=Date.parse('2026-09-24T04:30:00Z'); // a new Berlin day, common 06:30 threshold
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}},
     dailySelection:{day:'2026-09-23',rouletteDone:true,windowDone:true,completedAt:1,startedAt:1}};
   const store={lease:async()=>true,save:async()=>{}};
@@ -130,7 +130,7 @@ test('order within one call: roulette publishes before window is even attempted 
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
   const store={lease:async()=>true,save:async()=>{}};
   const calls=[];
-  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:7*60+5,
+  const result=await runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60+30,
     publishRoulette:async()=>{calls.push('roulette');return{rebuilt:true,freshFraction:1,refresh:{attempted:10,refreshed:9,misses:1,errors:0,total:10}};},
     publishWindows:async()=>{calls.push('window');return{published:true,freshFraction:1,refresh:{attempted:5,refreshed:5,misses:0,errors:0,total:5}};}});
   assert.deepEqual(calls,['roulette','window'],'roulette (select+refresh+publish) completes fully before window starts');
@@ -147,7 +147,7 @@ test('same-day recovery after a window publication failure resumes only window a
   const state={version:1,jobs:{priority:{id:1,done:true,completedAt:1,checkpoint:{phase:'done'}}}};
   const saves=[];const store={lease:async()=>true,save:async value=>saves.push(structuredClone(value))};
   let rouletteCalls=0,windowCalls=0;
-  await assert.rejects(()=>runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
+  await assert.rejects(()=>runDueDailySelection({state,store,db:{},instant,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60+30,
     publishRoulette:async()=>{rouletteCalls++;return{rebuilt:true,rank1Rows:44,poolRows:220};},
     publishWindows:async()=>{windowCalls++;throw new Error('invalid daily window candidate row');}}),/invalid daily window candidate row/);
   assert.equal(rouletteCalls,1);assert.equal(windowCalls,1);
@@ -157,7 +157,7 @@ test('same-day recovery after a window publication failure resumes only window a
   assert.equal(dailySelectionRetryThrottled(state,instant+5*60_000),true,'same-day recovery obeys the 30-minute throttle');
 
   const retryAt=instant+31*60_000;
-  const recovered=await runDueDailySelection({state,store,db:{},instant:retryAt,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60,
+  const recovered=await runDueDailySelection({state,store,db:{},instant:retryAt,wave:43,pilotMarketSchedule:true,selectionThresholdMinutes:6*60+30,
     publishRoulette:async()=>{throw new Error('completed roulette must not run again');},
     publishWindows:async()=>{windowCalls++;return{published:true,candidateRows:873,freshFraction:0.8};}});
   if(state.dailySelection.lastError){delete state.dailySelection.lastError;await store.save(state);}
@@ -171,7 +171,7 @@ test('same-day recovery after a window publication failure resumes only window a
 });
 
 test('legacy (pilotMarketSchedule unset) behaves exactly as the pilot path — both always publish immediately, no freshness gate either way',async()=>{
-  const instant=Date.parse('2026-09-23T02:30:00Z'); // 03:30 Berlin, legacy threshold
+  const instant=Date.parse('2026-09-23T04:30:00Z'); // 06:30 Berlin, common threshold
   const state={version:1,jobs:{}};
   const store={lease:async()=>true,save:async()=>{}};
   const calls=[];
@@ -254,16 +254,16 @@ test('off-cycle MAIN advance always computes its stop time from offCycleMainBudg
   assert.match(source, /safetyMarginMs:OFF_CYCLE_SAFETY_MARGIN_MS/);
 });
 
-test('pilot mode shifts the daily-selection due threshold past the night gap, legacy default is unchanged', () => {
-  const winterNight = Date.parse('2026-01-15T02:30:00Z'); // 03:30 Europe/Berlin — legacy threshold, exactly at boundary
-  assert.equal(scheduledCollectionDue({ version: 1, jobs: {} }, winterNight), true); // no priority job yet → always due regardless
-  const state = { version: 1, jobs: { priority: { id: Math.floor(winterNight / CYCLE_MS), done: true } },
-    dailySelection: { day: '2026-01-14', rouletteDone: true, windowDone: true } }; // yesterday's selection, not yet re-run today
-  assert.equal(scheduledCollectionDue(state, winterNight), true, 'legacy: 03:30 Berlin is due');
-  assert.equal(scheduledCollectionDue(state, winterNight, 7 * 60 + 5), false, 'pilot: 03:30 Berlin is inside the night gap, not due yet');
-  const morning = Date.parse('2026-01-15T06:05:00Z'); // 07:05 Europe/Berlin
-  const morningState = { ...state, jobs: { priority: { id: Math.floor(morning / CYCLE_MS), done: true } } };
-  assert.equal(scheduledCollectionDue(morningState, morning, 7 * 60 + 5), true, 'pilot: due once local time reaches 07:05');
+test('coordinator uses the common 06:30 Berlin formation gate and retains its 30-minute cadence', () => {
+  const before = Date.parse('2026-01-15T05:29:00Z'); // 06:29 Europe/Berlin
+  const atGate = Date.parse('2026-01-15T05:30:00Z'); // 06:30 Europe/Berlin
+  const stateAt = (instant) => ({ version: 1, jobs: { priority: { id: Math.floor(instant / CYCLE_MS), done: true } },
+    dailySelection: { day: '2026-01-14', rouletteDone: true, windowDone: true } });
+  assert.equal(CYCLE_MS, 30 * 60_000);
+  assert.equal(scheduledCollectionDue(stateAt(before), before), false, 'default/legacy path: 06:29 is not due');
+  assert.equal(scheduledCollectionDue(stateAt(before), before, 6 * 60 + 30), false, 'pilot path: 06:29 is not due');
+  assert.equal(scheduledCollectionDue(stateAt(atGate), atGate), true, 'default/legacy path: 06:30 is due');
+  assert.equal(scheduledCollectionDue(stateAt(atGate), atGate, 6 * 60 + 30), true, 'pilot path: 06:30 is due');
 });
 
 test('off-cycle MAIN advance delegates its bounded, keep-ticking loop to the shared, unit-tested runBoundedMainAdvance (see collection-schedule.test.mjs for its busy-loop/idle-exit/deadline coverage)', () => {
@@ -312,7 +312,7 @@ test('dailySelectionRetryThrottled: no retry within 30 minutes of a same-day fai
 });
 
 test('a throttled selection alone does not make scheduledCollectionDue trigger a full session when priority is not due',()=>{
-  const instant=Date.parse('2026-09-25T02:30:00Z'); // 03:30 Berlin, legacy threshold just reached
+  const instant=Date.parse('2026-09-25T04:30:00Z'); // 06:30 Berlin, common threshold just reached
   const cycle=Math.floor(instant/CYCLE_MS);
   const state={version:1,jobs:{priority:{id:cycle,done:true}},
     dailySelection:{day:berlinObservedOn(instant),rouletteDone:false,windowDone:false,lastError:{message:'boom',at:instant-60000}}};
