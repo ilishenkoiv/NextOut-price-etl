@@ -739,7 +739,8 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // isDue lets the scheduling engine give this block precedence over MAIN/FAST/TAIL exactly like
   // priority does (see collection-schedule.mjs) — MAIN yields for the block's whole duration.
   const MAINTENANCE_JOBS = ['app_errors','flight_price_feedback','destination_requests',
-    'collect_storage_metrics','plan_bucket_expire','window_prices','price_storage','feedback_audit_drain'];
+    'collect_storage_metrics','plan_bucket_expire','window_prices','selected_carousel_revision_retention',
+    'price_storage','feedback_audit_drain'];
   async function recursiveSnapshotList(bucket,prefix,deadline){
     if(clock()+9000>=deadline)throw new CollectionYield('Snapshot listing would cross boundary');
     const rows=await query(()=>bucket.list(prefix,{limit:1000,sortBy:{column:'name',order:'asc'}}),deadline,{retry:true,op:'price_storage_snapshot_list'});
@@ -814,6 +815,11 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           if(rows){const watermark=found.at(-1).departure_at;
             await query(()=>db.from('window_prices').delete().lt('departure_at',today).lte('departure_at',watermark),deadline,{retry:true,op:'window_prices_expired_delete'});
             done=rows<500;}
+        }else if(name==='selected_carousel_revision_retention'){
+          // The RPC owns the bounded writer pause, completeness proof, and exact admission
+          // restoration transactionally. The maintenance adapter only records its parent count.
+          rows=await query(()=>db.rpc('collection_prune_selected_carousel_revisions'),deadline,
+            {op:'selected_carousel_revision_retention'});
         }else if(name==='price_storage'){
           // Ported from cleanup-price-storage.mjs (quarterly; gated above to only the standalone
           // workflow's own due day — 1st of Jan/Apr/Jul/Oct, Berlin).

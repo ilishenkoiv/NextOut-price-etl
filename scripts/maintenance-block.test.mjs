@@ -52,7 +52,8 @@ function makeAdapters(script,{onCall=()=>{}}={}) {
 const EMPTY_NIGHT_SCRIPT = {
   from: { 'app_errors:select': [EMPTY], 'flight_price_feedback:select': [EMPTY], 'destination_requests:select': [EMPTY],
     'window_prices:select': [EMPTY] },
-  rpc: { collect_storage_metrics: [OK], claim_flight_price_audit: [{ data: [], error: null }] },
+  rpc: { collect_storage_metrics: [OK], collection_prune_selected_carousel_revisions: [{ data: 0, error: null }],
+    claim_flight_price_audit: [{ data: [], error: null }] },
   storage: { list: [{ data: [], error: null }] },
 };
 
@@ -78,13 +79,30 @@ test('a due, all-empty night runs every job (2026-01-15, non-quarterly) and sett
   assert.equal(result.status, 'done');
   const jobNames = cp.summary.map((j) => j.name);
   assert.deepEqual(jobNames, ['app_errors', 'flight_price_feedback', 'destination_requests',
-    'collect_storage_metrics', 'plan_bucket_expire', 'window_prices', 'feedback_audit_drain']);
+    'collect_storage_metrics', 'plan_bucket_expire', 'window_prices', 'selected_carousel_revision_retention',
+    'feedback_audit_drain']);
   assert.equal(jobNames.includes('price_storage'), false, 'non-quarterly day: price_storage silently skipped');
   const summaryLines = lines.filter((l) => l.includes('"event":"maintenance_block"'));
   assert.equal(summaryLines.length, 1);
   const parsed = JSON.parse(summaryLines[0]);
   assert.equal(parsed.done, true);
-  assert.equal(parsed.jobs.length, 7);
+  assert.equal(parsed.jobs.length, 8);
+});
+
+test('nightly maintenance records only the retention RPC parent count', async () => {
+  const script = { ...EMPTY_NIGHT_SCRIPT,
+    rpc: { ...EMPTY_NIGHT_SCRIPT.rpc, collection_prune_selected_carousel_revisions: [{ data: 2, error: null }] } };
+  const { adapters, log } = makeAdapters(script);
+  let cp = null; let result;
+  for (let i = 0; i < 20; i++) {
+    result = await adapters.maintenance.step({ job: { id: 1, checkpoint: cp, activeMs: 0 }, deadline: Infinity });
+    cp = result.checkpoint;
+    if (result.status === 'done') break;
+  }
+  assert.equal(log.filter((entry) => entry === 'rpc:collection_prune_selected_carousel_revisions').length, 1);
+  assert.deepEqual(cp.summary.find((entry) => entry.name === 'selected_carousel_revision_retention'), {
+    name: 'selected_carousel_revision_retention', rows: 2, ms: 0,
+  });
 });
 
 test('resume across calls, same night: an unfinished job (rows found) is retried, not marked checked, until it drains', async () => {
@@ -146,7 +164,7 @@ test('price_storage runs (and only runs) on the first day of a quarter', async (
 });
 
 test('maintenance total_ms includes the final feedback-audit unit before the scheduler persists activeMs',async()=>{
-  const checked=Object.fromEntries(['app_errors','flight_price_feedback','destination_requests','collect_storage_metrics','plan_bucket_expire','window_prices','price_storage']
+  const checked=Object.fromEntries(['app_errors','flight_price_feedback','destination_requests','collect_storage_metrics','plan_bucket_expire','window_prices','selected_carousel_revision_retention','price_storage']
     .map(name=>[name,'2026-01-15']));
   const checkpoint={day:'2026-01-15',checked,attempted:{collect_storage_metrics:'2026-01-15'},failed:{},summary:[],blockDone:false};
   const lines=[];const originalLog=console.log;console.log=line=>lines.push(line);
