@@ -12,6 +12,7 @@ import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedb
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
 import { ORIGINS_ALL } from '../src/data/origins.js';
+import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { originDueThisCycle, selectedPriceRefreshDue } from './priority-market-schedule.mjs';
 import { maintenanceDue, maintenanceMustStop, isQuarterlyMaintenanceDay } from './maintenance-window.mjs';
 import { retentionCutoff, shouldDeleteSnapshot, positiveDays, SNAPSHOT_RETENTION_DAYS, PROGRESS_RETENTION_DAYS } from './price-storage-retention.mjs';
@@ -20,7 +21,7 @@ import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
 import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
 import { normalizeOutstanding, retainMainCell, mainCellKey, retainUnidentifiedHistory } from './main-outstanding.mjs';
-import { selectedRefreshAdmission, replacementDecision, rouletteRevisionDecision, carouselAlternate, isFreshConfirmed } from './selected-price-refresh-contract.mjs';
+import { selectedRefreshAdmission, replacementDecision, rouletteRevisionDecision, carouselAlternate } from './selected-price-refresh-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -390,16 +391,25 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       return true;
     }
     const now=clock();
-    const alternatives=await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
+    const offers=await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
       ['price','dest'],q=>q.eq('origin',ticket.origin).eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at),deadline);
-    const current=alternatives.find(row=>row.dest===ticket.dest&&isFreshConfirmed(row,now));
-    const alternate=carouselAlternate(alternatives,ticket,now);
-    // All non-found outcomes, including technical/unconfirmed ones, create one fenced
-    // revision. A still-fresh selected city wins; otherwise the exact-date fallback is
-    // chosen by carouselAlternate without inventing a price or changing date identity.
-    const decision=current
-      ?replacementDecision('carousel','fresh')
-      :replacementDecision('carousel',outcome.status,alternate);
+    const revisions=await query(()=>db.from('daily_origin_window_candidate_revisions').select('snapshot_at')
+      .eq('observed_on',ticket.observed_on).eq('origin',ticket.origin).order('revision',{ascending:false}).limit(1),deadline,
+      {retry:true,op:'daily_origin_window_candidate_revisions_latest'});
+    recordRead('daily_origin_window_candidate_revisions',revisions);
+    const revisionRows=revisions?.[0]
+      ?await load('daily_origin_window_candidate_revision_candidates','origin,dest,destination_id,flight_type,departure_at,return_at,exact_price,transfers,airline,exact_observed_at,price_source',
+        ['dest'],q=>q.eq('snapshot_at',revisions[0].snapshot_at).eq('origin',ticket.origin).eq('flight_type',ticket.flight_type)
+          .eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at),deadline)
+      :[];
+    const alternates=[...offers,...revisionRows.map(row=>({...row,price:row.exact_price,updated_at:row.exact_observed_at}))];
+    const alternate=carouselAlternate(alternates,ticket,now);
+    // A current exact check which did not find a fare is never itself fresh confirmation.
+    // It may only replace the card with a separately fresh, exact-date Carousel city; an
+    // older row is not an alternate and leaves the published no-empty-slide fallback intact.
+    const replacement=alternate&&destinationIdForIata(alternate.dest)
+      ?{...alternate,destination_id:destinationIdForIata(alternate.dest)}:null;
+    const decision=replacementDecision('carousel',outcome.status==='no_result'?'confirmed_absent':outcome.status,replacement);
     await commit('collection_commit_selected_carousel',{p_ticket:ticket,p_generation:generation,
       p_result:{status:outcome.status==='no_result'?'confirmed_absent':outcome.status,outcome:decision.outcome,replacement:decision.replacement}},deadline);
     return true;

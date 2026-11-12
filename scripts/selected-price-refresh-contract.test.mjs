@@ -16,10 +16,12 @@ test('eligible Berlin half-hour cadence is bounded and DST-safe through Intl',()
 test('fresh/equal price holds while an unconfirmed carousel outcome applies its factual fallback',()=>{
   assert.equal(isFreshConfirmed(fresh,now),true);
   assert.deepEqual(replacementDecision('roulette','fresh',fresh),{outcome:'retain_fresh',replacement:null});
+
+
   assert.deepEqual(replacementDecision('carousel','timeout',fresh),{outcome:'replaced',replacement:fresh});
 });
 
-test('carousel fallback prioritizes a <=30m exact-date city, then the freshest factual exact-date city',()=>{
+test('carousel replacement accepts only a fresh exact-date city; an older row remains the fallback',()=>{
   const rows=[
     {...fresh,dest:'LIS',price:88,departure_at:'2027-03-01',return_at:'2027-03-06'},
     {...fresh,dest:'BCN',price:60,updated_at:new Date(now-31*60_000).toISOString()},
@@ -27,7 +29,7 @@ test('carousel fallback prioritizes a <=30m exact-date city, then the freshest f
   ];
   assert.equal(rouletteAlternate(rows,{...fresh,dest:'FCO'},now,new Set(['FCO'])).dest,'LIS');
   assert.equal(carouselAlternate(rows,{...fresh,dest:'FCO'},now).dest,'MAD');
-  assert.equal(carouselAlternate(rows.filter(row=>row.dest!=='MAD'),{...fresh,dest:'FCO'},now).dest,'BCN');
+  assert.equal(carouselAlternate(rows.filter(row=>row.dest!=='MAD'),{...fresh,dest:'FCO'},now),null);
   assert.deepEqual(replacementDecision('carousel','confirmed_absent',fresh),{outcome:'replaced',replacement:fresh});
 });
 

@@ -44,13 +44,9 @@ export function rouletteAlternate(rows, ticket, now, occupiedDestinations = new 
 export function carouselAlternate(rows, ticket, now) {
   const matching = rows.filter(row => row.origin === ticket.origin && row.flight_type === ticket.flight_type
       && row.dest !== ticket.dest && row.departure_at === ticket.departure_at && row.return_at === ticket.return_at
-      && Number.isFinite(Number(row.price)) && Number(row.price) > 0
-      && Number.isFinite(Date.parse(row.updated_at)));
-  // Prefer an exact-date city confirmed during this 30-minute cycle.  If none exists,
-  // retain the freshest factual exact-date city; its timestamp is carried to the revision
-  // and is never manufactured as a new fare observation.
-  return matching.sort((a,b) => Number(isFreshConfirmed(b, now)) - Number(isFreshConfirmed(a, now))
-    || Date.parse(b.updated_at) - Date.parse(a.updated_at)
+      && isFreshConfirmed(row,now));
+  // An old factual row is the documented no-empty-slide fallback, never a replacement.
+  return matching.sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)
     || Number(a.price) - Number(b.price)
     || String(a.dest).localeCompare(String(b.dest)))[0] ?? null;
 }
