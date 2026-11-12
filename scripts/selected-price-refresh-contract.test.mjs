@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { carouselReplacement, isBerlinSelectedRefreshDaytime, isCurrentConfirmedFare, remainingExactPool10, rouletteReplacement,
+import { carouselAlternate, carouselReplacement, isBerlinSelectedRefreshDaytime, isCurrentConfirmedFare, remainingExactPool10, rouletteReplacement,
   selectCarouselAlternate, selectRouletteAlternate, selectedRefreshAdmission, withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 const now = Date.parse('2026-11-06T12:00:00Z');
@@ -42,6 +42,16 @@ test('carousel alternate preserves exact dates and requires a different current 
   assert.equal(selectCarouselAlternate(candidates.map(row => row.dest === 'FCO' ? { ...row, exact_observed_at: '2026-11-06T11:29:59Z' } : row), ticket, now), null);
   assert.equal(selectCarouselAlternate(candidates.map(row => row.dest === 'FCO' ? { ...row, refresh_status: 'unavailable' } : row), ticket, now), null,
     'confirmed-unavailable city is never a carousel alternate');
+});
+
+test('normalized offers and revision candidates admit only a fresh positive exact-date alternate', () => {
+  const candidates = [
+    { ...ticket, ...fresh, destination_id:'rome', dest:'FCO', price:88, updated_at:'2026-11-06T11:40:00Z' },
+    { ...ticket, ...fresh, destination_id:'lisbon', dest:'LIS', price:1, origin:'MUC', updated_at:'2026-11-06T11:50:00Z' },
+    { ...ticket, ...fresh, destination_id:'copenhagen', dest:'CPH', price:2, departure_at:'2026-12-11', updated_at:'2026-11-06T11:50:00Z' },
+  ];
+  assert.equal(carouselAlternate(candidates,ticket,now).dest,'FCO');
+  assert.equal(carouselAlternate(candidates.map(row=>row.dest==='FCO'?{...row,updated_at:'2026-11-06T11:29:59Z'}:row),ticket,now),null);
 });
 
 test('current confirmation rejects invalid, stale, future, and direct-with-transfer rows', () => {

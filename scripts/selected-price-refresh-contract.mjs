@@ -84,6 +84,19 @@ export function selectCarouselAlternate(candidates, ticket, now = Date.now) {
     .sort((a, b) => Number(a.position) - Number(b.position) || String(a.destination_id).localeCompare(String(b.destination_id)))[0] ?? null;
 }
 
+// A selected-carousel recheck may use a separately confirmed exact-date offer or the latest
+// revision candidate. The caller normalizes both sources to this shape; stale data remains the
+// no-empty-slide fallback and cannot become a replacement.
+export function carouselAlternate(candidates, ticket, now = Date.now) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .filter(row => row?.origin === ticket?.origin && row?.flight_type === ticket?.flight_type
+      && date(row?.departure_at) === date(ticket?.departure_at) && date(row?.return_at) === date(ticket?.return_at)
+      && row?.dest !== ticket?.dest && row?.destination_id !== ticket?.destination_id
+      && isCurrentConfirmedFare(row, now, row?.updated_at))
+    .sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)
+      || Number(a.price) - Number(b.price) || String(a.dest).localeCompare(String(b.dest)))[0] ?? null;
+}
+
 function fareFrom(row, timestamp) {
   return {
     price: Number(row.price),

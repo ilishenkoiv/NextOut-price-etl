@@ -14,6 +14,7 @@ import { logDbError, dbErrorCode } from './db-error.mjs';
 import { classifyResponse, ticketFromFeedback } from './check-flight-price-feedback.mjs';
 import { calendarMonthsAgoIso } from './destination-request-retention.mjs';
 import { expansionTargets } from '../src/data/expansion-targets.js';
+import { destinationIdForIata } from '../src/data/destination-identities.js';
 import { originDueThisCycle } from './priority-market-schedule.mjs';
 import { maintenanceDue, maintenanceMustStop, isQuarterlyMaintenanceDay } from './maintenance-window.mjs';
 import { retentionCutoff, shouldDeleteSnapshot, positiveDays, SNAPSHOT_RETENTION_DAYS, PROGRESS_RETENTION_DAYS } from './price-storage-retention.mjs';
@@ -21,8 +22,8 @@ import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { recordRead } from './collection-egress.mjs';
 import { preserveCarouselSixMonthMinimum } from './carousel-six-month-contract.mjs';
-import { carouselReplacement, isBerlinSelectedRefreshDaytime, retainedResult, rouletteReplacement,
-  selectCarouselAlternate, selectRouletteAlternate, selectedRefreshAdmission, withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
+import { carouselAlternate, carouselReplacement, isBerlinSelectedRefreshDaytime, retainedResult, rouletteReplacement,
+  selectRouletteAlternate, selectedRefreshAdmission, withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
@@ -224,6 +225,29 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
     }
     if (response.data !== true) throw new Error('Selected carousel write was not acknowledged');
     if (!await store.lease()) throw new Error('Selected carousel write forbidden: lease lost after commit');
+  }
+
+  async function freshCarouselAlternate(ticket, deadline) {
+    const offers=await load('offers','origin,market,dest,month,flight_type,departure_at,return_at,nights,price,transfers,airline,updated_at,price_source',
+      ['price','dest'],q=>q.eq('origin',ticket.origin).eq('flight_type',ticket.flight_type).eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at),deadline);
+    const revisions=await query(()=>db.from('daily_origin_window_candidate_revisions').select('snapshot_at')
+      .eq('observed_on',ticket.observed_on).eq('origin',ticket.origin).order('revision',{ascending:false}).limit(1),deadline,
+      {retry:true,op:'daily_origin_window_candidate_revisions_latest'});
+    recordRead('daily_origin_window_candidate_revisions',revisions);
+    const revisionRows=revisions?.[0]
+      ?await load('daily_origin_window_candidate_revision_candidates','origin,dest,destination_id,flight_type,departure_at,return_at,exact_price,transfers,airline,exact_observed_at,refresh_status,price_source',
+        ['dest'],q=>q.eq('snapshot_at',revisions[0].snapshot_at).eq('origin',ticket.origin).eq('flight_type',ticket.flight_type)
+          .eq('departure_at',ticket.departure_at).eq('return_at',ticket.return_at),deadline)
+      :[];
+    const normalize=(row,price,updatedAt)=>{
+      const destinationId=row.destination_id??destinationIdForIata(row.dest);
+      return destinationId?{...row,observed_on:ticket.observed_on,snapshot_at:ticket.snapshot_at,origin:ticket.origin,
+        destination_id:destinationId,flight_type:ticket.flight_type,departure_at:ticket.departure_at,return_at:ticket.return_at,
+        price,updated_at:updatedAt,exact_observed_at:updatedAt}:null;
+    };
+    const candidates=[...offers.map(row=>normalize(row,row.price,row.updated_at)),
+      ...revisionRows.filter(row=>row.refresh_status==='fresh').map(row=>normalize(row,row.exact_price,row.exact_observed_at))].filter(Boolean);
+    return carouselAlternate(candidates,ticket,clock());
   }
 
   // Claims and completes ONE flight_price_audits row, or returns claimed:false when the queue is
@@ -446,8 +470,12 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
       if (selected?.active) {
         const candidateResult = fare
           ? { status: 'found', fare: { ...fare, price_source: preserveCarouselSixMonthMinimum(fare.price_source, ticket.price_source) } }
-          : (() => { const replacement = carouselReplacement(selectCarouselAlternate(selected.candidates, ticket, clock()));
+          : (() => { const replacement = null;
             return replacement ? { status: 'confirmed_absent', outcome: 'replaced', replacement } : retainedResult(outcome); })();
+        if(!fare){const replacement=carouselReplacement(await freshCarouselAlternate(ticket,deadline));
+          candidateResult.status=replacement?'confirmed_absent':candidateResult.status;
+          candidateResult.outcome=replacement?'replaced':candidateResult.outcome;
+          candidateResult.replacement=replacement??candidateResult.replacement;}
         await commitSelectedCarousel(ticket, selected.generation, candidateResult, deadline);
       } else {
         const candidateResult=fare?{status:'found',price:fare.price,
