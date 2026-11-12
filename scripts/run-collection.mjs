@@ -12,6 +12,7 @@ import { expansionTargets } from '../src/data/expansion-targets.js';
 import { main as publishDailyRoulette, berlinObservedOn, nightlySelectionDue, LEGACY_SELECTION_THRESHOLD_MINUTES, PILOT_SELECTION_THRESHOLD_MINUTES } from './snapshot-daily-origin-cheapest.mjs';
 import { main as publishDailyWindows } from './snapshot-daily-window-candidates.mjs';
 import { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
+import { refreshSelectedRoulette } from './selected-refresh-recovery.mjs';
 
 export { DAILY_SELECTION_REFRESH_MAX_MS, DAILY_SELECTION_REFRESH_RESERVE_MS } from './daily-selection-budget.mjs';
 
@@ -233,6 +234,11 @@ export async function main(env=process.env){
         console.error(JSON.stringify({event:'daily_selection_failed',source:triggerSource,day:berlinObservedOn(Date.now()),error:error.message}));
       }
     }
+    const selectedRouletteRefresh = await refreshSelectedRoulette({
+      db, store, provider, deadline: Math.min(Date.now() + DAILY_SELECTION_REFRESH_MAX_MS, sessionEnd - DAILY_SELECTION_REFRESH_RESERVE_MS),
+      staleOnly: true, regular: true,
+    });
+    console.log(JSON.stringify({ event: 'selected_roulette_refresh', ...selectedRouletteRefresh }));
     const end=sessionEnd;
     const guaranteeDailyMain=env.GUARANTEE_DAILY_MAIN!=='false';
     engine=new SequentialSchedule({state,lease:()=>store.lease(),save:s=>store.save(s),stopAt:end,guaranteeDailyMain,

@@ -220,6 +220,15 @@ test('pilot state is published under the same claimed lease for both the regular
     'the provider is built before daily selection so its point-refresh pass can use it');
 });
 
+test('a regular normal run invokes the shared stale-only selected Roulette refresher, while off-cycle and owner-manual paths remain separate', () => {
+  assert.match(source, /import\s*\{\s*refreshSelectedRoulette\s*\}\s*from\s*'\.\/selected-refresh-recovery\.mjs'/);
+  const offCycleBlock = source.slice(source.indexOf('OFF_CYCLE_MAIN_MINUTES'), source.indexOf('await runDueDailySelection'));
+  assert.doesNotMatch(offCycleBlock, /refreshSelectedRoulette/, 'the non-due/off-cycle path does not change collection cadence');
+  const regularBlock = source.slice(source.indexOf('const sessionEnd='), source.indexOf('const end=sessionEnd;'));
+  assert.match(regularBlock, /await refreshSelectedRoulette\(\{\s*\n\s*db, store, provider, deadline: Math\.min\(Date\.now\(\) \+ DAILY_SELECTION_REFRESH_MAX_MS, sessionEnd - DAILY_SELECTION_REFRESH_RESERVE_MS\),\s*\n\s*staleOnly: true, regular: true,/);
+  assert.doesNotMatch(regularBlock, /runSelectedRefresh|owner-manual|SELECTED_REFRESH_CANDIDATE/);
+});
+
 test('off-cycle MAIN advance defaults to exactly legacy behavior (OFF_CYCLE_MAIN_MINUTES unset/0 → immediate not_due, no engine)', () => {
   assert.match(source, /const offCycleMinutes=Number\(env\.OFF_CYCLE_MAIN_MINUTES\?\?0\)/);
   assert.match(source, /const stopAt=offCycleMinutes>0\s*\n\s*\?offCycleMainBudget/);

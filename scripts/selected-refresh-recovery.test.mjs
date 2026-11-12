@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptedCarouselRun, assertManualSelectedRequest, assertSelectedControl, berlinDay, carouselResult, carouselTicket, rouletteResult, rouletteTicket } from './selected-refresh-recovery.mjs';
+import { acceptedCarouselRun, assertManualSelectedRequest, assertSelectedControl, berlinDay, carouselResult, carouselTicket,
+  refreshSelectedRoulette, rouletteResult, rouletteTicket } from './selected-refresh-recovery.mjs';
 import { withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 const ticket = { observed_on: '2026-11-05', snapshot_at: '2026-11-05T05:00:00Z', origin: 'BER', dest: 'BCN', destination_id: 'barcelona',
@@ -10,6 +11,60 @@ test('only the explicit fixed-duration owner-manual request is admitted before a
   assert.throws(() => assertManualSelectedRequest({}), /owner-manual only/);
   assert.throws(() => assertManualSelectedRequest({ SELECTED_REFRESH_CANDIDATE: 'owner-manual', COLLECTION_SESSION_MINUTES: '15' }), /fixed 25-minute/);
   assert.doesNotThrow(() => assertManualSelectedRequest({ SELECTED_REFRESH_CANDIDATE: 'owner-manual', COLLECTION_SESSION_MINUTES: '25' }));
+});
+
+test('normal selected Roulette refresh invokes the shared path only for an enabled stale ticket', async () => {
+  const instant = Date.parse('2026-11-05T12:00:00Z');
+  const stale = { ...ticket, flight_type: 'direct', transfers: 0, price: 84, source_updated_at: '2026-11-05T11:29:59Z' };
+  const calls = []; let refreshed = 0;
+  const result = await refreshSelectedRoulette({
+    db: { rpc: async (name, args) => { calls.push({ name, args }); return { data: true, error: null }; } },
+    store: { args: () => ({ p_owner: 'owner', p_token: 9 }), lease: async () => true }, provider: null,
+    deadline: instant + 60_000, now: () => instant,
+    control: { enabled: true, generation: 7, main12h_rollback: false },
+    readTickets: async () => [stale], regular: true, staleOnly: true,
+    refresh: async () => { refreshed++; return { status: 'found', price: 91, source: { transfers: 0 } }; },
+  });
+  assert.deepEqual(result, { active: true, generation: 7, attempted: 1, stale: 1 });
+  assert.equal(refreshed, 1); assert.equal(calls.length, 1); assert.equal(calls[0].name, 'collection_commit_selected_roulette');
+  assert.equal(calls[0].args.p_generation, 7, 'the RPC receives the admitted control generation');
+  assert.equal(calls[0].args.p_result.status, 'found');
+});
+
+test('normal selected Roulette refresh is a disabled or rollback no-op before ticket reads', async () => {
+  const instant = Date.parse('2026-11-05T12:00:00Z');
+  for (const control of [{ enabled: false, generation: 7, main12h_rollback: false }, { enabled: true, generation: 7, main12h_rollback: true }]) {
+    let reads = 0;
+    const result = await refreshSelectedRoulette({ db: {}, store: {}, deadline: instant + 60_000, now: () => instant,
+      control, regular: true, staleOnly: true, readTickets: async () => { reads++; return []; } });
+    assert.deepEqual(result, { active: false, generation: null, attempted: 0, stale: 0 });
+    assert.equal(reads, 0);
+  }
+});
+
+test('normal selected Roulette refresh leaves fresh selected fares untouched', async () => {
+  const instant = Date.parse('2026-11-05T12:00:00Z');
+  const fresh = { ...ticket, flight_type: 'direct', transfers: 0, price: 84, source_updated_at: '2026-11-05T11:45:00Z' };
+  let refreshed = 0;
+  const result = await refreshSelectedRoulette({ db: {}, store: {}, deadline: instant + 60_000, now: () => instant,
+    control: { enabled: true, generation: 1, main12h_rollback: false }, regular: true, staleOnly: true,
+    readTickets: async () => [fresh], refresh: async () => { refreshed++; throw new Error('fresh ticket must not refresh'); } });
+  assert.deepEqual(result, { active: true, generation: 1, attempted: 0, stale: 0 });
+  assert.equal(refreshed, 0);
+});
+
+test('normal selected Roulette refresh fences a lost lease before provider work and preserves the admitted generation', async () => {
+  const instant = Date.parse('2026-11-05T12:00:00Z');
+  const stale = { ...ticket, flight_type: 'direct', transfers: 0, price: 84, source_updated_at: '2026-11-05T11:29:59Z' };
+  let refreshed = 0; let rpc = 0;
+  await assert.rejects(() => refreshSelectedRoulette({
+    db: { rpc: async () => { rpc++; return { data: true, error: null }; } },
+    store: { args: () => ({ p_owner: 'owner', p_token: 9 }), lease: async () => false }, provider: null,
+    deadline: instant + 60_000, now: () => instant,
+    control: { enabled: true, generation: 11, main12h_rollback: false }, regular: true, staleOnly: true,
+    readTickets: async () => [stale], refresh: async () => { refreshed++; return { status: 'found', price: 91, source: { transfers: 0 } }; },
+  }), /collection lease lost/);
+  assert.equal(refreshed, 0); assert.equal(rpc, 0);
 });
 
 test('target control admits only enabled non-rollback integer generations', () => {
@@ -94,6 +149,14 @@ test('carousel reader uses the per-origin run triple and not the legacy global e
 test('manual selected runner contains no coordinator, MAIN, or daily-selection entry point', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./selected-refresh-recovery.mjs', import.meta.url), 'utf8'));
   assert.doesNotMatch(source, /runDueDailySelection|createAdapters|\.main\.step|snapshot-daily-/);
+});
+
+test('the explicit owner-manual wrapper remains separately admitted and retains its non-stale-only roulette sweep', async () => {
+  const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./selected-refresh-recovery.mjs', import.meta.url), 'utf8'));
+  const runner = source.match(/export async function runSelectedRefresh[\s\S]*?\n}\n\nif \(process\.argv/)[0];
+  assert.match(runner, /assertManualSelectedRequest\(env\);/);
+  assert.ok(runner.indexOf('assertManualSelectedRequest(env);') < runner.indexOf('new CollectionProvider'), 'manual admission remains before provider construction');
+  assert.match(runner, /staleOnly: false/);
 });
 
 test('recovery migration keeps retained carousel absence as a no-op and decomposes a verified alternate into exact base facts', async () => {

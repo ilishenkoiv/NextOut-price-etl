@@ -11,6 +11,7 @@ import { marketForOrigin } from '../src/data/origin-markets.js';
 import { withPriceProvenance } from './price-provenance.mjs';
 import { noOtherActiveRuns } from './run-collection.mjs';
 import { carouselReplacement, retainedResult, rouletteReplacement, selectCarouselAlternate, selectRouletteAlternate,
+  isBerlinSelectedRefreshDaytime, isCurrentConfirmedFare, selectedRefreshAdmission,
   withCurrentRouletteRevisionState } from './selected-price-refresh-contract.mjs';
 
 export const SELECTED_REFRESH_CANDIDATE = 'owner-manual';
@@ -185,6 +186,32 @@ async function commit(db, store, name, args) {
   if (data !== true) throw new Error(`Selected refresh RPC rejected: ${name}`);
 }
 
+// The normal coordinator reuses this exact Roulette path after it has claimed the scheduler
+// lease.  Regular passes are deliberately stale-only and daytime-only; the retained
+// owner-manual wrapper passes `staleOnly: false` and keeps its explicit admission separately.
+export async function refreshSelectedRoulette({ db, store, provider, deadline, now = Date.now,
+  control: suppliedControl, readControl = selectedControl, readTickets = latestRoulette,
+  refresh = refreshOutcome, staleOnly = false, regular = false } = {}) {
+  const empty = { active: false, generation: null, attempted: 0, stale: 0 };
+  if (regular && !isBerlinSelectedRefreshDaytime(now())) return empty;
+  const admission = selectedRefreshAdmission(suppliedControl ?? await readControl(db));
+  if (!admission.active) return empty;
+  const tickets = await readTickets(db, admission.generation);
+  const targets = (tickets ?? []).filter(ticket => !staleOnly || !isCurrentConfirmedFare(ticket, now(), ticket.source_updated_at));
+  const summary = { active: true, generation: admission.generation, attempted: 0, stale: targets.length };
+  for (const ticket of targets) {
+    if (now() + 9000 >= deadline) break;
+    if (!await store.lease()) throw new Error('Selected refresh forbidden: collection lease lost');
+    const identity = rouletteTicket(ticket), outcome = await refresh(ticket, provider, deadline, now);
+    await commit(db, store, ROULETTE_RPC, {
+      ...store.args(), p_generation: admission.generation, p_ticket: identity,
+      p_result: rouletteResult(ticket, outcome, now, tickets),
+    });
+    summary.attempted++;
+  }
+  return summary;
+}
+
 export async function runSelectedRefresh({ env = process.env, db: injectedDb, provider: injectedProvider, store: injectedStore,
   now = Date.now, noOtherRuns = noOtherActiveRuns, oldStopped = oldRunnerHasStopped } = {}) {
   // This is intentionally first: an unsupported dispatch cannot construct a provider, claim a
@@ -194,7 +221,8 @@ export async function runSelectedRefresh({ env = process.env, db: injectedDb, pr
   if (!await noOtherRuns(env)) throw new Error('Selected refresh refused: another workflow is active or unknown');
   const db = injectedDb ?? createClient(env.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co', env.SUPABASE_SERVICE_KEY,
     { auth: { persistSession: false, autoRefreshToken: false } });
-  const generation = assertSelectedControl(await selectedControl(db));
+  const control = await selectedControl(db);
+  const generation = assertSelectedControl(control);
   const store = injectedStore ?? new CollectionStore(db, randomUUID(), env.GITHUB_RUN_ID);
   const previous = await store.inspect();
   if (!await oldStopped(previous, { repository: env.GITHUB_REPOSITORY, token: env.GITHUB_TOKEN, now })) {
@@ -205,13 +233,8 @@ export async function runSelectedRefresh({ env = process.env, db: injectedDb, pr
   const provider = injectedProvider ?? new CollectionProvider({ token: env.TP_TOKEN, lease: () => store.lease() });
   const summary = { roulette: { attempted: 0 }, carousel: { attempted: 0 }, generation };
   try {
-    const rouletteTickets = await latestRoulette(db, generation);
-    for (const ticket of rouletteTickets) {
-      if (now() + 9000 >= deadline) break;
-      const identity = rouletteTicket(ticket), outcome = await refreshOutcome(ticket, provider, deadline, now);
-      await commit(db, store, ROULETTE_RPC, { ...store.args(), p_generation: generation, p_ticket: identity, p_result: rouletteResult(ticket, outcome, now, rouletteTickets) });
-      summary.roulette.attempted++;
-    }
+    const roulette = await refreshSelectedRoulette({ db, store, provider, deadline, now, control, staleOnly: false });
+    summary.roulette.attempted = roulette.attempted;
     const carouselTickets = await latestCarousel(db, now);
     for (const ticket of carouselTickets) {
       if (now() + 9000 >= deadline) break;
