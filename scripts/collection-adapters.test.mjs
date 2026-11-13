@@ -331,6 +331,40 @@ test('selected carousel mode validates per-origin request groups by flight type 
   assert.equal(f.calls.some(call=>call.name==='collection_commit_selected_carousel'),true);
 });
 
+test('selected carousel mode retains the prior card when a same-date alternate is not a current base candidate',async()=>{
+  const nonRepresentableAlternate={origin:'FRA',dest:'BCN',flight_type:'direct',departure_at:'2027-01-10',return_at:'2027-01-17',
+    price:77,transfers:0,updated_at:'2026-01-15T11:55:00Z'};
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>selectedCarouselNow,buildPlan:true,filterRows:true,tableRows:{
+    selected_price_refresh_control:selectedCarouselControl,
+    daily_origin_window_candidate_runs:[selectedCarouselRun],
+    daily_origin_window_candidates:[selectedCarouselTicket],
+    offers:[nonRepresentableAlternate],
+  }});
+  await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+  const commit=f.calls.find(call=>call.name==='collection_commit_selected_carousel');
+  assert.equal(commit.args.p_result.status,'confirmed_absent');
+  assert.equal(commit.args.p_result.outcome,'retained');
+  assert.equal(commit.args.p_result.replacement,undefined);
+});
+
+test('selected carousel mode submits a fresh alternate from its current base candidates',async()=>{
+  const alternate={...selectedCarouselTicket,destination_id:'barcelona',dest:'BCN',position:2,exact_price:77,
+    transfers:0,airline:'NX',exact_observed_at:'2026-01-15T11:55:00Z',price_source:{source:'current-candidate'}};
+  const run={...selectedCarouselRun,candidate_rows:2,exact_request_groups:1};
+  const f=fixture({},()=>({kind:'ok',json:{success:true,data:[]}}),{clock:()=>selectedCarouselNow,buildPlan:true,filterRows:true,tableRows:{
+    selected_price_refresh_control:selectedCarouselControl,
+    daily_origin_window_candidate_runs:[run],
+    daily_origin_window_candidates:[selectedCarouselTicket,alternate],
+  }});
+  await f.adapters.priority.step({job:{...job,checkpoint:selectedWeekendCheckpoint},deadline:selectedCarouselNow+200000});
+  const commit=f.calls.find(call=>call.name==='collection_commit_selected_carousel');
+  assert.deepEqual(commit.args.p_result,{status:'confirmed_absent',outcome:'replaced',replacement:{
+    observed_on:alternate.observed_on,snapshot_at:alternate.snapshot_at,origin:alternate.origin,destination_id:alternate.destination_id,
+    dest:alternate.dest,flight_type:alternate.flight_type,departure_at:alternate.departure_at,return_at:alternate.return_at,
+    price:77,transfers:0,airline:'NX',updated_at:alternate.exact_observed_at,price_source:alternate.price_source,
+  }});
+});
+
 test('selected carousel mode fails closed for absent or stale origin snapshots without a provider request or RPC',async()=>{
   for(const runs of [[],[{...selectedCarouselRun,observed_on:'2026-01-14'}]]){
     const f=fixture({},()=>{throw new Error('missing or stale selected snapshot must not call provider');},{clock:()=>selectedCarouselNow,buildPlan:true,tableRows:{
