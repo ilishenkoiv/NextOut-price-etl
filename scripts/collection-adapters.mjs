@@ -745,7 +745,7 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
   // priority does (see collection-schedule.mjs) — MAIN yields for the block's whole duration.
   const MAINTENANCE_JOBS = ['app_errors','flight_price_feedback','destination_requests',
     'collect_storage_metrics','plan_bucket_expire','window_prices','selected_carousel_revision_retention',
-    'price_storage','feedback_audit_drain'];
+    'daily_window_candidates','window_price_misses','price_history','price_storage','feedback_audit_drain'];
   async function recursiveSnapshotList(bucket,prefix,deadline){
     if(clock()+9000>=deadline)throw new CollectionYield('Snapshot listing would cross boundary');
     const rows=await query(()=>bucket.list(prefix,{limit:1000,sortBy:{column:'name',order:'asc'}}),deadline,{retry:true,op:'price_storage_snapshot_list'});
@@ -825,6 +825,37 @@ export function createAdapters({ db, store, provider, wave = 0, clock = Date.now
           // restoration transactionally. The maintenance adapter only records its parent count.
           rows=await query(()=>db.rpc('collection_prune_selected_carousel_revisions'),deadline,
             {op:'selected_carousel_revision_retention'});
+        }else if(name==='daily_window_candidates'){
+          // The client reads the latest epoch only. Deleting an expired epoch cascades solely to
+          // its immutable historical candidates; current offers and window_prices stay untouched.
+          const cutoff=new Date(now-7*DAY).toISOString();
+          const found=await query(()=>db.from('daily_window_candidate_epochs').select('snapshot_at')
+            .lt('snapshot_at',cutoff).order('snapshot_at',{ascending:true}).limit(100),deadline,
+            {retry:true,op:'daily_window_candidates_expired_scan'});
+          rows=found.length;
+          if(rows){const watermark=found.at(-1).snapshot_at;
+            await query(()=>db.from('daily_window_candidate_epochs').delete().lt('snapshot_at',cutoff)
+              .lte('snapshot_at',watermark),deadline,{retry:true,op:'daily_window_candidates_expired_delete'});
+            done=false;}
+        }else if(name==='window_price_misses'){
+          // A miss is diagnostic only: a real fare deletes it immediately, and no app path reads it.
+          const cutoff=new Date(now-30*DAY).toISOString();
+          const found=await query(()=>db.from('window_price_misses').select('checked_at').lt('checked_at',cutoff)
+            .order('checked_at',{ascending:true}).limit(500),deadline,{retry:true,op:'window_price_misses_expired_scan'});
+          rows=found.length;
+          if(rows){const watermark=found.at(-1).checked_at;
+            await query(()=>db.from('window_price_misses').delete().lt('checked_at',cutoff)
+              .lte('checked_at',watermark),deadline,{retry:true,op:'window_price_misses_expired_delete'});
+            done=false;}
+        }else if(name==='price_history'){
+          // Historical price changes are not a current-price source. Keep 90 days for diagnosis.
+          const cutoff=new Date(now-90*DAY).toISOString();
+          const found=await query(()=>db.from('price_history').select('id').lt('observed_at',cutoff)
+            .order('observed_at',{ascending:true}).order('id',{ascending:true}).limit(500),deadline,
+            {retry:true,op:'price_history_expired_scan'});
+          rows=found.length;
+          if(rows){await query(()=>db.from('price_history').delete().in('id',found.map(row=>row.id)),deadline,
+            {retry:true,op:'price_history_expired_delete'});done=false;}
         }else if(name==='price_storage'){
           // Ported from cleanup-price-storage.mjs (quarterly; gated above to only the standalone
           // workflow's own due day — 1st of Jan/Apr/Jul/Oct, Berlin).
