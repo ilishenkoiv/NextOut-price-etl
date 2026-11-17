@@ -1,4 +1,4 @@
--- Reviewed owner-run SQL: install exactly one five-minute trigger for the existing coordinator.
+-- Reviewed owner-run SQL: install exactly one 30-minute trigger for the existing coordinator.
 -- Prerequisite: store the fine-grained GitHub token directly in Supabase Vault with the name
 -- `nextout_github_workflow_dispatch_token`. Never paste the token into this script.
 
@@ -28,7 +28,7 @@ begin
   if exists (
     select 1 from cron.job
     where active
-      and jobname <> 'nextout-etl-coordinator-dispatch-5m'
+      and jobname not in ('nextout-etl-coordinator-dispatch-5m', 'nextout-etl-coordinator-dispatch-30m')
       and (command ilike '%nextout_dispatch_etl_coordinator%'
         or command ilike '%collection-coordinator.yml%/dispatches%')
   ) then
@@ -77,9 +77,15 @@ $function$;
 
 revoke all on function public.nextout_dispatch_etl_coordinator() from public, anon, authenticated;
 
+-- Replace only the prior coordinator cadence. Re-running this reviewed owner action cannot leave
+-- a five-minute or duplicate 30-minute coordinator trigger active.
+select cron.unschedule(jobid)
+from cron.job
+where jobname in ('nextout-etl-coordinator-dispatch-5m', 'nextout-etl-coordinator-dispatch-30m');
+
 select cron.schedule(
-  'nextout-etl-coordinator-dispatch-5m',
-  '*/5 * * * *',
+  'nextout-etl-coordinator-dispatch-30m',
+  '*/30 * * * *',
   $command$select public.nextout_dispatch_etl_coordinator();$command$
 );
 
@@ -88,4 +94,4 @@ commit;
 -- Non-secret installation readback.
 select jobid, jobname, schedule, active
 from cron.job
-where jobname = 'nextout-etl-coordinator-dispatch-5m';
+where jobname = 'nextout-etl-coordinator-dispatch-30m';

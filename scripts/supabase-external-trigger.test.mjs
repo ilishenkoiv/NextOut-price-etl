@@ -5,9 +5,12 @@ import { readFileSync } from 'node:fs';
 const install=readFileSync(new URL('./install-supabase-external-trigger.sql',import.meta.url),'utf8');
 const rollback=readFileSync(new URL('./rollback-supabase-external-trigger.sql',import.meta.url),'utf8');
 
-test('Supabase cron dispatches only the existing coordinator with narrow provenance',()=>{
-  assert.match(install,/nextout-etl-coordinator-dispatch-5m/);
-  assert.match(install,/'\*\/5 \* \* \* \*'/);
+test('Supabase cron replaces the legacy trigger with one 30-minute coordinator authority',()=>{
+  assert.match(install,/nextout-etl-coordinator-dispatch-30m/);
+  assert.match(install,/'\*\/30 \* \* \* \*'/);
+  assert.match(install,/jobname not in \('nextout-etl-coordinator-dispatch-5m', 'nextout-etl-coordinator-dispatch-30m'\)/);
+  assert.match(install,/select cron\.unschedule\(jobid\)\s+from cron\.job\s+where jobname in \('nextout-etl-coordinator-dispatch-5m', 'nextout-etl-coordinator-dispatch-30m'\)/);
+  assert.equal((install.match(/nextout-etl-coordinator-dispatch-5m/g)??[]).length,2,'legacy cadence is only preflighted and replaced');
   assert.match(install,/collection-coordinator\.yml\/dispatches/);
   assert.match(install,/jsonb_build_object\('trigger_source', 'supabase-cron'\)/);
   assert.match(install,/vault\.decrypted_secrets/);

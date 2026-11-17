@@ -1,7 +1,5 @@
 name: Sequential data collection
 on:
-  schedule:
-    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       rollout_action:
@@ -18,7 +16,7 @@ on:
         type: string
         default: '15'
       trigger_source:
-        description: 'Dispatch provenance only; does not change collection behavior'
+        description: 'Automatic Supabase refresh or preserved manual request'
         type: choice
         options: [manual, supabase-cron]
         default: manual
@@ -28,14 +26,23 @@ on:
         options: [none, owner-manual]
         default: none
 concurrency:
-  group: nextout-data-collection
-  queue: max
+  # Automatic requests coalesce only with automatic requests. Manual requests use their own
+  # queue, so no newer automatic request can cancel or supersede one.
+  group: ${{ inputs.trigger_source == 'supabase-cron' && 'nextout-data-collection-auto' || 'nextout-data-collection-manual' }}
+  queue: single
   cancel-in-progress: false
 permissions:
   contents: read
   actions: read
 jobs:
   collect:
+    # The workflow-level lanes coalesce automatic requests without touching manual requests.
+    # This shared job queue still serializes actual writers, so the newest automatic request waits
+    # behind a manual writer instead of standing down at the durable lease check.
+    concurrency:
+      group: nextout-data-collection-writer
+      queue: max
+      cancel-in-progress: false
     if: vars.COLLECTION_MODE == 'coordinated' || (github.event_name == 'workflow_dispatch' && inputs.rollout_action == 'none')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -98,6 +105,10 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://xpalogebawoljlafsafs.supabase.co' }}
         run: node scripts/selected-refresh-recovery.mjs
   rollout-control:
+    concurrency:
+      group: nextout-data-collection-writer
+      queue: max
+      cancel-in-progress: false
     if: github.event_name == 'workflow_dispatch' && inputs.rollout_action != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 30

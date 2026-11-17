@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 const dir=new URL('../.github/workflows/',import.meta.url);
-test('every data workflow shares the same non-canceling queued lock',()=>{
-  for(const file of fs.readdirSync(dir).filter(f=>f.endsWith('.yml'))){
+test('non-coordinator data workflows retain the shared non-canceling queue',()=>{
+  for(const file of fs.readdirSync(dir).filter(f=>f.endsWith('.yml')&&f!=='collection-coordinator.yml')){
     const text=fs.readFileSync(new URL(file,dir),'utf8');
     assert.match(text,/concurrency:\s*\n\s+group: nextout-data-collection\s*\n\s+queue: max\s*\n\s+cancel-in-progress: false/,file);
   }
@@ -16,13 +16,18 @@ test('every old main/window/audit/snapshot job is disabled in coordinated mode',
     assert.equal(gates,jobs,file);
   }
 });
-test('single coordinator retains manual dispatch and owns the 30-minute schedule',()=>{
+test('single coordinator has no native schedule and coalesces automatic requests without superseding manual requests',()=>{
   const text=fs.readFileSync(new URL('collection-coordinator.yml',dir),'utf8');
   assert.match(text,/if: vars.COLLECTION_MODE == 'coordinated'/);
   assert.match(text,/smoke_minutes:[\s\S]*default: '15'/);
   assert.match(text,/workflow_dispatch:/);
-  assert.match(text,/^\s*schedule:\s*\n\s+- cron: '\*\/30 \* \* \* \*'/m);
+  assert.doesNotMatch(text,/^\s*schedule:/m);
   assert.match(text,/trigger_source:[\s\S]*options: \[manual, supabase-cron\]/);
+  assert.match(text,/group: \$\{\{ inputs\.trigger_source == 'supabase-cron' && 'nextout-data-collection-auto' \|\| 'nextout-data-collection-manual' \}\}/);
+  assert.match(text,/queue: single/);
+  assert.match(text,/cancel-in-progress: false/);
+  assert.equal((text.match(/group: nextout-data-collection-writer\s*\n\s+queue: max\s*\n\s+cancel-in-progress: false/g)??[]).length,2,
+    'collect and rollout-control share the durable-writer queue');
   assert.match(text,/Collection trigger source=\$\{TRIGGER_SOURCE\}/);
   assert.match(text,/COLLECTION_SESSION_MINUTES:.*trigger_source == 'supabase-cron'.*'25'/);
   assert.match(text,/COLLECTION_TRIGGER_SOURCE:.*inputs\.trigger_source/);
