@@ -112,8 +112,16 @@ test('cache-inventory helper has no invented top-N or /48 shortcut and preserves
     departure_at:'2026-10-10',return_at:'2026-10-17',window_kind:'weekend'}));
   const selected=selectWindowConsumerSet(rows,'2026-09-22');
   assert.equal(selected.length,1205);assert.match(windowConsumerSetId(selected,'2026-09-22'),/^window-consumer:2026-09-22:[a-f0-9]{20}$/);
-  assert.equal(selectWindowConsumerSet([{...rows[0],departure_at:'2026-09-25'},{...rows[1],departure_at:'2027-02-01'},
+  assert.equal(selectWindowConsumerSet([{...rows[0],departure_at:'2026-09-23'},{...rows[1],departure_at:'2027-02-01'},
     {...rows[2],window_kind:'weekend_around'}],'2026-09-22').length,0,'matches app lead/horizon/kind eligibility');
+});
+
+test('priority refresh excludes departures due tomorrow even when an older published set remains',()=>{
+  const row={origin:'BER',dest:'BCN',flight_type:'any',return_at:'2026-11-22',window_kind:'weekend'};
+  assert.deepEqual(selectWindowConsumerSet([
+    {...row,departure_at:'2026-11-20'},
+    {...row,departure_at:'2026-11-21',return_at:'2026-11-23'},
+  ],'2026-11-19').map(ticket=>ticket.departure_at),['2026-11-21']);
 });
 
 test('direct+any rows for one exact route/date use one provider request group without changing row membership',()=>{

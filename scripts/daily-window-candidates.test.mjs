@@ -25,6 +25,19 @@ test('any mode may use the cheaper observed direct row without dropping the inde
   assert.deepEqual(out.map(r=>[r.flight_type,r.exact_price]),[['any',90],['direct',90]]);
 });
 
+test('carousel keeps the 24-hour departure cutoff and admits nearer dates only from a three-hour price',()=>{
+  const at='2026-11-19T12:00:00.000Z';
+  const out=selectDailyWindowCandidates([
+    row('BCN','any',100,{departure_at:'2026-11-20',return_at:'2026-11-22',updated_at:'2026-11-19T11:59:00.000Z'}),
+    row('FCO','any',110,{departure_at:'2026-11-27',return_at:'2026-11-29',updated_at:'2026-11-19T09:00:00.000Z'}),
+    row('ATH','any',120,{departure_at:'2026-11-27',return_at:'2026-11-29',updated_at:'2026-11-19T08:59:59.999Z'}),
+    row('VCE','any',130,{departure_at:'2026-12-04',return_at:'2026-12-06',updated_at:'2026-10-01T00:00:00.000Z'}),
+  ],{today:'2026-11-19',snapshotAt:at,regions:['DE-BE']});
+  assert.deepEqual(out.map(candidate=>[candidate.dest,candidate.departure_at]),[
+    ['FCO','2026-11-27'],['VCE','2026-12-04'],
+  ]);
+});
+
 test('per-origin publisher sends the exact v1 atomic writer payload and preserves an object price source',async()=>{
   const [candidate]=selectDailyWindowCandidates([row('BCN','any',150,{price_source:null})],{today:'2026-09-22',snapshotAt,regions:['DE-BE']});
   const calls=[];const client={rpc:async(name,args)=>{calls.push({name,args});return{data:true,error:null};}};

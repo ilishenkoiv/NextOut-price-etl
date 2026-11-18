@@ -27,6 +27,7 @@ import { carouselReplacement, isBerlinSelectedRefreshDaytime, retainedResult, ro
 const PRICE_ORDER = ['origin','dest','month'];
 const WINDOW_ORDER = ['origin','dest','flight_type','departure_at','return_at'];
 const DAY = 86400000;
+export const CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS = 2;
 export const PRIORITY_AUDIT_BATCH = 10;
 // Keep the scheduler's admission bound identical to the adapter's own hard deadline.
 // A larger advertised unit strands usable time at the end of the five-minute priority budget.
@@ -48,9 +49,10 @@ export function projectMainCellMs({requestMs,dbMs=0,calendarFallback=false,retry
 }
 function addIsoDays(day,n){const d=new Date(day+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
 function addIsoMonths(day,n){const d=new Date(day+'T00:00:00Z');d.setUTCMonth(d.getUTCMonth()+n);return d.toISOString().slice(0,10);}
-// Mirrors the read-only app consumer: breakWindows uses lead=10 days, horizon=4 months and only
-// factual `weekend`/`holiday` windows. Both exact variants remain separate rows; no top-N cap.
-export function selectWindowConsumerSet(rows,day){const min=addIsoDays(day,10),max=addIsoMonths(day,4);return rows.filter(t=>
+// Keep the 24-hour departure cutoff even while refreshing a previously published set.  The daily
+// publisher owns the stricter three-hour near-price admission; this worker may refresh an already
+// admitted near ticket so it does not become stale before its next app read.
+export function selectWindowConsumerSet(rows,day){const min=addIsoDays(day,CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS),max=addIsoMonths(day,4);return rows.filter(t=>
   t.departure_at>=min&&t.departure_at<=max&&t.return_at>t.departure_at&&['weekend','holiday'].includes(t.window_kind));}
 export function windowConsumerSetId(rows,day){return`window-consumer:${day}:`+createHash('sha256').update(rows.map(t=>
   [t.origin,t.dest,t.flight_type,t.departure_at,t.return_at].join('|')).join('\n')).digest('hex').slice(0,20);}

@@ -15,26 +15,32 @@ import { CollectionProvider } from './collection-provider.mjs';
 import { DAILY_SELECTION_REFRESH_MAX_MS } from './daily-selection-budget.mjs';
 
 const PAGE=1000,CONTRACT_VERSION=1;
+export const CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS=2;
+export const CAROUSEL_DEFAULT_LEAD_DAYS=10;
+export const CAROUSEL_NEAR_PRICE_MAX_AGE_MS=3*60*60*1000;
 const addDays=(iso,n)=>{const d=new Date(iso+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
 const addMonths=(iso,n)=>{const d=new Date(iso+'T00:00:00Z');d.setUTCMonth(d.getUTCMonth()+n);return d.toISOString().slice(0,10);};
 const windowKey=(start,end)=>`${start}|${end}`;
 const routeKey=row=>[row.origin,row.dest,row.departure_at,row.return_at].join('|');
 
-export function buildWindowRegionMap(holidays,regions,today){const result=new Map();
-  for(const region of regions){for(const w of computeAllWindows(holidays,[region],today,{horizonMonths:4})){
+export function buildWindowRegionMap(holidays,regions,today,windowOptions={}){const result=new Map();
+  for(const region of regions){for(const w of computeAllWindows(holidays,[region],today,{horizonMonths:4,...windowOptions})){
     if(w.kind!=='holiday')continue;const key=windowKey(w.start,w.end);if(!result.has(key))result.set(key,new Set());result.get(key).add(region);}}
   return result;
 }
 
 export function selectDailyWindowCandidates(rows,{today,snapshotAt,holidays=[],regions=[],originRegions=[],wave=0}={}){
-  const min=addDays(today,10),max=addMonths(today,4),allowedDests=publishedSnapshotDestinations(wave),allowedOrigins=publishedSnapshotOrigins();
-  const factual=computeAllWindows(holidays,regions,today,{horizonMonths:4});const factualByKey=new Map(factual.map(w=>[windowKey(w.start,w.end),w]));
-  const weekends=new Set(computeAllWindows([],[],today,{horizonMonths:4}).map(w=>windowKey(w.start,w.end)));
-  const regionMap=buildWindowRegionMap(holidays,regions,today);
+  const hardMin=addDays(today,CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS),min=addDays(today,CAROUSEL_DEFAULT_LEAD_DAYS),max=addMonths(today,4),
+    snapshotMs=Date.parse(snapshotAt),allowedDests=publishedSnapshotDestinations(wave),allowedOrigins=publishedSnapshotOrigins();
+  const windowOptions={horizonMonths:4,minLeadDays:CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS};
+  const factual=computeAllWindows(holidays,regions,today,windowOptions);const factualByKey=new Map(factual.map(w=>[windowKey(w.start,w.end),w]));
+  const weekends=new Set(computeAllWindows([],[],today,windowOptions).map(w=>windowKey(w.start,w.end)));
+  const regionMap=buildWindowRegionMap(holidays,regions,today,windowOptions);
   const regionForOrigin=new Map(originRegions.map(row=>[row.airport,row.calendar_subdivision_code]));
   const exact=new Map();
-  for(const row of rows){const key=windowKey(row.departure_at,row.return_at),w=factualByKey.get(key),updated=Date.parse(row.updated_at);
-    if(!w||!allowedOrigins.has(row.origin)||!allowedDests.has(row.dest)||!destinationIdForIata(row.dest)||row.departure_at<min||row.departure_at>max
+  for(const row of rows){const key=windowKey(row.departure_at,row.return_at),w=factualByKey.get(key),updated=Date.parse(row.updated_at),
+      near=row.departure_at<min,nearPriceFresh=Number.isFinite(snapshotMs)&&updated<=snapshotMs&&updated>=snapshotMs-CAROUSEL_NEAR_PRICE_MAX_AGE_MS;
+    if(!w||!allowedOrigins.has(row.origin)||!allowedDests.has(row.dest)||!destinationIdForIata(row.dest)||row.departure_at<hardMin||row.departure_at>max||near&&!nearPriceFresh
       ||row.return_at<=row.departure_at||!['direct','any'].includes(row.flight_type)||!(Number(row.price)>0)||!Number.isFinite(updated))continue;
     const holidayRegions=[...(regionMap.get(key)??[])].sort(),originRegion=regionForOrigin.get(row.origin);
     const window=originRegion&&holidayRegions.includes(originRegion)?{...w,kind:'holiday',regionCodes:[originRegion]}:
@@ -102,9 +108,9 @@ export async function main({db,instant=Date.now(),wave=Number(process.env.SNAPSH
   if(!force&&!nightlySelectionDue(instant,selectionThresholdMinutes))return{published:false,reason:'not_due',observedOn:today};
   if(!db&&!process.env.SUPABASE_SERVICE_KEY)throw new Error('Missing SUPABASE_SERVICE_KEY');
   const client=db??createClient(process.env.SUPABASE_URL||'https://xpalogebawoljlafsafs.supabase.co',process.env.SUPABASE_SERVICE_KEY,{auth:{persistSession:false}});
-  // Date bounds stay server-side. Observation age is diagnostic only: a last-known positive exact
-  // window remains eligible and is point-refreshed after selection.
-  const windowMin=addDays(today,10),windowMax=addMonths(today,4);
+  // Query from the hard 24-hour departure boundary. Selection below admits a nearer row only
+  // when its exact price is no older than three hours; the ordinary ten-day lead still applies.
+  const windowMin=addDays(today,CAROUSEL_HARD_DEPARTURE_CUTOFF_DAYS),windowMax=addMonths(today,4);
   const [rows,holidays,originRegions]=await Promise.all([
     loadAll(client,'window_prices','origin,dest,flight_type,departure_at,return_at,price,transfers,airline,updated_at,price_source',['origin','dest','flight_type','departure_at','return_at'],
       q=>q.gte('departure_at',windowMin).lte('departure_at',windowMax)),

@@ -44,8 +44,8 @@ function buildBlocks(holidays) {
 
 // Full window set for the horizon: holiday windows for EVERY supported region ∪ weekends, deduped by
 // (start|end). Mirrors computeBreakWindows across all regions, first-writer-wins per date pair.
-export function computeAllWindows(holidays, regions, today, { horizonMonths = 6, weekendAround = false } = {}) {
-  const minStart = addDays(today, MIN_LEAD_DAYS);
+export function computeAllWindows(holidays, regions, today, { horizonMonths = 6, weekendAround = false, minLeadDays = MIN_LEAD_DAYS } = {}) {
+  const minStart = addDays(today, minLeadDays);
   const maxStart = addMonths(today, horizonMonths);
   const chosen = new Map();
   // enforceLead=false lets a corridor departure sit up to four days before the (lead-valid) Friday
